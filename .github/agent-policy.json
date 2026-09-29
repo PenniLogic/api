@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "repository": "PenniLogic/api",
+  "repository_id": 1394134582,
+  "required_native_check": "CI",
+  "review_roles": {
+    "core": "pennilogic-core-reviewer",
+    "qa": "pennilogic-qa",
+    "security": "pennilogic-security-reviewer",
+    "privacy": "pennilogic-privacy-reviewer",
+    "money": "pennilogic-money-reviewer",
+    "contract": "pennilogic-contract-reviewer",
+    "compliance": "pennilogic-compliance-reviewer",
+    "accessibility": "pennilogic-accessibility-reviewer",
+    "design": "pennilogic-design-reviewer",
+    "reliability": "pennilogic-reliability-reviewer",
+    "release": "pennilogic-release-reviewer"
+  },
+  "commands": [
+    "python scripts/check_repository.py",
+    "python scripts/quality.py build",
+    "python -m unittest discover -s scripts/tests"
+  ],
+  "review_floor": [
+    "core"
+  ],
+  "behavior_changes_add": [
+    "qa"
+  ],
+  "review_identity": "Separate non-author AI sessions; one GitHub user, not two-human approval.",
+  "github_approving_review_count": 0,
+  "mandatory_commit_signatures": false,
+  "no_bypass": true
+}

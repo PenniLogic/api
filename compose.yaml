@@ -1,0 +1,17 @@
+services:
+  api:
+    build: .
+    image: pennilogic-api-scaffold:local
+    environment:
+      APP_ENV: local
+      HOST: 0.0.0.0
+      PORT: "8080"
+    ports:
+      - "127.0.0.1:${API_LOCAL_PORT:-8080}:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

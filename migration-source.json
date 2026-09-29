@@ -1,0 +1,166 @@
+{
+  "source_repository": "PenniLogic-old/api",
+  "source_commit": "37cb402268d9278ce1f1d65c9808a07bb4b03484",
+  "source_history_copied": false,
+  "private_discussions_or_actions_logs_copied": false,
+  "unmerged_changes_copied": false,
+  "files": [
+    {
+      "path": ".dockerignore",
+      "source_path": ".dockerignore",
+      "source_sha256": "75e855e6bfa58bbf67b368eb0562c48b9fbcdcc0a3deb9b104c289c6d0143fb5",
+      "export_sha256": "75e855e6bfa58bbf67b368eb0562c48b9fbcdcc0a3deb9b104c289c6d0143fb5"
+    },
+    {
+      "path": ".editorconfig",
+      "source_path": ".editorconfig",
+      "source_sha256": "309386f0f2eab9284f8602e856c68996ef1e73cd80f8641bfb90fc99e24d4aff",
+      "export_sha256": "309386f0f2eab9284f8602e856c68996ef1e73cd80f8641bfb90fc99e24d4aff"
+    },
+    {
+      "path": ".gitignore",
+      "source_path": ".gitignore",
+      "source_sha256": "67c25de13c4c6dffa0e9fb142de3690d1564c2b22a6207feb060b0dfe24dafce",
+      "export_sha256": "1285ffbfac6ae161974e6a7a9a17da5d743ee4edfd8deb9e708ad22ce774390e",
+      "adaptation": "Replace the private-era ignore file with the shared generated public baseline; application sources are unchanged."
+    },
+    {
+      "path": "Dockerfile",
+      "source_path": "Dockerfile",
+      "source_sha256": "37fd1a96818e5aa8a1cdc266d4ef4b5eba4d083ebf8fabede1ec25c7f69f3305",
+      "export_sha256": "37fd1a96818e5aa8a1cdc266d4ef4b5eba4d083ebf8fabede1ec25c7f69f3305"
+    },
+    {
+      "path": "build.gradle.kts",
+      "source_path": "build.gradle.kts",
+      "source_sha256": "6116c94ad4fe704193db5c6aa40ad6609ca949856e6590a89f75e47960763515",
+      "export_sha256": "6116c94ad4fe704193db5c6aa40ad6609ca949856e6590a89f75e47960763515"
+    },
+    {
+      "path": "compose.yaml",
+      "source_path": "compose.yaml",
+      "source_sha256": "997a4a9571ad0b1a1e90b816916fddb03150c037eec0ce9d1de81aa94ded7547",
+      "export_sha256": "997a4a9571ad0b1a1e90b816916fddb03150c037eec0ce9d1de81aa94ded7547"
+    },
+    {
+      "path": "docs/health.schema.json",
+      "source_path": "docs/health.schema.json",
+      "source_sha256": "a491d6adcadc67bb4a55cd01d2b86bad3043eb169c12b599b5d7f4340e0c4eff",
+      "export_sha256": "a491d6adcadc67bb4a55cd01d2b86bad3043eb169c12b599b5d7f4340e0c4eff"
+    },
+    {
+      "path": "gradle.lockfile",
+      "source_path": "gradle.lockfile",
+      "source_sha256": "9daf8817e69695e578d85a0319990cb26ce5dc9a4cbdd0836576b075aa1bf038",
+      "export_sha256": "9daf8817e69695e578d85a0319990cb26ce5dc9a4cbdd0836576b075aa1bf038"
+    },
+    {
+      "path": "gradle.properties",
+      "source_path": "gradle.properties",
+      "source_sha256": "bb28d4d00285b7a6247b02e81710f0b081d27c739b2c1cb5025565d12e2b045b",
+      "export_sha256": "bb28d4d00285b7a6247b02e81710f0b081d27c739b2c1cb5025565d12e2b045b"
+    },
+    {
+      "path": "gradle/verification-metadata.xml",
+      "source_path": "gradle/verification-metadata.xml",
+      "source_sha256": "2d151480669cf69bedeaa3afed5759274bb2300eec4c5d30af0d6f786a6e1cfc",
+      "export_sha256": "2d151480669cf69bedeaa3afed5759274bb2300eec4c5d30af0d6f786a6e1cfc"
+    },
+    {
+      "path": "gradle/wrapper/gradle-wrapper.jar",
+      "source_path": "gradle/wrapper/gradle-wrapper.jar",
+      "source_sha256": "7a9ce74cff467ca1bf60a4fcd9f05185acceda4d0f382434d393e17864262c5d",
+      "export_sha256": "7a9ce74cff467ca1bf60a4fcd9f05185acceda4d0f382434d393e17864262c5d"
+    },
+    {
+      "path": "gradle/wrapper/gradle-wrapper.properties",
+      "source_path": "gradle/wrapper/gradle-wrapper.properties",
+      "source_sha256": "d0bebe8133babb74ab29a31ee6616c56ef8985fc801e1fd16c61b5ed2189e907",
+      "export_sha256": "d0bebe8133babb74ab29a31ee6616c56ef8985fc801e1fd16c61b5ed2189e907"
+    },
+    {
+      "path": "gradlew",
+      "source_path": "gradlew",
+      "source_sha256": "a5a5c199ba02189ae8c46a334223371a20599d9c298ef65e7540ede4a3f72d59",
+      "export_sha256": "a5a5c199ba02189ae8c46a334223371a20599d9c298ef65e7540ede4a3f72d59"
+    },
+    {
+      "path": "gradlew.bat",
+      "source_path": "gradlew.bat",
+      "source_sha256": "59328c7a17f673b1a63040bfb380a0c749e5d6df3406f7f18641060314cd9aa1",
+      "export_sha256": "59328c7a17f673b1a63040bfb380a0c749e5d6df3406f7f18641060314cd9aa1"
+    },
+    {
+      "path": "quality/coverage-baseline.json",
+      "source_path": "quality/coverage-baseline.json",
+      "source_sha256": "51689a786b1836f57679085b661310d4e783e4fdcd6611c35d939b7b47e0f123",
+      "export_sha256": "51689a786b1836f57679085b661310d4e783e4fdcd6611c35d939b7b47e0f123"
+    },
+    {
+      "path": "scripts/quality.py",
+      "source_path": "scripts/quality.py",
+      "source_sha256": "66ab10961fda2e7308d7137d3965506a8e87dc39e1a9187c4c1ce4c581de6f4c",
+      "export_sha256": "66ab10961fda2e7308d7137d3965506a8e87dc39e1a9187c4c1ce4c581de6f4c"
+    },
+    {
+      "path": "scripts/tests/test_quality.py",
+      "source_path": "scripts/tests/test_quality.py",
+      "source_sha256": "d93b76bb7f16d62544b26cf9270ccec2812fd37681743bac6b9b85d482d7469c",
+      "export_sha256": "d93b76bb7f16d62544b26cf9270ccec2812fd37681743bac6b9b85d482d7469c"
+    },
+    {
+      "path": "settings.gradle.kts",
+      "source_path": "settings.gradle.kts",
+      "source_sha256": "7e29749f87cb9abe3dd5137333ae941c6b9afa1d2f39f6f08e895845dd8bb4c9",
+      "export_sha256": "7e29749f87cb9abe3dd5137333ae941c6b9afa1d2f39f6f08e895845dd8bb4c9"
+    },
+    {
+      "path": "src/main/kotlin/com/pennilogic/bootstrap/Application.kt",
+      "source_path": "src/main/kotlin/com/pennilogic/bootstrap/Application.kt",
+      "source_sha256": "7cdfcf40730812ee37ed3db7ab22eeaa38d8d4fd5b4ffa3c9768a3677b4184ae",
+      "export_sha256": "7cdfcf40730812ee37ed3db7ab22eeaa38d8d4fd5b4ffa3c9768a3677b4184ae"
+    },
+    {
+      "path": "src/main/kotlin/com/pennilogic/bootstrap/Health.kt",
+      "source_path": "src/main/kotlin/com/pennilogic/bootstrap/Health.kt",
+      "source_sha256": "b408b002f6b43add4262f6aa7ae020b13191c5c2bd585aa21f2b57a5a3d03f17",
+      "export_sha256": "b408b002f6b43add4262f6aa7ae020b13191c5c2bd585aa21f2b57a5a3d03f17"
+    },
+    {
+      "path": "src/main/kotlin/com/pennilogic/bootstrap/ServerConfig.kt",
+      "source_path": "src/main/kotlin/com/pennilogic/bootstrap/ServerConfig.kt",
+      "source_sha256": "fed445aa31731e45711d15d6da607092676af9a7804f1c771800a1dbaa9b0c07",
+      "export_sha256": "fed445aa31731e45711d15d6da607092676af9a7804f1c771800a1dbaa9b0c07"
+    },
+    {
+      "path": "src/main/resources/logback.xml",
+      "source_path": "src/main/resources/logback.xml",
+      "source_sha256": "0a29b1f83015578f28b8ad5af9db54c07784135be90550ecacd53948ad9a11be",
+      "export_sha256": "0a29b1f83015578f28b8ad5af9db54c07784135be90550ecacd53948ad9a11be"
+    },
+    {
+      "path": "src/test/kotlin/com/pennilogic/bootstrap/ApplicationProcessTest.kt",
+      "source_path": "src/test/kotlin/com/pennilogic/bootstrap/ApplicationProcessTest.kt",
+      "source_sha256": "f87cd0bd91c498ae224b1b6ce3ee81c7cca04a41cc8ad4576c7d7c1d2f038262",
+      "export_sha256": "f87cd0bd91c498ae224b1b6ce3ee81c7cca04a41cc8ad4576c7d7c1d2f038262"
+    },
+    {
+      "path": "src/test/kotlin/com/pennilogic/bootstrap/ApplicationStartupTest.kt",
+      "source_path": "src/test/kotlin/com/pennilogic/bootstrap/ApplicationStartupTest.kt",
+      "source_sha256": "e4f69078bc37366dfad81bcb933805c9b92e2b8ffcd143d60b653b6b3f9a1a08",
+      "export_sha256": "e4f69078bc37366dfad81bcb933805c9b92e2b8ffcd143d60b653b6b3f9a1a08"
+    },
+    {
+      "path": "src/test/kotlin/com/pennilogic/bootstrap/HealthTest.kt",
+      "source_path": "src/test/kotlin/com/pennilogic/bootstrap/HealthTest.kt",
+      "source_sha256": "0b1d96ff50f24db8b413197ff21adf7454bc65bbd897774ca1387ac393249015",
+      "export_sha256": "0b1d96ff50f24db8b413197ff21adf7454bc65bbd897774ca1387ac393249015"
+    },
+    {
+      "path": "src/test/kotlin/com/pennilogic/bootstrap/ServerConfigTest.kt",
+      "source_path": "src/test/kotlin/com/pennilogic/bootstrap/ServerConfigTest.kt",
+      "source_sha256": "f5065238a0c6dd71ba3559bfe16d4b23dc0cc68e997d7d9c8986663e7e1e695d",
+      "export_sha256": "f5065238a0c6dd71ba3559bfe16d4b23dc0cc68e997d7d9c8986663e7e1e695d"
+    }
+  ]
+}

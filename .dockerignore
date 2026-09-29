@@ -1,0 +1,6 @@
+**
+!build/
+!build/install/
+!build/install/pennilogic-api/
+!build/install/pennilogic-api/lib/
+!build/install/pennilogic-api/lib/*.jar

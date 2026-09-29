@@ -1,0 +1,12 @@
+<configuration>
+    <appender name="LIFECYCLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%msg%n</pattern>
+        </encoder>
+    </appender>
+    <logger name="pennilogic.lifecycle" level="INFO" additivity="false">
+        <appender-ref ref="LIFECYCLE"/>
+    </logger>
+    <!-- The scaffold emits only fixed lifecycle events, never framework/request diagnostics. -->
+    <root level="OFF"/>
+</configuration>
