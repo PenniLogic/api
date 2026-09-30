@@ -3,7 +3,7 @@
 
 Kotlin/Ktor core API with deterministic server-authoritative money.
 
-**Current scope:** Accepted health-service scaffold only. Authentication, ledger and product APIs are not implemented.
+**Current scope:** Kotlin/Ktor health-service scaffold from the reviewed initial import only; no authentication, ledger or product APIs are implemented.
 
 Read this file, the linked plan item, relevant product decisions and
 `.github/agent-policy.json`. This new public repository has its own delivery
