@@ -3,7 +3,7 @@
 
 Kotlin/Ktor core API with deterministic server-authoritative money.
 
-**Status:** Accepted health-service scaffold only. Authentication, ledger and product APIs are not implemented.
+**Status:** Kotlin/Ktor health-service scaffold from the reviewed initial import only; no authentication, ledger or product APIs are implemented.
 
 This repository belongs to the new public, Free-plan `PenniLogic` organization.
 `migration-source.json` records the pinned source snapshot and excluded history.
@@ -21,7 +21,9 @@ python -m unittest discover -s scripts/tests
 
 See [AGENTS.md](AGENTS.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 Product specifications and the preserved backlog are in
-[PenniLogic/docs](https://github.com/PenniLogic/docs).
+[PenniLogic/docs](https://github.com/PenniLogic/docs). Verification requirements:
+[PenniLogic/docs/governance/test-strategy.md](https://github.com/PenniLogic/docs/blob/main/governance/test-strategy.md)
+(numbers in [governance/test-strategy.json](https://github.com/PenniLogic/docs/blob/main/governance/test-strategy.json)).
 
 ## Cost and permissions
 
