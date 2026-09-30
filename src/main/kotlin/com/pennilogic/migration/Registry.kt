@@ -116,8 +116,8 @@ data class RegistryRow(
 /**
  * JDBC client for the runner-owned registry tables. The registry is append-only: every attempt
  * is one row and the current state of a version is derived from its latest non-failed row.
- * Every reference is schema-qualified (`migration.*`) so the registry is one fact per database,
- * independent of the session's `search_path`.
+ * Every reference is schema-qualified with [SCHEMA] (`migration_runner.*`) so the registry is one
+ * fact per database, independent of the session's `search_path`.
  */
 class Registry(
     private val connection: Connection,

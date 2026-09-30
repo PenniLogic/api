@@ -59,10 +59,17 @@ a database:
    lint reads the script the way Postgres does: `--` and nested `/* */`
    comments are dropped; plain `'…'` literals, `E'…'` escape strings (where
    `\'` does not close the string), `"…"` identifiers and `$tag$…$tag$` bodies
-   are kept whole, so a keyword inside them cannot be mistaken for a statement
+   are kept whole, so a comment marker inside them does not start a comment
    and a statement after them cannot be hidden. Plain literals follow
    `standard_conforming_strings = on`, which the runner sets for every session
    it opens so a role or database setting cannot change how a script parses.
+   The lint is syntactic and does not exclude quoted text: a plain `'…'`
+   literal whose text contains `DROP` or `TRUNCATE` followed by `CASCADE`
+   (for example `INSERT INTO notes VALUES ('drop schema x cascade');`) is
+   refused as well — a fail-safe false positive that is resolved by rewriting
+   the literal or splitting the migration, never by weakening the rule (pinned
+   by `a cascade inside a plain literal stays visible to rule 7 and the
+   reversal is refused` in `SqlTextTest`).
 8. Rows of an append-only table are never `UPDATE`d or `DELETE`d by any
    script, forward, migrate or reversal: the ledger is corrected by reversing
    transactions (CONSTITUTION.md, "ledger history append-only"). api#2 names

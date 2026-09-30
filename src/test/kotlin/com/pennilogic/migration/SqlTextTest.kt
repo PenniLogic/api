@@ -1,9 +1,16 @@
 package com.pennilogic.migration
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
+import java.nio.file.Path
 
 class SqlTextTest {
+    @TempDir
+    lateinit var directory: Path
+
     private fun strip(script: String): String = SqlText.withoutComments(script).trim()
 
     @Test
@@ -49,5 +56,17 @@ class SqlTextTest {
         assertEquals("'\\'", strip("'\\' -- a quote at the very start is a plain literal"))
         // In a plain literal the backslash is an ordinary character (standard_conforming_strings = on).
         assertEquals("SELECT '\\';\nDROP TABLE t CASCADE;", strip("SELECT '\\';\nDROP TABLE t CASCADE;"))
+    }
+
+    @Test
+    fun `a cascade inside a plain literal stays visible to rule 7 and the reversal is refused`() {
+        // CONVENTION.md rule 7: the lint is syntactic and does not exclude quoted text, so this is a
+        // fail-safe false positive. A legitimate literal is rewritten or the migration split; the rule is not weakened.
+        val reversal = "INSERT INTO notes VALUES ('drop schema x cascade');\n"
+        assertEquals(reversal.trim(), strip(reversal))
+        Fixtures.write(directory, "V001__x", Fixtures.header() + "CREATE TABLE notes (body text);\n", down = reversal)
+        val error = assertThrows(ConventionViolation::class.java) { MigrationSet.load(directory) }
+        assertEquals("V001__x.down.sql", error.file)
+        assertTrue(error.rule.contains("must not DROP or TRUNCATE with CASCADE"), error.message)
     }
 }
