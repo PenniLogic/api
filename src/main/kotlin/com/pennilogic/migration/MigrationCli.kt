@@ -135,6 +135,8 @@ class MigrationCli(
             }
         val identity = Identity(options.holder, InetAddress.getLocalHost().hostName, ProcessHandle.current().pid())
         DriverManager.getConnection(url, properties).use { connection ->
+            // The convention lint parses literals under the Postgres default; pin it so a role or database setting cannot change it.
+            connection.createStatement().use { statement -> statement.execute("SET standard_conforming_strings = on") }
             return block(MigrationRunner(connection, set, identity, options.slowThreshold, ::emit))
         }
     }

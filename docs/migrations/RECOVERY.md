@@ -90,13 +90,13 @@ Symptom: `migration_registry_problem` with `kind` `registry_not_contiguous`, or
 been modified outside the runner. [`status can be written to a file and reports
 registry corruption`]
 
-Stop deployments. Compare `migration.migration_registry` with the actual schema
+Stop deployments. Compare `migration_runner.migration_registry` with the actual schema
 (`\dn`, `\dt pennilogic.*`) and with the migration files. Then either restore
 the history rows from the last known-good backup (*manual*) or reinsert each
 missing `applied` row with the values `validate` prints for that migration:
 
 ```sql
-INSERT INTO migration.migration_registry
+INSERT INTO migration_runner.migration_registry
     (version, migration_id, phase, checksum, reversal_kind, reversal_file,
      reversal_checksum, state, direction, applied_by, host, pid, duration_ms)
 VALUES

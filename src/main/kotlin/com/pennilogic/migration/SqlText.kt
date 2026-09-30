@@ -2,10 +2,13 @@ package com.pennilogic.migration
 
 /**
  * Removes SQL comments so the "script has statements" rule cannot be satisfied by a comment.
- * Handles `--` line comments and nested `/* */` block comments, and leaves quoted literals,
- * quoted identifiers and dollar-quoted bodies intact so a comment marker inside them is not
- * mistaken for a comment. The check stays syntactic: it decides whether anything remains, not
- * whether what remains is a meaningful reverse.
+ * Handles `--` line comments and nested `/* */` block comments, and leaves quoted literals
+ * (including `E'…'` escape strings, where a backslash escapes the next character), quoted
+ * identifiers and dollar-quoted bodies intact so a comment marker inside them is not mistaken
+ * for a comment and a statement after them is not mistaken for literal text. Plain literals
+ * follow `standard_conforming_strings = on`, which the runner sets for its session. The check
+ * stays syntactic: it decides whether anything remains, not whether what remains is a
+ * meaningful reverse.
  */
 internal object SqlText {
     private val DOLLAR_TAG = Regex("""\$([A-Za-z_][A-Za-z0-9_]*)?\$""")
@@ -25,8 +28,12 @@ internal object SqlText {
                         skipBlockComment(script, index)
                     }
 
-                    character == '\'' || character == '"' -> {
-                        copyQuoted(script, index, character, out)
+                    character == '\'' -> {
+                        copyQuoted(script, index, character, out, escapes = isEscapeString(script, index))
+                    }
+
+                    character == '"' -> {
+                        copyQuoted(script, index, character, out, escapes = false)
                     }
 
                     character == '$' -> {
@@ -77,11 +84,23 @@ internal object SqlText {
         return index
     }
 
+    /** `E'…'` (or `e'…'`) is an escape string when the E is not the tail of an identifier. */
+    private fun isEscapeString(
+        script: String,
+        quoteIndex: Int,
+    ): Boolean {
+        if (quoteIndex == 0 || script[quoteIndex - 1] !in "Ee") return false
+        return quoteIndex == 1 || !isIdentifierCharacter(script[quoteIndex - 2])
+    }
+
+    private fun isIdentifierCharacter(character: Char): Boolean = character.isLetterOrDigit() || character == '_' || character == '$'
+
     private fun copyQuoted(
         script: String,
         start: Int,
         quote: Char,
         out: StringBuilder,
+        escapes: Boolean,
     ): Int {
         var index = start + 1
         out.append(quote)
@@ -89,7 +108,11 @@ internal object SqlText {
             val character = script[index]
             out.append(character)
             index++
-            if (character == quote) {
+            if (escapes && character == '\\' && index < script.length) {
+                // A backslash escapes the next character in an E'…' string, so \' does not close it.
+                out.append(script[index])
+                index++
+            } else if (character == quote) {
                 if (index < script.length && script[index] == quote) {
                     out.append(quote)
                     index++

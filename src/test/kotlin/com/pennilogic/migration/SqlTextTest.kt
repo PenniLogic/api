@@ -30,4 +30,24 @@ class SqlTextTest {
         assertEquals("SELECT 'x'", strip("SELECT 'x'"))
         assertEquals("SELECT \$\$ unterminated", strip("SELECT \$\$ unterminated"))
     }
+
+    @Test
+    fun `escape strings honour backslash escapes so a following statement is not hidden`() {
+        // Postgres reads E'\'' as a one-character string; the DROP after it is a real statement and must stay visible.
+        assertEquals("SELECT E'\\'';\nDROP TABLE t CASCADE;", strip("SELECT E'\\'';\nDROP TABLE t CASCADE;"))
+        assertEquals("SELECT E'\\\\';", strip("SELECT E'\\\\'; -- backslash literal"))
+        assertEquals("SELECT E'a\\'b -- not a comment';", strip("SELECT E'a\\'b -- not a comment';"))
+        assertEquals("SELECT e'\\''", strip("SELECT e'\\'' /* lowercase marker */"))
+        assertEquals("SELECT E'both''\\'';", strip("SELECT E'both''\\''; -- doubled and escaped"))
+        assertEquals("SELECT E'trailing\\", strip("SELECT E'trailing\\"))
+        // A quote after an identifier ending in e is a plain literal: '\' closes at the second quote.
+        assertEquals("SELECT abe'\\';", strip("SELECT abe'\\'; -- tail"))
+        assertEquals("SELECT x_e'\\';", strip("SELECT x_e'\\'; -- tail"))
+        assertEquals("SELECT x\$e'\\';", strip("SELECT x\$e'\\'; -- tail"))
+        assertEquals("E'\\''", strip("E'\\'' -- marker at the start of the script"))
+        assertEquals("SELECT 'x'e'y'", strip("SELECT 'x'e'y' -- e after a quote is not an identifier tail"))
+        assertEquals("'\\'", strip("'\\' -- a quote at the very start is a plain literal"))
+        // In a plain literal the backslash is an ordinary character (standard_conforming_strings = on).
+        assertEquals("SELECT '\\';\nDROP TABLE t CASCADE;", strip("SELECT '\\';\nDROP TABLE t CASCADE;"))
+    }
 }

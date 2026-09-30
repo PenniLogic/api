@@ -236,6 +236,11 @@ class MigrationSetTest {
         assertEquals(1, MigrationSet.load(directory).latestVersion)
         Fixtures.write(directory, "V001__x", Fixtures.header() + "DROP TABLE old CASCADE;\n", down = "SELECT 1;\n")
         assertEquals(1, MigrationSet.load(directory).latestVersion)
+        // An E'…' escape string cannot hide the cascade: Postgres closes E'\'' after one character, and so does the lint.
+        Fixtures.write(directory, "V001__x", Fixtures.header() + "SELECT 1;\n", down = "SELECT E'\\'';\nDROP TABLE t CASCADE;\n")
+        assertViolation("V001__x.down.sql", "must not DROP or TRUNCATE with CASCADE")
+        Fixtures.write(directory, "V001__x", Fixtures.header() + "SELECT 1;\n", down = "DROP TABLE t;\nSELECT E'it\\'s fine';\n")
+        assertEquals(1, MigrationSet.load(directory).latestVersion)
     }
 
     @Test

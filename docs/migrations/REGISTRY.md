@@ -1,7 +1,7 @@
 # Migration registry and lock contract (T-MIG-01, api#55)
 
-The registry is two tables in the runner-owned schema `migration` —
-`migration.migration_registry` and `migration.migration_lock` — bootstrapped
+The registry is two tables in the runner-owned schema `migration_runner` —
+`migration_runner.migration_registry` and `migration_runner.migration_lock` — bootstrapped
 idempotently (`CREATE SCHEMA IF NOT EXISTS`, `CREATE TABLE IF NOT EXISTS`) at the
 start of every writing command. They are infrastructure, like a schema-history
 table, not migrations: they must exist before the first migration so that even
@@ -9,12 +9,17 @@ V001 is applied under the lock and recorded with its checksum. `--dry-run` never
 bootstraps them.
 
 Every statement the runner issues names the schema explicitly, including the
-`to_regclass('migration.migration_registry')` existence probe, so the registry
+`to_regclass('migration_runner.migration_registry')` existence probe, so the registry
 is one fact per database: a role or database `search_path` that omits the
 schema, or `?currentSchema=` / `options=-c search_path=` in `MIGRATION_JDBC_URL`,
 changes nothing — the runner still finds the same registry and never bootstraps
 a second one. The application schema (`pennilogic`, created by V001) never holds
-registry tables, so V001's reverse can drop it with `RESTRICT`.
+registry tables, so V001's reverse can drop it with `RESTRICT`. The schema is
+named `migration_runner` rather than `migration` so that it can never coincide
+with the connecting role's name: `"$user"` leads the default `search_path`, and
+a schema named after the role would receive every unqualified `CREATE TABLE` a
+script performs, mixing application tables into the registry schema. Nothing
+but the two tables below may live in `migration_runner`.
 
 ## `migration_registry` (append-only attempt history)
 

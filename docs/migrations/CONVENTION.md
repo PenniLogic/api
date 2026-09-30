@@ -55,7 +55,14 @@ a database:
 7. A reversal script never `DROP`s or `TRUNCATE`s with `CASCADE` (enforced;
    `ON DELETE CASCADE` inside a constraint definition is a referential action
    and is allowed). A reverse must fail rather than destroy objects or rows it
-   does not own — V001's `DROP SCHEMA pennilogic RESTRICT` is the model.
+   does not own — V001's `DROP SCHEMA pennilogic RESTRICT` is the model. The
+   lint reads the script the way Postgres does: `--` and nested `/* */`
+   comments are dropped; plain `'…'` literals, `E'…'` escape strings (where
+   `\'` does not close the string), `"…"` identifiers and `$tag$…$tag$` bodies
+   are kept whole, so a keyword inside them cannot be mistaken for a statement
+   and a statement after them cannot be hidden. Plain literals follow
+   `standard_conforming_strings = on`, which the runner sets for every session
+   it opens so a role or database setting cannot change how a script parses.
 8. Rows of an append-only table are never `UPDATE`d or `DELETE`d by any
    script, forward, migrate or reversal: the ledger is corrected by reversing
    transactions (CONSTITUTION.md, "ledger history append-only"). api#2 names
@@ -130,7 +137,7 @@ not by editing the pinned script.
 
 Scripts name their objects with the schema (`pennilogic.accounts`, not
 `accounts`): the runner does not set `search_path`, and the registry itself
-is always addressed as `migration.migration_registry` / `migration.migration_lock`
+is always addressed as `migration_runner.migration_registry` / `migration_runner.migration_lock`
 so that one database has exactly one registry whatever the session or role
 `search_path` is.
 
@@ -212,8 +219,12 @@ noticed by the runner rather than by a timeout elsewhere.
 ## Roles
 
 The runner connects as the migration role, which owns the application schema
-(`pennilogic`) and the registry schema (`migration`, created by the runner's
-bootstrap). The runtime application role is a different role and
+(`pennilogic`) and the registry schema (`migration_runner`, created by the
+runner's bootstrap). The registry schema is deliberately not named after the
+role: the default `search_path` begins with `"$user"`, so a schema called
+`migration` would silently receive every unqualified `CREATE TABLE` a script
+run as role `migration` performs. The round-trip test asserts the runner
+schema holds exactly its two tables after an unqualified create. The runtime application role is a different role and
 is never granted `CREATE` on a schema or ownership of a table; the ledger ticket
 (api#2) and T-SEC-01 define that role's grants. `applied_by` in the registry
 records the holder identity given to the runner, and Postgres records the

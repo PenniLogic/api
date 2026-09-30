@@ -101,8 +101,45 @@ class MigrationRunnerPostgresTest {
         val finalStatus = status(database, shipped)
         assertEquals(1, currentVersion(finalStatus))
         assertTrue(finalStatus.contains("\"lastApplied\":{\"version\":1,\"id\":\"V001__create_pennilogic_schema\""))
-        assertEquals(5L, database.count("SELECT count(*) FROM migration.migration_registry"))
-        assertEquals(1L, database.count("SELECT count(*) FROM migration.migration_lock WHERE holder IS NULL"))
+        assertEquals(5L, database.count("SELECT count(*) FROM migration_runner.migration_registry"))
+        assertEquals(1L, database.count("SELECT count(*) FROM migration_runner.migration_lock WHERE holder IS NULL"))
+        assertRunnerSchemaHoldsOnlyTheRegistry(database)
+    }
+
+    @Test
+    fun `an unqualified create by the migration role never lands in the runner schema`() {
+        val database = TestDatabase.fresh()
+        assertEquals("migration", database.user, "the fixture role is named like the old runner schema on purpose")
+        Fixtures.write(
+            directory,
+            "V001__stray",
+            Fixtures.header() + "CREATE TABLE stray_unqualified (id integer);\n",
+            "DROP TABLE stray_unqualified;\n",
+        )
+        migrate(database, directory)
+        assertEquals(
+            "public",
+            database.scalar(
+                "SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'stray_unqualified'",
+            ),
+        )
+        assertNull(database.scalar("SELECT to_regnamespace('migration')"))
+        assertRunnerSchemaHoldsOnlyTheRegistry(database)
+        val down = Output()
+        assertEquals(0, cli(database, down, "migrate-down", "--holder", "test@junit", "--migrations", directory.toString()))
+        assertRunnerSchemaHoldsOnlyTheRegistry(database)
+    }
+
+    private fun assertRunnerSchemaHoldsOnlyTheRegistry(database: TestDatabase) {
+        val relations =
+            database.query(
+                "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace" +
+                    " WHERE n.nspname = '${Registry.SCHEMA}' AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S') ORDER BY c.relname",
+            ) { rows ->
+                generateSequence { if (rows.next()) rows.getString(1) else null }.toList()
+            }
+        assertEquals(listOf("migration_lock", "migration_registry", "migration_registry_id_seq"), relations)
+        assertEquals("migration_runner", Registry.SCHEMA)
     }
 
     @Test
@@ -141,7 +178,7 @@ class MigrationRunnerPostgresTest {
         val statusOutput = Output()
         assertEquals(1, cli(database, statusOutput, "status", "--migrations", migrations.toString()))
         statusOutput.require("migration_registry_problem")
-        assertEquals(2L, database.count("SELECT count(*) FROM migration.migration_registry"))
+        assertEquals(2L, database.count("SELECT count(*) FROM migration_runner.migration_registry"))
         // RECOVERY.md §3: restore the reviewed content and run again.
         Files.writeString(file, reviewed)
         val restored = migrate(database, migrations)
@@ -211,7 +248,7 @@ class MigrationRunnerPostgresTest {
         assertTrue(again.require("migration_plan").contains("\"steps\":[]"))
         assertNull(again.event("migration_applied"))
         assertEquals(1L, database.count("SELECT count(*) FROM public.acct"))
-        assertEquals(1L, database.count("SELECT count(*) FROM migration.migration_registry"))
+        assertEquals(1L, database.count("SELECT count(*) FROM migration_runner.migration_registry"))
         assertNull(database.scalar("SELECT to_regclass('other.migration_registry')"))
         assertNull(database.scalar("SELECT to_regclass('public.migration_registry')"))
         val currentSchema = TestDatabase(database.url + "?currentSchema=other", database.user, database.password)
@@ -242,7 +279,7 @@ class MigrationRunnerPostgresTest {
         assertEquals(1, cli(database, down, "migrate-down", "--holder", "bob@ci", "--migrations", migrations.toString(), "--target", "0"))
         down.require("migration_plan")
         down.require("migration_lock_refused")
-        assertEquals(1L, database.count("SELECT count(*) FROM migration.migration_registry"))
+        assertEquals(1L, database.count("SELECT count(*) FROM migration_runner.migration_registry"))
         val lockStatus = status(database, migrations)
         assertEquals(1, currentVersion(lockStatus))
         assertTrue(lockStatus.contains("\"lock\":{\"holder\":\"api#55@alice\""))
@@ -311,7 +348,7 @@ class MigrationRunnerPostgresTest {
         assertFalse(output.toString().contains("duplicate key"))
         output.require("migration_lock_released")
         assertNull(database.scalar("SELECT to_regclass('t2')"))
-        assertEquals(1L, database.count("SELECT count(*) FROM migration.migration_registry WHERE state = 'failed' AND version = 2"))
+        assertEquals(1L, database.count("SELECT count(*) FROM migration_runner.migration_registry WHERE state = 'failed' AND version = 2"))
 
         val recovery = status(database, directory)
         assertEquals(1, currentVersion(recovery))
@@ -329,7 +366,7 @@ class MigrationRunnerPostgresTest {
         val recovered = status(database, directory)
         assertEquals(2, currentVersion(recovered))
         assertFalse(recovered.contains("\"state\":\"failed\""))
-        assertEquals(3L, database.count("SELECT count(*) FROM migration.migration_registry"))
+        assertEquals(3L, database.count("SELECT count(*) FROM migration_runner.migration_registry"))
     }
 
     @Test
@@ -357,7 +394,7 @@ class MigrationRunnerPostgresTest {
         val wrongPid = Output()
         assertEquals(1, cli(database, wrongPid, "release-lock", "--holder", "ghost@host", "--host", "gone", "--pid", "98"))
         wrongPid.require("migration_lock_not_held")
-        assertEquals(1L, database.count("SELECT count(*) FROM migration.migration_lock WHERE holder = 'ghost@host'"))
+        assertEquals(1L, database.count("SELECT count(*) FROM migration_runner.migration_lock WHERE holder = 'ghost@host'"))
         val released = Output()
         assertEquals(0, cli(database, released, "release-lock", "--holder", "ghost@host", "--host", "gone", "--pid", "99"))
         val event = released.require("migration_lock_released")
@@ -382,7 +419,7 @@ class MigrationRunnerPostgresTest {
         val error = output.require("runner_error")
         assertTrue(error.contains("V001__commits ended its own transaction"))
         assertTrue(output.require("migration_lock_released").contains("test@junit"))
-        assertEquals(0L, database.count("SELECT count(*) FROM migration.migration_registry"))
+        assertEquals(0L, database.count("SELECT count(*) FROM migration_runner.migration_registry"))
         assertNotNull(database.scalar("SELECT to_regclass('t1')"))
         database.execute("DROP TABLE t1; DROP TABLE t2")
         Fixtures.write(
@@ -469,8 +506,8 @@ class MigrationRunnerPostgresTest {
         assertTrue(plan.contains("\"currentVersion\":0"))
         assertTrue(plan.contains("\"action\":\"apply\""))
         assertNull(emptyRun.event("migration_lock_claimed"))
-        assertNull(database.scalar("SELECT to_regclass('migration.migration_registry')"))
-        assertNull(database.scalar("SELECT to_regclass('migration.migration_lock')"))
+        assertNull(database.scalar("SELECT to_regclass('migration_runner.migration_registry')"))
+        assertNull(database.scalar("SELECT to_regclass('migration_runner.migration_lock')"))
         assertNull(database.scalar("SELECT to_regclass('t1')"))
 
         migrate(database, migrations, "--target", "1")
@@ -484,8 +521,8 @@ class MigrationRunnerPostgresTest {
         assertEquals(before, status(database, migrations))
         assertEquals(1, currentVersion(before))
         assertNull(database.scalar("SELECT to_regclass('t2')"))
-        assertEquals(1L, database.count("SELECT count(*) FROM migration.migration_registry"))
-        assertEquals(1L, database.count("SELECT count(*) FROM migration.migration_lock WHERE holder IS NULL"))
+        assertEquals(1L, database.count("SELECT count(*) FROM migration_runner.migration_registry"))
+        assertEquals(1L, database.count("SELECT count(*) FROM migration_runner.migration_lock WHERE holder IS NULL"))
     }
 
     @Test
@@ -592,7 +629,7 @@ class MigrationRunnerPostgresTest {
         Fixtures.write(
             directory,
             "V001__steal",
-            Fixtures.header() + "UPDATE migration.migration_lock SET holder = 'someone-else';\n",
+            Fixtures.header() + "UPDATE migration_runner.migration_lock SET holder = 'someone-else';\n",
             "SELECT 1;\n",
         )
         val output = Output()
@@ -616,7 +653,7 @@ class MigrationRunnerPostgresTest {
             reversalSteal,
             "V001__steal_on_down",
             Fixtures.header() + "SELECT 1;\n",
-            "UPDATE migration.migration_lock SET holder = 'someone-else';\n",
+            "UPDATE migration_runner.migration_lock SET holder = 'someone-else';\n",
         )
         migrate(other, reversalSteal)
         val down = Output()
@@ -643,27 +680,27 @@ class MigrationRunnerPostgresTest {
         assertTrue(unwritable.require("runner_error").contains("NoSuchFileException"))
         assertFalse(unwritable.toString().contains(database.password))
 
-        database.execute("DELETE FROM migration.migration_registry WHERE version = 1")
+        database.execute("DELETE FROM migration_runner.migration_registry WHERE version = 1")
         val gap = Output()
         assertEquals(1, cli(database, gap, "status", "--migrations", migrations.toString()))
         assertTrue(gap.require("migration_registry_problem").contains("\"kind\":\"registry_not_contiguous\""))
         // RECOVERY.md §4: reinsert the applied row with the checksums that validate prints.
         val lost = MigrationSet.load(migrations).byVersion(1)!!
         database.execute(
-            "INSERT INTO migration.migration_registry (version, migration_id, phase, checksum, reversal_kind, reversal_file," +
+            "INSERT INTO migration_runner.migration_registry (version, migration_id, phase, checksum, reversal_kind, reversal_file," +
                 " reversal_checksum, state, direction, applied_by, host, pid, duration_ms) VALUES" +
                 " (1, '${lost.id}', '${lost.phase.directive}', '${lost.checksum}', '${lost.reversal.kind.directive}'," +
                 " '${lost.reversal.file}', '${lost.reversal.checksum}', 'applied', 'up', 'operator@recovery', 'console', 0, 0)",
         )
         assertEquals(2, currentVersion(status(database, migrations)))
 
-        database.execute("DELETE FROM migration.migration_lock")
+        database.execute("DELETE FROM migration_runner.migration_lock")
         val noLock = Output()
         assertEquals(1, cli(database, noLock, "status", "--migrations", migrations.toString()))
         assertTrue(noLock.require("runner_error").contains("migration_lock singleton row is missing"))
         // RECOVERY.md §4: the next writing command's bootstrap recreates the lock row.
         assertTrue(migrate(database, migrations).require("migration_plan").contains("\"steps\":[]"))
-        assertEquals(1L, database.count("SELECT count(*) FROM migration.migration_lock WHERE holder IS NULL"))
+        assertEquals(1L, database.count("SELECT count(*) FROM migration_runner.migration_lock WHERE holder IS NULL"))
         assertTrue(status(database, migrations).contains("\"lock\":null"))
     }
 

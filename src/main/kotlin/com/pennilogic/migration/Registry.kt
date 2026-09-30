@@ -288,8 +288,13 @@ class Registry(
     ): String = rows.getObject(column, OffsetDateTime::class.java).withOffsetSameInstant(ZoneOffset.UTC).toString()
 
     companion object {
-        /** The runner-owned schema; the application schema (`pennilogic`) is created by V001 and never holds the registry. */
-        const val SCHEMA = "migration"
+        /**
+         * The runner-owned schema. Named so it can never coincide with a role name such as `migration`:
+         * the default `search_path` starts with `"$user"`, so a schema named after the connecting role would
+         * receive every unqualified `CREATE TABLE` a script runs. The application schema (`pennilogic`) is
+         * created by V001 and never holds the registry.
+         */
+        const val SCHEMA = "migration_runner"
 
         private val BOOTSTRAP =
             """
