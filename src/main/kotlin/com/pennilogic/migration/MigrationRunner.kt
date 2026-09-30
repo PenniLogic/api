@@ -100,6 +100,19 @@ class MigrationRunner(
                     mapOf("version" to row.version, "file" to migration.file, "applied" to row.checksum, "current" to migration.checksum),
                 )
             }
+            // The reverse that runs must be the reverse that was recorded as evidence when the migration was applied.
+            if (row.reversalChecksum != migration.reversal.checksum) {
+                throw RegistryProblem(
+                    "reversal_checksum_drift",
+                    mapOf(
+                        "version" to row.version,
+                        "file" to migration.reversal.file,
+                        "appliedFile" to row.reversalFile,
+                        "applied" to row.reversalChecksum,
+                        "current" to migration.reversal.checksum,
+                    ),
+                )
+            }
         }
         return Snapshot(true, applied.size, states, registry.currentLock())
     }
@@ -149,32 +162,30 @@ class MigrationRunner(
                 migration to if (held) "hold" else "apply"
             }
         emit(plan("migrate", dryRun, snapshot.currentVersion, goal, steps))
-        if (dryRun || steps.none { it.second == "apply" }) {
+        if (dryRun) {
+            return 0
+        }
+        if (steps.none { it.second == "apply" }) {
+            // Nothing is written, so no lock is needed; the hold is still reported.
+            steps.forEach { (migration, _) -> emitHeld(migration) }
             return 0
         }
         val claim = registry.claim(identity, "migrate", goal)
         emit(Json.encode(linkedMapOf("event" to "migration_lock_claimed") + claim.payload()))
+        var released = false
         try {
             confirmUnchanged(snapshot.currentVersion)
             for ((migration, action) in steps) {
                 if (action == "hold") {
-                    emit(
-                        Json.event(
-                            "migration_contract_held",
-                            "version" to migration.version,
-                            "id" to migration.id,
-                            "expandVersion" to migration.expandVersion,
-                            "reason" to "contract migrations run only with --include-contract once every consumer has migrated",
-                        ),
-                    )
+                    emitHeld(migration)
                 } else {
                     execute(migration, "up", migration.sql, RowState.APPLIED, migration.version - 1)
                 }
             }
         } finally {
-            releaseOwnLock()
+            released = releaseOwnLock()
         }
-        return 0
+        return if (released) 0 else 1
     }
 
     fun migrateDown(
@@ -201,21 +212,22 @@ class MigrationRunner(
         }
         val claim = registry.claim(identity, "migrate-down", goal)
         emit(Json.encode(linkedMapOf("event" to "migration_lock_claimed") + claim.payload()))
+        var released = false
         try {
             confirmUnchanged(current)
             for ((migration, _) in steps) {
                 execute(migration, "down", migration.reversal.sql, RowState.REVERSED, migration.version)
             }
         } finally {
-            releaseOwnLock()
+            released = releaseOwnLock()
         }
-        return 0
+        return if (released) 0 else 1
     }
 
-    /** Operator release of a lock whose holder process has died; the holder must be named explicitly. */
-    fun releaseLock(holder: String): Boolean {
+    /** Operator release of a lock whose holder process has died; the exact claim (holder, host, pid) must be named. */
+    fun releaseLock(claim: Identity): Boolean {
         registry.bootstrap()
-        return registry.release(holder)
+        return registry.release(claim)
     }
 
     /** The plan was computed before the claim; another runner finishing in between makes it stale. */
@@ -298,12 +310,30 @@ class MigrationRunner(
         }
     }
 
-    private fun releaseOwnLock() {
-        if (registry.releaseOwn(identity)) {
-            emit(Json.event("migration_lock_released", "holder" to identity.holder, "host" to identity.host, "pid" to identity.pid))
-        } else {
-            emit(Json.event("migration_lock_release_mismatch", "holder" to identity.holder, "host" to identity.host, "pid" to identity.pid))
-        }
+    /** Releases the runner's own claim; false means the claim was gone and a second writer may have overlapped. */
+    private fun releaseOwnLock(): Boolean {
+        val released = registry.release(identity)
+        emit(
+            Json.event(
+                if (released) "migration_lock_released" else "migration_lock_release_mismatch",
+                "holder" to identity.holder,
+                "host" to identity.host,
+                "pid" to identity.pid,
+            ),
+        )
+        return released
+    }
+
+    private fun emitHeld(migration: Migration) {
+        emit(
+            Json.event(
+                "migration_contract_held",
+                "version" to migration.version,
+                "id" to migration.id,
+                "expandVersion" to migration.expandVersion,
+                "reason" to "contract migrations run only with --include-contract once every consumer has migrated",
+            ),
+        )
     }
 
     private fun plan(

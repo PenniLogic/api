@@ -1,10 +1,20 @@
 # Migration registry and lock contract (T-MIG-01, api#55)
 
-The registry is two tables owned by the runner and bootstrapped idempotently
-(`CREATE TABLE IF NOT EXISTS`) at the start of every writing command. They are
-infrastructure, like a schema-history table, not migrations: they must exist
-before the first migration so that even V001 is applied under the lock and
-recorded with its checksum. `--dry-run` never bootstraps them.
+The registry is two tables in the runner-owned schema `migration` —
+`migration.migration_registry` and `migration.migration_lock` — bootstrapped
+idempotently (`CREATE SCHEMA IF NOT EXISTS`, `CREATE TABLE IF NOT EXISTS`) at the
+start of every writing command. They are infrastructure, like a schema-history
+table, not migrations: they must exist before the first migration so that even
+V001 is applied under the lock and recorded with its checksum. `--dry-run` never
+bootstraps them.
+
+Every statement the runner issues names the schema explicitly, including the
+`to_regclass('migration.migration_registry')` existence probe, so the registry
+is one fact per database: a role or database `search_path` that omits the
+schema, or `?currentSchema=` / `options=-c search_path=` in `MIGRATION_JDBC_URL`,
+changes nothing — the runner still finds the same registry and never bootstraps
+a second one. The application schema (`pennilogic`, created by V001) never holds
+registry tables, so V001's reverse can drop it with `RESTRICT`.
 
 ## `migration_registry` (append-only attempt history)
 
@@ -14,7 +24,7 @@ recorded with its checksum. `--dry-run` never bootstraps them.
 | `version`, `migration_id` | `1`, `V001__create_pennilogic_schema`. |
 | `phase` | `expand`, `migrate` or `contract`. |
 | `checksum` | SHA-256 of the up script at the time of the attempt. |
-| `reversal_kind`, `reversal_file`, `reversal_reason`, `reversal_checksum` | The reversal evidence declared by the migration when this row was written. |
+| `reversal_kind`, `reversal_file`, `reversal_reason`, `reversal_checksum` | The reversal evidence declared by the migration when this row was written; the checksum pins the reversal script until the migration is reversed. |
 | `state` | `applied`, `reversed` or `failed`. |
 | `direction` | `up` or `down`: which script the attempt ran. |
 | `applied_by`, `host`, `pid` | The holder identity given to the runner and where it ran. |
@@ -29,7 +39,8 @@ applied. The applied versions must form the contiguous prefix `1..n` of the
 migration files and each applied row's `migration_id` and `checksum` must match
 the file; any other shape stops every command with
 `migration_registry_problem` (`registry_not_contiguous`,
-`applied_migration_missing`, `applied_migration_renamed`, `checksum_drift`).
+`applied_migration_missing`, `applied_migration_renamed`, `checksum_drift`,
+`reversal_checksum_drift`).
 
 ## `migration_lock` (single row)
 
@@ -42,14 +53,17 @@ the file; any other shape stops every command with
 | `command` | `migrate` or `migrate-down`. |
 | `target_version` | The version the holder is moving towards. |
 
-A claim is `SELECT ... FOR UPDATE` on the row followed by the `UPDATE` in one
-short transaction, so two runners starting together are serialised by Postgres
-and the loser reads the winner's committed claim. The claim is committed before
-any migration runs and released (matching holder, host and pid) after the last
-one, whether it succeeded or failed. A refused claim exits 1 with
+A claim is `SELECT ... FOR UPDATE` on the row followed by an `UPDATE ... WHERE
+holder IS NULL` in one short transaction, so two runners starting together are
+serialised by Postgres and the loser reads the winner's committed claim. The
+claim is committed before any migration runs and released after the last one,
+whether it succeeded or failed. Every release — the runner's own and the
+operator's `release-lock` — matches holder, host **and** pid, so naming a
+holder string alone clears nothing. A refused claim exits 1 with
 `migration_lock_refused` carrying the holder's payload, and the exception
 message reads `migration lock is held by <holder> on <host> (pid <pid>) since
-<claimedAt> running <command> towards V###`.
+<claimedAt> running <command> towards V###`. A runner whose own claim is gone
+at release time reports `migration_lock_release_mismatch` and exits 1.
 
 ## Claim and release payload
 
@@ -73,13 +87,15 @@ the check reads is the lock the runner takes. It appears verbatim as the
 - `holder`: 1-120 characters of `A-Z a-z 0-9 . _ @ # / : -`, starting with a
   letter or digit. Name the ticket and the job or person, for example
   `api#2@release-2026-10` or `basiltt@laptop`. It is the value a check
-  compares against the pull request's plan item and the value an operator
-  passes to `release-lock`.
+  compares against the pull request's plan item; together with `host` and
+  `pid` it is what an operator passes to `release-lock`.
 - `claimedAt`: ISO-8601 in UTC, taken from the database server clock.
 - `targetVersion`: the integer version the holder is moving towards.
 
 A release is the same identity (`holder`, `host`, `pid`) as event
-`migration_lock_released`; an operator release adds `"releasedBy": "operator"`.
+`migration_lock_released`; an operator release adds `"releasedBy": "operator"`,
+and a release that matched no claim is `migration_lock_not_held` with the
+same three fields.
 
 ### Ownership boundary with T-GOV-04
 
@@ -109,21 +125,23 @@ Every line the runner prints is one JSON object with an `event` field:
 | `migration_validation_failed` | A convention rule failed; `file`, `rule`. |
 | `migration_plan` | Before any write: `command`, `dryRun`, `currentVersion`, `targetVersion`, `steps[]` with `action` `apply`, `hold` or `reverse`. |
 | `migration_lock_claimed`, `migration_lock_released`, `migration_lock_refused` | Lock lifecycle; payload above. |
-| `migration_lock_release_mismatch` | The runner's own claim was gone at release time (someone force-released it while it ran). |
-| `migration_lock_not_held` | `release-lock` named a holder that does not hold the lock. |
+| `migration_lock_release_mismatch` | The runner's own claim was gone at release time (someone force-released it while it ran); the run exits 1. |
+| `migration_lock_not_held` | `release-lock` named a holder, host and pid that do not match the current claim. |
 | `migration_applied`, `migration_reversed` | One migration finished; `version`, `id`, `phase`, `checksum`, `reversal`, `reason`, `durationMs`. |
-| `migration_contract_held` | A contract migration was skipped without `--include-contract`. |
+| `migration_contract_held` | A contract migration was skipped without `--include-contract`; reported on every non-dry run that holds, including one that applies nothing. |
 | `migration_slow` | A migration exceeded the threshold and is still running. |
 | `migration_failed` | A statement failed; `version`, `id`, `direction`, `knownVersion` and the redacted failure fields. |
-| `migration_registry_problem` | Registry and files disagree; `kind` (`registry_not_contiguous`, `applied_migration_missing`, `applied_migration_renamed`, `checksum_drift`, `registry_changed_before_lock`) and details. |
+| `migration_registry_problem` | Registry and files disagree; `kind` (`registry_not_contiguous`, `applied_migration_missing`, `applied_migration_renamed`, `checksum_drift`, `reversal_checksum_drift`, `registry_changed_before_lock`) and details. |
 | `migration_status` | `registryPresent`, `currentVersion`, `latestVersion`, `lastApplied`, `lock`, `migrations[]` (record plus `state` `pending`/`applied`/`failed`/`reversed` and `lastAttempt`). |
 | `database_error` | A database error outside a migration (connection, bootstrap); codes only. |
-| `runner_error` | An internal invariant failed, for example a missing lock row. |
+| `runner_error` | An internal invariant failed (a missing lock row, a script that ended its own transaction) or a file could not be written (`--status-file`). |
 | `usage_error` | Bad arguments or missing environment; exit 2. |
 
 ## Observability
 
 `status --status-file <path>` (Gradle: `migrateStatus` then read the JSON) writes
 the current version, last applied migration and lock holder to a file that a
-dashboard or a deploy step can read without a database session. Registry
-timestamps are server time and always reported in UTC.
+dashboard or a deploy step can read without a database session. The file is
+written to a sibling temporary file and renamed into place, so a reader never
+sees a partial document. Registry timestamps are server time and always
+reported in UTC.

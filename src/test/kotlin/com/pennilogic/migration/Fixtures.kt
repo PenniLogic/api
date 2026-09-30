@@ -88,11 +88,14 @@ class Output {
  * One disposable database per test inside the container that the Gradle integrationTest task
  * starts (or any Postgres named through MIGRATION_TEST_JDBC_URL/_DB_USER/_DB_PASSWORD).
  */
-class TestDatabase private constructor(
+class TestDatabase(
     val url: String,
     val user: String,
     val password: String,
 ) {
+    /** The database name, which is the last path segment of the JDBC URL. */
+    val name: String get() = url.substringAfterLast('/').substringBefore('?')
+
     fun environment(): Map<String, String> =
         mapOf("MIGRATION_JDBC_URL" to url, "MIGRATION_DB_USER" to user, "MIGRATION_DB_PASSWORD" to password)
 

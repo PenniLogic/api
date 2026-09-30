@@ -92,7 +92,9 @@ data class RegistryRow(
     val direction: String,
     val checksum: String,
     val reversalKind: ReversalKind,
+    val reversalFile: String,
     val reversalReason: String?,
+    val reversalChecksum: String,
     val appliedBy: String,
     val host: String,
     val attemptedAt: String,
@@ -114,6 +116,8 @@ data class RegistryRow(
 /**
  * JDBC client for the runner-owned registry tables. The registry is append-only: every attempt
  * is one row and the current state of a version is derived from its latest non-failed row.
+ * Every reference is schema-qualified (`migration.*`) so the registry is one fact per database,
+ * independent of the session's `search_path`.
  */
 class Registry(
     private val connection: Connection,
@@ -122,7 +126,7 @@ class Registry(
         connection.createStatement().use { statement ->
             statement
                 .executeQuery(
-                    "SELECT to_regclass('migration_registry') IS NOT NULL AND to_regclass('migration_lock') IS NOT NULL",
+                    "SELECT to_regclass('$SCHEMA.migration_registry') IS NOT NULL AND to_regclass('$SCHEMA.migration_lock') IS NOT NULL",
                 ).use { rows ->
                     rows.next()
                     rows.getBoolean(1)
@@ -203,7 +207,8 @@ class Registry(
                     statement.setString(4, command)
                     statement.setInt(5, targetVersion)
                     statement.executeQuery().use { rows ->
-                        rows.next()
+                        // Unreachable while the row lock is held; kept as defence in depth with the holder IS NULL predicate.
+                        check(rows.next()) { "migration_lock claim found the row taken after FOR UPDATE" }
                         readClaim(rows)
                     }
                 }
@@ -217,16 +222,12 @@ class Registry(
         }
     }
 
-    /** Releases the lock only when the named holder owns it, so a stale claim can never be cleared by accident. */
-    fun release(holder: String): Boolean =
+    /**
+     * Releases the lock only for the exact claim (holder, host and pid), so a stale claim can never be
+     * cleared by naming the holder alone; the same match is used for the runner's own release.
+     */
+    fun release(identity: Identity): Boolean =
         connection.prepareStatement(RELEASE_LOCK).use { statement ->
-            statement.setString(1, holder)
-            statement.executeUpdate() == 1
-        }
-
-    /** Releases the runner's own claim, matching holder, host and pid so a re-claimed lock is left alone. */
-    fun releaseOwn(identity: Identity): Boolean =
-        connection.prepareStatement("$RELEASE_LOCK AND host = ? AND pid = ?").use { statement ->
             statement.setString(1, identity.holder)
             statement.setString(2, identity.host)
             statement.setLong(3, identity.pid)
@@ -270,7 +271,9 @@ class Registry(
             direction = rows.getString("direction"),
             checksum = rows.getString("checksum"),
             reversalKind = ReversalKind.valueOf(rows.getString("reversal_kind").uppercase()),
+            reversalFile = rows.getString("reversal_file"),
             reversalReason = rows.getString("reversal_reason"),
+            reversalChecksum = rows.getString("reversal_checksum"),
             appliedBy = rows.getString("applied_by"),
             host = rows.getString("host"),
             attemptedAt = timestamp(rows, "attempted_at"),
@@ -285,9 +288,13 @@ class Registry(
     ): String = rows.getObject(column, OffsetDateTime::class.java).withOffsetSameInstant(ZoneOffset.UTC).toString()
 
     companion object {
+        /** The runner-owned schema; the application schema (`pennilogic`) is created by V001 and never holds the registry. */
+        const val SCHEMA = "migration"
+
         private val BOOTSTRAP =
             """
-            CREATE TABLE IF NOT EXISTS migration_registry (
+            CREATE SCHEMA IF NOT EXISTS $SCHEMA;
+            CREATE TABLE IF NOT EXISTS $SCHEMA.migration_registry (
                 id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
                 version integer NOT NULL CHECK (version > 0),
                 migration_id text NOT NULL,
@@ -311,7 +318,7 @@ class Registry(
                 failure_column text,
                 failure_position integer
             );
-            CREATE TABLE IF NOT EXISTS migration_lock (
+            CREATE TABLE IF NOT EXISTS $SCHEMA.migration_lock (
                 singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
                 holder text,
                 host text,
@@ -320,23 +327,24 @@ class Registry(
                 command text,
                 target_version integer
             );
-            INSERT INTO migration_lock (singleton) VALUES (true) ON CONFLICT DO NOTHING;
+            INSERT INTO $SCHEMA.migration_lock (singleton) VALUES (true) ON CONFLICT DO NOTHING;
             """.trimIndent()
         private const val SELECT_ROWS =
-            "SELECT version, migration_id, state, direction, checksum, reversal_kind, reversal_reason, applied_by, host," +
-                " attempted_at, duration_ms, failure_sqlstate, failure_schema, failure_table, failure_constraint," +
-                " failure_column, failure_position FROM migration_registry ORDER BY id"
+            "SELECT version, migration_id, state, direction, checksum, reversal_kind, reversal_file, reversal_reason," +
+                " reversal_checksum, applied_by, host, attempted_at, duration_ms, failure_sqlstate, failure_schema, failure_table," +
+                " failure_constraint, failure_column, failure_position FROM $SCHEMA.migration_registry ORDER BY id"
         private const val INSERT_ROW =
-            "INSERT INTO migration_registry (version, migration_id, phase, checksum, reversal_kind, reversal_file," +
+            "INSERT INTO $SCHEMA.migration_registry (version, migration_id, phase, checksum, reversal_kind, reversal_file," +
                 " reversal_reason, reversal_checksum, state, direction, applied_by, host, pid, duration_ms, failure_sqlstate," +
                 " failure_schema, failure_table, failure_constraint, failure_column, failure_position)" +
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        private const val SELECT_LOCK = "SELECT holder, host, pid, claimed_at, command, target_version FROM migration_lock WHERE singleton"
+        private const val SELECT_LOCK =
+            "SELECT holder, host, pid, claimed_at, command, target_version FROM $SCHEMA.migration_lock WHERE singleton"
         private const val CLAIM_LOCK =
-            "UPDATE migration_lock SET holder = ?, host = ?, pid = ?, claimed_at = now(), command = ?, target_version = ?" +
-                " WHERE singleton RETURNING holder, host, pid, claimed_at, command, target_version"
+            "UPDATE $SCHEMA.migration_lock SET holder = ?, host = ?, pid = ?, claimed_at = now(), command = ?, target_version = ?" +
+                " WHERE singleton AND holder IS NULL RETURNING holder, host, pid, claimed_at, command, target_version"
         private const val RELEASE_LOCK =
-            "UPDATE migration_lock SET holder = NULL, host = NULL, pid = NULL, claimed_at = NULL, command = NULL," +
-                " target_version = NULL WHERE singleton AND holder = ?"
+            "UPDATE $SCHEMA.migration_lock SET holder = NULL, host = NULL, pid = NULL, claimed_at = NULL, command = NULL," +
+                " target_version = NULL WHERE singleton AND holder = ? AND host = ? AND pid = ?"
     }
 }

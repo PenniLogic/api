@@ -25,6 +25,9 @@ class MigrationSet private constructor(
         private val REQUIRED_DIRECTIVES = listOf("phase", "owner", "reversal")
         private val KNOWN_DIRECTIVES = REQUIRED_DIRECTIVES + listOf("reason", "expand")
 
+        // DROP ... CASCADE and TRUNCATE ... CASCADE within one statement; ON DELETE CASCADE in a constraint is not matched.
+        private val DESTRUCTIVE_CASCADE = Regex("""\b(?:DROP|TRUNCATE)\b[^;]*\bCASCADE\b""", RegexOption.IGNORE_CASE)
+
         fun label(version: Int): String = "V" + version.toString().padStart(3, '0')
 
         fun load(directory: Path): MigrationSet {
@@ -108,8 +111,15 @@ class MigrationSet private constructor(
                 throw ConventionViolation(upName, "script has no SQL statements")
             }
             val reversalSql = Files.readString(directory.resolve(reversalName))
-            if (statements(reversalSql).isEmpty()) {
+            val reversalStatements = statements(reversalSql)
+            if (reversalStatements.isEmpty()) {
                 throw ConventionViolation(reversalName, "reversal script has no SQL statements")
+            }
+            if (DESTRUCTIVE_CASCADE.containsMatchIn(reversalStatements.joinToString(" "))) {
+                throw ConventionViolation(
+                    reversalName,
+                    "reversal scripts must not DROP or TRUNCATE with CASCADE: a reverse must fail rather than destroy objects or rows it does not own",
+                )
             }
             return Migration(
                 version = version,
@@ -182,6 +192,10 @@ class MigrationSet private constructor(
         }
 
         private fun statements(script: String): List<String> =
-            script.lines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("--") }
+            SqlText
+                .withoutComments(script)
+                .lines()
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
     }
 }

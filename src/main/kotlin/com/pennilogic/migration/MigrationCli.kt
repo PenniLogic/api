@@ -1,9 +1,11 @@
 package com.pennilogic.migration
 
+import java.io.IOException
 import java.io.PrintStream
 import java.net.InetAddress
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
 import java.sql.DriverManager
 import java.sql.SQLException
 import java.time.Duration
@@ -32,6 +34,8 @@ data class Options(
     val migrations: Path,
     /** The identity recorded in the registry; "read-only" for commands that never write. */
     val holder: String,
+    /** The exact claim to clear; only release-lock takes it, and only in full. */
+    val releaseClaim: Identity?,
     val target: Int?,
     val includeContract: Boolean,
     val dryRun: Boolean,
@@ -42,7 +46,7 @@ data class Options(
 /**
  * Command-line entry point. Connection settings come only from the environment
  * (MIGRATION_JDBC_URL, MIGRATION_DB_USER, MIGRATION_DB_PASSWORD) and are never printed.
- * Exit codes: 0 success, 1 refused or failed (an event names why), 2 usage error.
+ * Exit codes: 0 success, 1 refused, failed or ended without its own lock (an event names why), 2 usage error.
  */
 class MigrationCli(
     private val out: PrintStream,
@@ -61,7 +65,7 @@ class MigrationCli(
                 Command.STATUS -> withRunner(options) { runner -> status(runner, options) }
                 Command.MIGRATE -> withRunner(options) { runner -> runner.migrate(options.target, options.includeContract, options.dryRun) }
                 Command.MIGRATE_DOWN -> withRunner(options) { runner -> runner.migrateDown(options.target, options.dryRun) }
-                Command.RELEASE_LOCK -> withRunner(options) { runner -> releaseLock(runner, options.holder) }
+                Command.RELEASE_LOCK -> withRunner(options) { runner -> releaseLock(runner, requireNotNull(options.releaseClaim)) }
             }
         } catch (error: UsageError) {
             usage(error)
@@ -75,6 +79,10 @@ class MigrationCli(
             emit(Json.encode(linkedMapOf("event" to "migration_lock_refused") + error.claim.payload()))
             1
         } catch (error: IllegalStateException) {
+            emit(Json.event("runner_error", "type" to error.javaClass.name, "message" to error.message))
+            1
+        } catch (error: IOException) {
+            // A status file that cannot be written or a host name that cannot be resolved; paths only, never credentials.
             emit(Json.event("runner_error", "type" to error.javaClass.name, "message" to error.message))
             1
         } catch (error: MigrationFailed) {
@@ -137,21 +145,38 @@ class MigrationCli(
     ): Int {
         val report = runner.status()
         emit(Json.encode(linkedMapOf("event" to "migration_status") + report))
-        options.statusFile?.let { Files.writeString(it, Json.encode(report) + "\n") }
+        options.statusFile?.let { writeAtomically(it, Json.encode(report) + "\n") }
         return 0
+    }
+
+    /** A reader never sees a partial status file: the content lands in a sibling temp file and is renamed over the target. */
+    private fun writeAtomically(
+        target: Path,
+        content: String,
+    ) {
+        val directory = target.toAbsolutePath().parent
+        val temporary = Files.createTempFile(directory, ".${target.fileName}.", ".tmp")
+        try {
+            Files.writeString(temporary, content)
+            Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+        } finally {
+            Files.deleteIfExists(temporary)
+        }
     }
 
     private fun releaseLock(
         runner: MigrationRunner,
-        holder: String,
-    ): Int =
-        if (runner.releaseLock(holder)) {
-            emit(Json.event("migration_lock_released", "holder" to holder, "releasedBy" to "operator"))
+        claim: Identity,
+    ): Int {
+        val fields = arrayOf("holder" to claim.holder, "host" to claim.host, "pid" to claim.pid)
+        return if (runner.releaseLock(claim)) {
+            emit(Json.event("migration_lock_released", *fields, "releasedBy" to "operator"))
             0
         } else {
-            emit(Json.event("migration_lock_not_held", "holder" to holder))
+            emit(Json.event("migration_lock_not_held", *fields))
             1
         }
+    }
 
     private fun required(name: String): String = environment[name] ?: throw UsageError("environment variable $name is required")
 
@@ -166,14 +191,16 @@ class MigrationCli(
 
     companion object {
         const val USAGE =
-            "validate|status|migrate|migrate-down|release-lock [--migrations DIR] [--holder ID] [--target N]" +
-                " [--include-contract] [--dry-run] [--status-file PATH] [--slow-threshold-seconds N]"
+            "validate|status|migrate|migrate-down|release-lock [--migrations DIR] [--holder ID] [--host NAME] [--pid N]" +
+                " [--target N] [--include-contract] [--dry-run] [--status-file PATH] [--slow-threshold-seconds N]"
         private val HOLDER = Regex("""^[A-Za-z0-9][A-Za-z0-9._@#/:-]{0,119}$""")
 
         /** Mutable parse state; each option is handled by one table entry so every path is plainly testable. */
         private class Arguments {
             var migrations: Path = Path.of("src", "main", "resources", "db", "migrations")
             var holder: String? = null
+            var host: String? = null
+            var pid: Long? = null
             var target: Int? = null
             var includeContract = false
             var dryRun = false
@@ -187,6 +214,12 @@ class MigrationCli(
                 "--dry-run" to { _, _ -> dryRun = true },
                 "--migrations" to { iterator, option -> migrations = Path.of(value(iterator, option)) },
                 "--holder" to { iterator, option -> holder = value(iterator, option) },
+                "--host" to { iterator, option -> host = value(iterator, option) },
+                "--pid" to { iterator, option ->
+                    pid =
+                        value(iterator, option).toLongOrNull()?.takeIf { it >= 0 }
+                            ?: throw UsageError("$option requires a non-negative integer")
+                },
                 "--status-file" to { iterator, option -> statusFile = Path.of(value(iterator, option)) },
                 "--target" to { iterator, option ->
                     target =
@@ -219,16 +252,39 @@ class MigrationCli(
             if (writes && holder == null) {
                 throw UsageError("--holder is required for ${command.token} because the registry records who applied each change")
             }
+            val releaseClaim = releaseClaim(command, holder, arguments.host, arguments.pid)
             return Options(
                 command = command,
                 migrations = arguments.migrations,
                 holder = holder ?: "read-only",
+                releaseClaim = releaseClaim,
                 target = arguments.target,
                 includeContract = arguments.includeContract,
                 dryRun = arguments.dryRun,
                 statusFile = arguments.statusFile,
                 slowThreshold = arguments.slowThreshold,
             )
+        }
+
+        /** release-lock names the exact claim from the refusal event; the other commands must not carry host or pid. */
+        private fun releaseClaim(
+            command: Command,
+            holder: String?,
+            host: String?,
+            pid: Long?,
+        ): Identity? {
+            if (command != Command.RELEASE_LOCK) {
+                if (host != null || pid != null) {
+                    throw UsageError("--host and --pid are only valid for release-lock")
+                }
+                return null
+            }
+            if (host == null || pid == null) {
+                throw UsageError(
+                    "release-lock requires --holder, --host and --pid exactly as the migration_lock_refused event reports them",
+                )
+            }
+            return Identity(requireNotNull(holder), host, pid)
         }
 
         private fun value(

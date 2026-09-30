@@ -129,10 +129,16 @@ val integrationTest =
             events("failed", "skipped")
         }
         val docker = dockerAvailable
+        val ci = providers.environmentVariable("CI")
         onlyIf("Docker is required for the Postgres migration tests") { task ->
             // A machine without the docker binary makes the probe throw; treat that as unavailable.
             val available = runCatching { docker.get() }.getOrDefault(false)
             if (!available) {
+                if (ci.isPresent) {
+                    throw GradleException(
+                        "integrationTest requires Docker in CI: the Postgres migration tests run on every pull request and are never skipped there.",
+                    )
+                }
                 task.logger.warn(
                     "integrationTest SKIPPED: Docker is not available on this machine, so the Postgres migration tests" +
                         " did not run. CI (ubuntu-24.04 with Docker) runs them on every pull request.",
@@ -157,6 +163,15 @@ val integrationTest =
                     .lines()
                     .last()
                     .trim()
+            }
+            // A previous run whose JVM died before its finalizer may have left this container behind; remove exactly that one.
+            if (file.isFile) {
+                ProcessBuilder("docker", "rm", "-f", file.readText().trim())
+                    .redirectErrorStream(true)
+                    .start()
+                    .apply { inputStream.readAllBytes() }
+                    .waitFor()
+                file.delete()
             }
             val password = UUID.randomUUID().toString()
             val id =
@@ -191,6 +206,25 @@ val integrationTest =
             environment("MIGRATION_TEST_JDBC_URL", "jdbc:postgresql://127.0.0.1:$port/pennilogic")
             environment("MIGRATION_TEST_DB_USER", "migration")
             environment("MIGRATION_TEST_DB_PASSWORD", password)
+        }
+        // Direct assertion that the Postgres tests executed: a run with none discovered or any skipped is a failure.
+        val junitXml = reports.junitXml.outputLocation
+        doLast {
+            val parser =
+                javax.xml.parsers.DocumentBuilderFactory
+                    .newInstance()
+                    .newDocumentBuilder()
+            val suites =
+                junitXml
+                    .get()
+                    .asFile
+                    .listFiles { file -> file.name.endsWith(".xml") }
+                    .orEmpty()
+                    .map { parser.parse(it).documentElement }
+            val count = suites.sumOf { it.getAttribute("tests").toInt() }
+            val skipped = suites.sumOf { it.getAttribute("skipped").toInt() }
+            check(count > 0 && skipped == 0) { "integrationTest must execute the Postgres migration tests: tests=$count skipped=$skipped" }
+            logger.lifecycle("""{"event":"integration_tests","count":$count,"skipped":$skipped}""")
         }
         finalizedBy(stopMigrationTestPostgres)
     }
@@ -251,9 +285,13 @@ tasks.jacocoTestCoverageVerification {
     dependsOn(tasks.jacocoTestReport)
     executionData.setFrom(fileTree(layout.buildDirectory.dir("jacoco")) { include("*.exec") })
     val docker = dockerAvailable
+    val ci = providers.environmentVariable("CI")
     onlyIf("the coverage gate needs the Postgres tests, which need Docker") { task ->
         val available = runCatching { docker.get() }.getOrDefault(false)
         if (!available) {
+            if (ci.isPresent) {
+                throw GradleException("jacocoTestCoverageVerification requires the Postgres tests in CI, which require Docker.")
+            }
             task.logger.warn("jacocoTestCoverageVerification SKIPPED: without Docker the Postgres tests did not run; CI enforces the gate.")
         }
         available

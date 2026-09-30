@@ -1,10 +1,10 @@
 {
   "LINE": {
-    "covered": 798,
-    "total": 801
+    "covered": 909,
+    "total": 912
   },
   "BRANCH": {
-    "covered": 339,
-    "total": 341
+    "covered": 398,
+    "total": 403
   }
 }

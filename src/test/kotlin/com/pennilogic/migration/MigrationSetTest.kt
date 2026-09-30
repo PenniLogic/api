@@ -164,6 +164,81 @@ class MigrationSetTest {
     }
 
     @Test
+    fun `block comments are not statements`() {
+        Fixtures.write(directory, "V001__x", Fixtures.header() + "SELECT 1;\n", down = "/* nothing to undo */\n")
+        assertViolation("V001__x.down.sql", "reversal script has no SQL statements")
+        Fixtures.write(directory, "V001__x", Fixtures.header() + "SELECT 1;\n", down = "/* multi\n   line\n   placeholder */\n")
+        assertViolation("V001__x.down.sql", "reversal script has no SQL statements")
+        Fixtures.write(
+            directory,
+            "V001__x",
+            Fixtures.header() + "SELECT 1;\n",
+            down = "/* outer /* nested */ still a comment */\n-- and a line\n",
+        )
+        assertViolation("V001__x.down.sql", "reversal script has no SQL statements")
+        Fixtures.write(directory, "V001__x", Fixtures.header() + "/* forward change described here */\n")
+        assertViolation("V001__x.up.sql", "script has no SQL statements")
+        Files.delete(directory.resolve("V001__x.down.sql"))
+        Fixtures.write(
+            directory,
+            "V001__x",
+            Fixtures.header(reversal = "compensating", reason = "why") + "SELECT 1;\n",
+            down = null,
+            compensating = "/* TODO */\n",
+        )
+        assertViolation("V001__x.compensating.sql", "reversal script has no SQL statements")
+        Files.delete(directory.resolve("V001__x.compensating.sql"))
+        Fixtures.write(
+            directory,
+            "V001__x",
+            Fixtures.header() + "/* create */ CREATE TABLE t (id integer); -- done\n",
+            down = "/* drop */\nDROP TABLE t;\n",
+        )
+        assertEquals(1, MigrationSet.load(directory).latestVersion)
+        Fixtures.write(directory, "V001__x", Fixtures.header() + "SELECT 1;\n", down = "SELECT '/* not a comment */';\n")
+        assertEquals(1, MigrationSet.load(directory).latestVersion)
+    }
+
+    @Test
+    fun `reversal scripts must not drop or truncate with cascade`() {
+        Fixtures.write(directory, "V001__x", Fixtures.header() + "CREATE SCHEMA s;\n", down = "DROP SCHEMA s CASCADE;\n")
+        assertViolation("V001__x.down.sql", "must not DROP or TRUNCATE with CASCADE")
+        Fixtures.write(directory, "V001__x", Fixtures.header() + "CREATE TABLE t (id integer);\n", down = "drop table t\n  cascade;\n")
+        assertViolation("V001__x.down.sql", "must not DROP or TRUNCATE with CASCADE")
+        Fixtures.write(directory, "V001__x", Fixtures.header() + "CREATE TABLE t (id integer);\n", down = "TRUNCATE t, u CASCADE;\n")
+        assertViolation("V001__x.down.sql", "must not DROP or TRUNCATE with CASCADE")
+        Fixtures.write(
+            directory,
+            "V001__x",
+            Fixtures.header() + "CREATE TABLE t (id integer);\n",
+            down = "ALTER TABLE t DROP COLUMN c CASCADE;\n",
+        )
+        assertViolation("V001__x.down.sql", "must not DROP or TRUNCATE with CASCADE")
+        Files.delete(directory.resolve("V001__x.down.sql"))
+        Fixtures.write(
+            directory,
+            "V001__x",
+            Fixtures.header(reversal = "compensating", reason = "why") + "SELECT 1;\n",
+            down = null,
+            compensating = "DROP TYPE mood CASCADE;\n",
+        )
+        assertViolation("V001__x.compensating.sql", "must not DROP or TRUNCATE with CASCADE")
+        Files.delete(directory.resolve("V001__x.compensating.sql"))
+        // A CASCADE that only appears in a comment or as a referential action is not a destructive cascade.
+        Fixtures.write(
+            directory,
+            "V001__x",
+            Fixtures.header() + "CREATE TABLE t (id integer);\n",
+            down =
+                "-- never DROP ... CASCADE here\n" +
+                    "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (id) REFERENCES p (id) ON DELETE CASCADE;\nDROP TABLE t;\n",
+        )
+        assertEquals(1, MigrationSet.load(directory).latestVersion)
+        Fixtures.write(directory, "V001__x", Fixtures.header() + "DROP TABLE old CASCADE;\n", down = "SELECT 1;\n")
+        assertEquals(1, MigrationSet.load(directory).latestVersion)
+    }
+
+    @Test
     fun `expand references are validated per phase`() {
         Fixtures.write(directory, "V001__x", Fixtures.header(phase = "contract") + "SELECT 1;\n")
         assertViolation("V001__x.up.sql", "a contract migration must name the expand migration")

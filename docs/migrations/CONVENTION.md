@@ -36,8 +36,12 @@ a database:
    the second merge, which is the intended serialization point.
 3. Every version has exactly one up script and exactly one reversal script.
    A version with neither a down nor a compensating script fails with
-   "reversal evidence is required". A comment-only script fails with "no SQL
-   statements": an empty reverse is not evidence.
+   "reversal evidence is required". A script with no statement outside `--`
+   line comments and `/* */` block comments (nested or multi-line) fails with
+   "no SQL statements": an empty reverse is not evidence. This rule is
+   syntactic — `SELECT 1;` passes it — so the CI round trip (apply, then
+   reverse, on every pull request) is the semantic evidence that the reverse
+   undoes the change.
 4. The up script starts with a header block of `-- key: value` lines (a
    lowercase word, a colon, a value; other comment lines are ignored; the block
    ends at the first SQL line). Required: `phase`, `owner`, `reversal`.
@@ -48,6 +52,16 @@ a database:
    `compensating` with `.compensating.sql`).
 6. `expand: V###` must name an earlier migration of the set whose phase is
    `expand`.
+7. A reversal script never `DROP`s or `TRUNCATE`s with `CASCADE` (enforced;
+   `ON DELETE CASCADE` inside a constraint definition is a referential action
+   and is allowed). A reverse must fail rather than destroy objects or rows it
+   does not own — V001's `DROP SCHEMA pennilogic RESTRICT` is the model.
+8. Rows of an append-only table are never `UPDATE`d or `DELETE`d by any
+   script, forward, migrate or reversal: the ledger is corrected by reversing
+   transactions (CONSTITUTION.md, "ledger history append-only"). api#2 names
+   its append-only tables when it creates them, and a pull request whose
+   scripts touch their rows fails review. This rule is reviewed, not machine
+   checked, until those tables exist.
 
 Example (the shipped baseline):
 
@@ -86,9 +100,18 @@ A migration is immutable once it has been applied anywhere. Fix a mistake with
 a new migration. A migration that only ever *failed* (a `failed` registry row,
 never `applied`) may be edited and retried, because nothing was written.
 
-The reversal script's checksum is recorded too (at apply and at reverse), but a
-changed reversal script does not stop a forward run: CI rehearses the current
-reversal on every pull request, which is the evidence that matters.
+The reversal script is pinned the same way: its checksum is recorded with the
+applied row, and a reversal script that differs from the recorded one stops
+every command with `reversal_checksum_drift`, naming the file, so the reverse
+that runs is exactly the reverse that was recorded as evidence. A reversal
+that turns out to be wrong after apply is corrected by a new forward migration,
+not by editing the pinned script.
+
+Scripts name their objects with the schema (`pennilogic.accounts`, not
+`accounts`): the runner does not set `search_path`, and the registry itself
+is always addressed as `migration.migration_registry` / `migration.migration_lock`
+so that one database has exactly one registry whatever the session or role
+`search_path` is.
 
 ## Phases
 
@@ -101,10 +124,12 @@ reversal on every pull request, which is the evidence that matters.
 
 `migrate` (the command) applies pending `expand` and `migrate` migrations and
 **holds** at the first `contract` migration, reporting `migration_contract_held`
-and applying nothing after it. Pass `--include-contract` (`-PincludeContract`
-for the Gradle task) only once every consumer has migrated. Ordering guarantees
-the expand a contract names is applied before it; the validator guarantees the
-reference exists.
+and applying nothing after it. The hold is reported on every run that holds,
+including a run in which the hold is the only thing that happens (such a run
+takes no lock); a dry run shows it in the plan as action `hold`. Pass
+`--include-contract` (`-PincludeContract` for the Gradle task) only once every
+consumer has migrated. Ordering guarantees the expand a contract names is
+applied before it; the validator guarantees the reference exists.
 
 ## Transactions and failure
 
@@ -121,9 +146,17 @@ next `status` prints it. Statements that cannot run inside a transaction
 (`CREATE INDEX CONCURRENTLY`, `VACUUM`, `ALTER SYSTEM`) are not supported by
 this runner and fail cleanly in the same way.
 
-Reversal scripts never use `CASCADE`. If a later migration left objects behind,
-the reverse must fail (as V001's `DROP SCHEMA pennilogic RESTRICT` does) rather
+Reversal scripts never `DROP` or `TRUNCATE` with `CASCADE` (rule 7, enforced
+by the convention check). If a later migration left objects behind, the
+reverse must fail (as V001's `DROP SCHEMA pennilogic RESTRICT` does) rather
 than destroy data that the reverse does not own.
+
+The runner holds the single lock from before the first statement until after
+the last registry row. If its claim is gone at release time — someone
+force-released it while the run was in progress — the run ends with
+`migration_lock_release_mismatch` and exit 1 even though every migration it
+ran was recorded, because it can no longer attest that no second writer
+overlapped; RECOVERY.md §2 treats it as an incident.
 
 ## Running
 
@@ -135,16 +168,16 @@ does not depend on the operator machine's zone database.
 | Command | Gradle task | Effect |
 | --- | --- | --- |
 | `validate` | `migrationConventionCheck` | Checks the directory, prints the machine-readable set, needs no database. |
-| `status [--status-file P]` | `migrateStatus` | Prints current version, last applied migration, lock holder and per-migration state; optionally writes it to a file that can be read without a database session. |
+| `status [--status-file P]` | `migrateStatus` | Prints current version, last applied migration, lock holder and per-migration state; optionally writes it atomically (temp file plus rename) to a file that can be read without a database session. |
 | `migrate --holder ID [--target N] [--include-contract] [--dry-run]` | `migrate` (`-Ptarget`, `-PincludeContract`), `migrateDryRun` | Applies pending migrations in order. |
 | `migrate-down --holder ID [--target N] [--dry-run]` | `migrateDown` (`-Ptarget`) | Reverses the latest applied migration, or down to `N`. |
-| `release-lock --holder ID` | (operator, see RECOVERY.md) | Clears a lock whose holder process has died. |
+| `release-lock --holder ID --host NAME --pid N` | (operator, see RECOVERY.md) | Clears a lock whose holder process has died; all three values must match the claim exactly as `migration_lock_refused` reports them. |
 
 `--dry-run` prints the `migration_plan` event and writes nothing: no bootstrap,
 no lock, no row. The Gradle tasks pass `--holder` from `-PmigrationHolder`
 (default `<user>@gradle`); a deployment names its ticket and job, for example
-`api#2@release-2026-10`. Exit codes: 0 success, 1 refused or failed (one event
-names why), 2 usage error. Every line of output is one JSON event; the event
+`api#2@release-2026-10`. Exit codes: 0 success; 1 refused, failed, or ended
+without its own lock claim (one event names why); 2 usage error. Every line of output is one JSON event; the event
 names are listed in [REGISTRY.md](REGISTRY.md).
 
 Every migration is expected to finish inside the published threshold of
@@ -155,7 +188,8 @@ noticed by the runner rather than by a timeout elsewhere.
 ## Roles
 
 The runner connects as the migration role, which owns the application schema
-and the registry tables. The runtime application role is a different role and
+(`pennilogic`) and the registry schema (`migration`, created by the runner's
+bootstrap). The runtime application role is a different role and
 is never granted `CREATE` on a schema or ownership of a table; the ledger ticket
 (api#2) and T-SEC-01 define that role's grants. `applied_by` in the registry
 records the holder identity given to the runner, and Postgres records the
@@ -168,14 +202,21 @@ container:
 
 - the round trip of every shipped migration on an empty database and again on
   a populated one (`shipped migrations round trip ...`),
-- checksum drift, rename and removal detection,
-- concurrent lock refusal naming the holder, and a two-thread race,
+- checksum drift of the up and of the reversal script, rename and removal
+  detection, and the documented restore-and-rerun remediation,
+- concurrent lock refusal naming the holder, a two-thread race, and release
+  of a dead claim by holder, host and pid,
 - part-way failure with rollback, redaction and the documented recovery,
 - dry-run with no bootstrap, no lock and no row,
-- the slow-migration alert, the contract hold and the status file.
+- the registry found under a foreign `search_path` with no second registry,
+- the slow-migration alert, the contract hold (including an all-held run),
+  the stolen-lock incident, the status file and registry-corruption recovery.
 
 A schema ticket adds its own populated-data step to the round trip (insert
 representative rows after applying its migration, then reverse) and any
 invariant test the ticket names. Without Docker the Postgres tests do not run
 and Gradle says so (`integrationTest SKIPPED: Docker is not available ...`);
-CI runs them on every pull request.
+in CI (where the `CI` environment variable is set) a missing Docker fails the
+build instead, and the task itself fails unless its JUnit results show at
+least one test executed and none skipped, so the Postgres tests cannot be
+silently absent from a pull request.

@@ -70,6 +70,17 @@ class MigrationCliTest {
         assertTrue(parseError("migrate").startsWith("--holder is required for migrate"))
         assertTrue(parseError("migrate-down").startsWith("--holder is required for migrate-down"))
         assertTrue(parseError("release-lock").startsWith("--holder is required for release-lock"))
+        assertTrue(parseError("release-lock", "--holder", "x").startsWith("release-lock requires --holder, --host and --pid"))
+        assertTrue(
+            parseError("release-lock", "--holder", "x", "--host", "h").startsWith("release-lock requires --holder, --host and --pid"),
+        )
+        assertTrue(parseError("release-lock", "--holder", "x", "--pid", "1").startsWith("release-lock requires --holder, --host and --pid"))
+        assertEquals("--pid requires a non-negative integer", parseError("release-lock", "--holder", "x", "--host", "h", "--pid", "-1"))
+        assertEquals("--host and --pid are only valid for release-lock", parseError("status", "--host", "h"))
+        assertEquals("--host and --pid are only valid for release-lock", parseError("migrate", "--holder", "x", "--pid", "1"))
+        val release = MigrationCli.parse(listOf("release-lock", "--holder", "ghost@host", "--host", "gone", "--pid", "99"))
+        assertEquals(Identity("ghost@host", "gone", 99), release.releaseClaim)
+        assertNull(MigrationCli.parse(listOf("status")).releaseClaim)
         assertEquals("read-only", MigrationCli.parse(listOf("migrate", "--dry-run")).holder)
         assertEquals("read-only", MigrationCli.parse(listOf("validate")).holder)
     }
