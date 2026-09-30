@@ -143,14 +143,21 @@ val integrationTest =
         val idFile = migrationTestContainerId
         val image = postgresImage
         doFirst {
-            fun dockerCommand(vararg arguments: String): String {
-                val process = ProcessBuilder("docker", *arguments).redirectErrorStream(true).start()
-                val output = process.inputStream.readAllBytes().toString(Charsets.UTF_8)
-                check(process.waitFor() == 0) { "docker ${arguments.first()} failed: $output" }
-                return output.trim()
-            }
             val file = idFile.get().asFile
             file.parentFile.mkdirs()
+            val diagnostics = file.resolveSibling("docker-stderr.log")
+
+            // Stdout carries the answer; stderr carries pull progress and errors, so the two are kept apart.
+            fun dockerCommand(vararg arguments: String): String {
+                val process = ProcessBuilder("docker", *arguments).redirectError(diagnostics).start()
+                val output = process.inputStream.readAllBytes().toString(Charsets.UTF_8)
+                check(process.waitFor() == 0) { "docker ${arguments.first()} failed: $output ${diagnostics.readText()}" }
+                return output
+                    .trim()
+                    .lines()
+                    .last()
+                    .trim()
+            }
             val password = UUID.randomUUID().toString()
             val id =
                 dockerCommand(
