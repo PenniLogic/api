@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/PenniLogic/api/blob/main/docs/migrations/lock-payload.schema.json",
+  "title": "Migration lock claim and release payload",
+  "description": "The single-row migration lock as claimed by the api migration runner and read by the T-GOV-04 pull-request check.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["holder", "host", "pid", "claimedAt", "command", "targetVersion"],
+  "properties": {
+    "holder": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@#/:-]{0,119}$",
+      "description": "Identity that claimed the lock: ticket and job or person, for example api#2@release-2026-10."
+    },
+    "host": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Host name of the process that claimed the lock."
+    },
+    "pid": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Process id of the claimant on that host."
+    },
+    "claimedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Database server time of the claim, ISO-8601 in UTC."
+    },
+    "command": {
+      "type": "string",
+      "enum": ["migrate", "migrate-down"],
+      "description": "The runner command holding the lock."
+    },
+    "targetVersion": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The version the holder is moving the database towards."
+    }
+  }
+}
