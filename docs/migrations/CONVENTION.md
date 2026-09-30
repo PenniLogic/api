@@ -62,6 +62,27 @@ a database:
    its append-only tables when it creates them, and a pull request whose
    scripts touch their rows fails review. This rule is reviewed, not machine
    checked, until those tables exist.
+9. `migrate-down` is never a path to deleting committed financial history.
+   The reversal of a migration that created a table holding such rows either
+   refuses to run while the table is non-empty — its first statement is a
+   guard such as
+
+   ```sql
+   DO $$ BEGIN
+       IF EXISTS (SELECT 1 FROM pennilogic.entries) THEN
+           RAISE EXCEPTION USING MESSAGE = 'committed ledger rows present; reverse refused',
+               ERRCODE = 'P0001', SCHEMA = 'pennilogic', TABLE = 'entries';
+       END IF;
+   END $$;
+   ```
+
+   so the run ends as `migration_failed` with `sqlState` `P0001`, `schema`
+   and `table` named and the version unchanged (the message text itself is
+   withheld like every server message) — or is declared
+   `reversal: compensating` with a `reason` that names what is kept. A plain
+   `DROP TABLE` of such a table is a review failure even though the convention
+   check cannot tell it from V001's `DROP SCHEMA`. The guard pattern is
+   exercised by `a guarded reversal refuses to run while the table holds rows`.
 
 Example (the shipped baseline):
 
@@ -170,11 +191,14 @@ does not depend on the operator machine's zone database.
 | `validate` | `migrationConventionCheck` | Checks the directory, prints the machine-readable set, needs no database. |
 | `status [--status-file P]` | `migrateStatus` | Prints current version, last applied migration, lock holder and per-migration state; optionally writes it atomically (temp file plus rename) to a file that can be read without a database session. |
 | `migrate --holder ID [--target N] [--include-contract] [--dry-run]` | `migrate` (`-Ptarget`, `-PincludeContract`), `migrateDryRun` | Applies pending migrations in order. |
-| `migrate-down --holder ID [--target N] [--dry-run]` | `migrateDown` (`-Ptarget`) | Reverses the latest applied migration, or down to `N`. |
+| `migrate-down --holder ID [--target N] [--dry-run]` | `migrateDown` (`-Ptarget`), `migrateDownDryRun` | Reverses the latest applied migration, or down to `N`. |
 | `release-lock --holder ID --host NAME --pid N` | (operator, see RECOVERY.md) | Clears a lock whose holder process has died; all three values must match the claim exactly as `migration_lock_refused` reports them. |
 
 `--dry-run` prints the `migration_plan` event and writes nothing: no bootstrap,
-no lock, no row. The Gradle tasks pass `--holder` from `-PmigrationHolder`
+no lock, no row. Run `migrate-down --dry-run` (Gradle: `migrateDownDryRun`)
+before every real `migrate-down` and read the plan: the reverse is the
+destructive direction, and the plan names each version and its reversal kind;
+`status` shows the recorded `reason` of a compensating reversal. The Gradle tasks pass `--holder` from `-PmigrationHolder`
 (default `<user>@gradle`); a deployment names its ticket and job, for example
 `api#2@release-2026-10`. Exit codes: 0 success; 1 refused, failed, or ended
 without its own lock claim (one event names why); 2 usage error. Every line of output is one JSON event; the event
@@ -214,7 +238,13 @@ container:
 
 A schema ticket adds its own populated-data step to the round trip (insert
 representative rows after applying its migration, then reverse) and any
-invariant test the ticket names. Without Docker the Postgres tests do not run
+invariant test the ticket names. The task starts one loopback-only container
+with a random password and records its id in `build/migration-test/container-id`;
+if a build dies before its finalizer runs, the next `integrationTest` removes
+exactly that container first, or remove it by hand with
+`docker rm -f $(cat build/migration-test/container-id)`. Never remove
+containers by the `pennilogic-api-migration-test` label: another checkout on
+the same machine may be running its own. Without Docker the Postgres tests do not run
 and Gradle says so (`integrationTest SKIPPED: Docker is not available ...`);
 in CI (where the `CI` environment variable is set) a missing Docker fails the
 build instead, and the task itself fails unless its JUnit results show at

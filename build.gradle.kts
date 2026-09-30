@@ -154,10 +154,16 @@ val integrationTest =
             val diagnostics = file.resolveSibling("docker-stderr.log")
 
             // Stdout carries the answer; stderr carries pull progress and errors, so the two are kept apart.
+            // The wait is bounded so a hung image pull fails here instead of at the 30-minute CI job timeout.
             fun dockerCommand(vararg arguments: String): String {
-                val process = ProcessBuilder("docker", *arguments).redirectError(diagnostics).start()
-                val output = process.inputStream.readAllBytes().toString(Charsets.UTF_8)
-                check(process.waitFor() == 0) { "docker ${arguments.first()} failed: $output ${diagnostics.readText()}" }
+                val stdout = file.resolveSibling("docker-stdout.log")
+                val process = ProcessBuilder("docker", *arguments).redirectOutput(stdout).redirectError(diagnostics).start()
+                if (!process.waitFor(10, TimeUnit.MINUTES)) {
+                    process.destroyForcibly()
+                    error("docker ${arguments.first()} did not finish within 10 minutes: ${diagnostics.readText()}")
+                }
+                val output = stdout.readText()
+                check(process.exitValue() == 0) { "docker ${arguments.first()} failed: $output ${diagnostics.readText()}" }
                 return output
                     .trim()
                     .lines()
@@ -268,6 +274,7 @@ registerMigrationTask(
 )
 registerMigrationTask("migrateDown", "Reverses the latest applied migration, or down to -Ptarget=N.", "migrate-down")
 registerMigrationTask("migrateDryRun", "Prints the migrate plan and writes nothing.", "migrate", "--dry-run")
+registerMigrationTask("migrateDownDryRun", "Prints the migrate-down plan and writes nothing.", "migrate-down", "--dry-run")
 registerMigrationTask("migrateStatus", "Prints the registry state: current version, last applied migration and lock holder.", "status")
 
 tasks.jacocoTestReport {

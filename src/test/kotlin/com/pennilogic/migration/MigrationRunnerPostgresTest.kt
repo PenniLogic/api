@@ -422,6 +422,43 @@ class MigrationRunnerPostgresTest {
     }
 
     @Test
+    fun `a guarded reversal refuses to run while the table holds rows`() {
+        val database = TestDatabase.fresh()
+        Fixtures.write(
+            directory,
+            "V001__create_entries",
+            Fixtures.header() +
+                "CREATE SCHEMA ledger;\nCREATE TABLE ledger.entries (id integer PRIMARY KEY, amount_minor bigint NOT NULL);\n",
+            "DO \$\$ BEGIN\n" +
+                "    IF EXISTS (SELECT 1 FROM ledger.entries) THEN\n" +
+                "        RAISE EXCEPTION USING MESSAGE = 'committed ledger rows present; reverse refused',\n" +
+                "            ERRCODE = 'P0001', SCHEMA = 'ledger', TABLE = 'entries';\n" +
+                "    END IF;\n" +
+                "END \$\$;\n" +
+                "DROP TABLE ledger.entries;\nDROP SCHEMA ledger RESTRICT;\n",
+        )
+        migrate(database, directory)
+        database.execute("INSERT INTO ledger.entries VALUES (1, 4200), (2, -4200)")
+        val refused = Output()
+        assertEquals(1, cli(database, refused, "migrate-down", "--holder", "test@junit", "--migrations", directory.toString()))
+        val failed = refused.require("migration_failed")
+        assertTrue(failed.contains("\"sqlState\":\"P0001\""))
+        assertTrue(failed.contains("\"schema\":\"ledger\""))
+        assertTrue(failed.contains("\"table\":\"entries\""))
+        assertTrue(failed.contains("\"knownVersion\":1"))
+        assertFalse(refused.toString().contains("committed ledger rows"))
+        assertEquals(2L, database.count("SELECT count(*) FROM ledger.entries"))
+        assertEquals(1, currentVersion(status(database, directory)))
+        // Only after the rows are gone (here: synthetic test data) does the reverse run.
+        database.execute("DELETE FROM ledger.entries")
+        val reversed = Output()
+        assertEquals(0, cli(database, reversed, "migrate-down", "--holder", "test@junit", "--migrations", directory.toString()))
+        reversed.require("migration_reversed")
+        assertEquals(0, currentVersion(status(database, directory)))
+        assertNull(database.scalar("SELECT to_regnamespace('ledger')"))
+    }
+
+    @Test
     fun `dry run prints the plan and writes nothing`() {
         val database = TestDatabase.fresh()
         val migrations = basicSet()
