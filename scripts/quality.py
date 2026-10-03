@@ -136,7 +136,8 @@ def check_coverage(base, write_baseline=False):
 def gate_self_test(artifact_dir):
     inputs = [
         "settings.gradle.kts", "build.gradle.kts", "gradle.properties", ".editorconfig",
-        "gradlew", "gradlew.bat", "gradle.lockfile", "gradle", "src",
+        "gradlew", "gradlew.bat", "gradle.lockfile", "gradle", "src", "scripts/check_money.py",
+        "scripts/money_provider.py", "build/contracts-money/source",
     ]
     with tempfile.TemporaryDirectory(prefix="api-gate-self-test-", dir=artifact_dir) as temporary:
         root = Path(temporary)
@@ -145,6 +146,7 @@ def gate_self_test(artifact_dir):
             if source.is_dir():
                 shutil.copytree(source, destination)
             else:
+                destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, destination)
         gradle("test", "spotlessCheck", root=root)
         tests = root / "src/test/kotlin/com/pennilogic/bootstrap"
@@ -191,6 +193,28 @@ def gate_self_test(artifact_dir):
             raise ValueError("Lint gate accepted a formatting violation")
         finally:
             bad_format.unlink()
+        bad_money = tests / "GateMoney.kt"
+        defects = [
+            ("double", "MG001", "data class GateMoney(\n    val amount: Double,\n)"),
+            ("float", "MG001", "data class GateMoney(\n    val amount: Float,\n)"),
+            ("bigdecimal", "MG001", "data class GateMoney(\n    val amount: java.math.BigDecimal,\n)"),
+            ("conversion", "MG003", "fun forbiddenConversion(amount: Long): Double = amount.toDouble()"),
+            ("raw_arithmetic", "MG002", "fun forbiddenArithmetic(\n    amount: Long,\n    fee: Long,\n): Long = amount + fee"),
+        ]
+        for case, rule, declaration in defects:
+            bad_money.write_text(
+                f"package com.pennilogic.bootstrap\n\n{declaration}\n", encoding="utf-8", newline="\n",
+            )
+            try:
+                gradle("build", root=root, capture=True)
+            except subprocess.CalledProcessError as error:
+                if "GateMoney.kt" not in error.output or rule not in error.output or ":moneyGuard FAILED" not in error.output:
+                    raise ValueError(f"Money guard failure was not the planted {case} defect")
+                print(json.dumps({"event": "gate_self_test", "gate": "money", "case": case, "rejected": True}))
+            else:
+                raise ValueError(f"Money guard accepted the planted {case} defect")
+            finally:
+                bad_money.unlink()
         gradle("build", root=root)
 
 
@@ -206,7 +230,10 @@ def test_metrics(root=ROOT):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["version", "install", "build", "test", "lint", "format", "coverage", "gate-self-test"])
+    parser.add_argument(
+        "command",
+        choices=["version", "install", "build", "test", "lint", "format", "coverage", "gate-self-test", "money-guard"],
+    )
     parser.add_argument("--base", help="Full trusted PR base commit SHA; required for coverage")
     parser.add_argument("--write-baseline", action="store_true")
     parser.add_argument("--artifact-dir", type=Path, help="Parent directory for isolated gate self-test copies")
@@ -233,6 +260,8 @@ def main():
                 parser.error("coverage requires --base; no implicit or stale CI base is accepted")
             gradle("jacocoTestReport", "jacocoTestCoverageVerification")
             check_coverage(args.base, args.write_baseline)
+        elif args.command == "money-guard":
+            run([sys.executable, str(ROOT / "scripts/check_money.py")])
         else:
             gate_self_test(args.artifact_dir)
     except (subprocess.CalledProcessError, ValueError, OSError, ET.ParseError) as error:

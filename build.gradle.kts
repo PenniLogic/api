@@ -23,7 +23,59 @@ application {
     mainClass.set("com.pennilogic.bootstrap.ApplicationKt")
 }
 
+val prepareAcceptedSource =
+    tasks.register<Exec>("prepareMoneyProvider") {
+        description = "Verifies and prepares the immutable accepted Contracts Money source, not a release."
+        group = "verification"
+        workingDir(rootDir)
+        commandLine("python", "scripts/money_provider.py")
+    }
+
+val moneyGuard =
+    tasks.register<Exec>("moneyGuard") {
+        description = "Rejects unsafe monetary JVM fields, numeric serializers and raw minor-unit arithmetic."
+        group = "verification"
+        workingDir(rootDir)
+        commandLine("python", "scripts/check_money.py")
+        dependsOn(prepareAcceptedSource)
+    }
+
+val acceptedSourceSet =
+    sourceSets.create("contractsMoney") {
+        java.setSrcDirs(emptyList<String>())
+        kotlin.srcDir(layout.buildDirectory.dir("contracts-money/kotlin/src/main/kotlin"))
+    }
+
+tasks.named("compileContractsMoneyKotlin") {
+    dependsOn(moneyGuard)
+}
+
+val acceptedSourceJar =
+    tasks.register<Jar>("contractsMoneyJar") {
+        description = "Packages the accepted immutable Money source for this local API build only."
+        from(acceptedSourceSet.output)
+        archiveBaseName.set("pennilogic-contracts-money-source-ea56c63")
+        manifest {
+            attributes(
+                "Source-Repository" to "PenniLogic/contracts",
+                "Source-Commit" to "ea56c63d5c9b679537bd9205b04626049c20c572",
+                "Provider-Kind" to "accepted-source-only",
+            )
+        }
+    }
+
+tasks.named("compileKotlin") {
+    dependsOn(moneyGuard)
+}
+
+tasks.named("compileTestKotlin") {
+    dependsOn(moneyGuard)
+}
+
 dependencies {
+    implementation(files(acceptedSourceJar))
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
+    add(acceptedSourceSet.implementationConfigurationName, "org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
     implementation(platform("io.ktor:ktor-bom:3.5.2"))
     implementation("io.ktor:ktor-server-core")
     implementation("io.ktor:ktor-server-netty")
@@ -68,6 +120,14 @@ tasks.test {
     )
     // Pinned so migration timestamps and the Postgres session never depend on the machine's zone database.
     systemProperty("user.timezone", "UTC")
+    systemProperty(
+        "pennilogic.money.source",
+        layout.buildDirectory
+            .dir("contracts-money/source")
+            .get()
+            .asFile.path,
+    )
+    inputs.dir(layout.buildDirectory.dir("contracts-money/source/spec"))
     testLogging {
         events("failed", "skipped")
     }
@@ -318,7 +378,7 @@ tasks.jacocoTestCoverageVerification {
 }
 
 tasks.check {
-    dependsOn(tasks.spotlessCheck, tasks.jacocoTestCoverageVerification, integrationTest, migrationConventionCheck)
+    dependsOn(moneyGuard, tasks.spotlessCheck, tasks.jacocoTestCoverageVerification, integrationTest, migrationConventionCheck)
 }
 
 tasks.withType<AbstractArchiveTask>().configureEach {
