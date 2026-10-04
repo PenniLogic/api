@@ -78,7 +78,14 @@ class MoneyProviderBindingTest(unittest.TestCase):
             output = bundle / "kotlin/Synthetic.kt"
             output.parent.mkdir()
             output.write_bytes(content)
-            with patch.object(provider, "SOURCE_FILES", catalog), patch.object(provider, "OUTPUT_HASHES", outputs):
+            strategy = bundle / provider.STRATEGY_FILE
+            strategy.parent.mkdir(parents=True)
+            strategy.write_bytes(content)
+            with (
+                patch.object(provider, "SOURCE_FILES", catalog),
+                patch.object(provider, "OUTPUT_HASHES", outputs),
+                patch.object(provider, "STRATEGY_PIN", (len(content), provider.digest(content))),
+            ):
                 self.assertEqual([output], provider.verify_outputs(root))
                 extra = output.with_name("Injected.kt")
                 extra.write_bytes(b"synthetic injected source")
@@ -90,6 +97,21 @@ class MoneyProviderBindingTest(unittest.TestCase):
                 with self.assertRaisesRegex(provider.ProviderError, "source mismatch"):
                     provider.verify_outputs(root)
                 self.assertEqual(altered, output.read_bytes())
+
+    def test_absent_or_tampered_strategy_has_no_invented_threshold_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "test-strategy.json"
+            with self.assertRaisesRegex(provider.ProviderError, "missing"):
+                provider.read_strategy(path)
+            content = b"synthetic accepted strategy"
+            path.write_bytes(content)
+            with patch.object(provider, "STRATEGY_PIN", (len(content), provider.digest(content))):
+                self.assertEqual(content, provider.read_strategy(path))
+                altered = b"synthetic changed strategy"
+                path.write_bytes(altered)
+                with self.assertRaisesRegex(provider.ProviderError, "source mismatch"):
+                    provider.read_strategy(path)
+                self.assertEqual(altered, path.read_bytes())
 
     def test_output_junctions_are_refused_before_writing_outside_owned_root(self):
         with tempfile.TemporaryDirectory() as temporary:

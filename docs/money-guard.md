@@ -24,26 +24,32 @@ Registry acceptance of INR/JPY/KWD is codec support, not ledger admission: the M
 INR-only and no ledger endpoint or migration is changed.
 
 These are Kotlin source-seam tests, not generated-client transport tests or three-language
-interoperability. Full functional contracts, Kotlin/TypeScript/Python generated-client compilation
-and cross-language round trips, contract release/adoption, mutation qualification and protected
-integration remain pending. No published-client acceptance is inferred from local fixture hashes.
+API interoperability. Full functional contract/release adoption and protected integration remain
+pending. The separately executed three-language Contracts scaffold is not an API cross-language
+consumer test. No published-client acceptance is inferred from local fixture hashes.
 
 ## Commands and ownership
 
 ```text
-python scripts/money_provider.py --source-root <owned-immutable-contracts-snapshot>
+python scripts/money_provider.py --source-root <owned-immutable-contracts-snapshot> --strategy-file <accepted-docs-test-strategy>
 python scripts/money_provider.py --verify
 python scripts/check_money.py
 python scripts/quality.py money-guard
 python -m unittest discover -s scripts/tests
 python scripts/quality.py build
+python scripts/quality.py money-coverage
 python scripts/quality.py gate-self-test --artifact-dir <session-artifacts-directory>
 ```
 
-The snapshot contains only the size/hash-bound files listed in `scripts/money_provider.py`, fetched
-from the accepted full commit, never a branch. It is not another writable repository checkout.
+The Contracts snapshot contains only the ten size/hash-bound files listed in
+`scripts/money_provider.py`, fetched from the accepted full commit, never a branch.
+The additional Docs input is the unchanged `governance/test-strategy.json` from
+`a700e639585c61a4610e7b99dbd02b2dab28bdcc` (80,953 bytes, SHA-256
+`a0322e0337c7c0e496711f21a1aea01136c6047b787318fd805a0788c2239bb2`).
+The snapshots are not other writable repository checkouts.
 The script performs no downloads, credential operations, full client generation or publication.
-Prepared inputs live in `build/contracts-money/source`; missing or changed inputs/output stop,
+Prepared Contracts inputs live in `build/contracts-money/source`, and the exact Docs input in
+`build/contracts-money/strategy/governance/test-strategy.json`; missing or changed inputs/output stop,
 without overwriting a mismatched cache or synthesizing a registry.
 
 The manual `prepareMoneyProvider` and `moneyGuard` Gradle tasks run before Kotlin production/test
@@ -53,6 +59,39 @@ hard failure, with no warn-only switch. The existing native CI command still inv
 explicitly. Canonical CI source materialization is a coordinator/Infra handoff, not a local CI
 exception or a generated-workflow edit.
 The existing test/lint checks, coverage floors and integration-test requirements are unchanged.
+
+## Actual Money-package qualification
+
+The existing JaCoCo 0.8.15 tool now measures the authoritative dependency, not unchanged API
+own-main code. `moneyTest` executes the source-seam tests; `moneyCoverageReport` includes all
+eight compiled classes from both `Money.kt` and `CurrencyRegistry.kt`, without class, method or
+branch exclusions. `moneyCoverageCheck` fails a normal build below the accepted `api.money`
+97% line or 93% branch floor. It reads the numbers directly from the byte-bound Docs strategy;
+there are no local fallback thresholds. Missing target tests, skips/failures, omitted classes,
+omitted source files, unrelated package totals or inconsistent counters are refusals.
+
+The initial twelve tests measured 74/75 lines and 76/86 branches, and the branch gate failed.
+Additional equality, descriptor, rendering and non-JSON encoder/decoder tests improved the
+actual complete-package result to 75/75 lines (100%) and 81/86 branches (94.19%) across sixteen
+tests. The remaining five branches stay in the denominator; no fabricated invalid instance,
+registry mutation or provider-source change was used to erase them.
+
+`quality/money-coverage-baseline.json` is generated from this actual report. The native package
+gate refuses a decline from that recorded baseline even above the floors. The documented
+reviewed-base `coverage --base <full SHA>` command additionally compares the committed base's
+Money baseline, when it exists. This is the first Money-package baseline; `04f9701` had none,
+which is reported explicitly rather than using its unrelated own-main coverage.
+Regeneration uses `money-coverage --write-baseline --base <full reviewed SHA>` and still refuses
+undercoverage or a decline; changing report counters or the accepted strategy is not a remedy.
+
+**Mutation qualification is not executable yet.** The accepted strategy section 7.1 and
+`mutation_testing` category charter the harness to [API #22](https://github.com/PenniLogic/api/issues/22),
+which remains open. Neither the actual API Gradle task/dependency inventory nor the accepted
+strategy/owner specification declares an implemented mutation command, tool/version, Money
+mutator catalogue or result. The strategy requires a 90% score; this change does not invent a
+tool, pretend branch coverage is mutation testing, weaken the floor or mark it met.
+Each package record reports `not_measured`, a null score/survivor set, and that precise missing
+executable-owner fact. Full Money qualification and issue completion remain blocked on it.
 
 `build.gradle.kts`, `scripts/quality.py`, its tests and this guide are manual API source;
 they are not outputs of the accepted Infra `governance/generate.py` artifact inventory.

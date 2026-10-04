@@ -1,6 +1,8 @@
 """Portable quality commands. CI supplies the reviewed base explicitly for coverage."""
 
 import argparse
+import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -16,6 +18,10 @@ from fractions import Fraction
 ROOT = Path(__file__).resolve().parents[1]
 REPORT = Path("build/reports/jacoco/test/jacocoTestReport.xml")
 BASELINE = "quality/coverage-baseline.json"
+MONEY_REPORT = Path("build/reports/jacoco/moneyCoverageReport/moneyCoverageReport.xml")
+MONEY_CLASSES = Path("build/classes/kotlin/contractsMoney")
+MONEY_PACKAGE = "com/pennilogic/contracts/money"
+MONEY_BASELINE = "quality/money-coverage-baseline.json"
 
 
 def run(command, root=ROOT, capture=False):
@@ -133,11 +139,162 @@ def check_coverage(base, write_baseline=False):
         raise ValueError("Coverage baseline does not match report; run coverage --write-baseline and review it")
 
 
+def money_provider_module():
+    spec = importlib.util.spec_from_file_location("money_quality_provider", ROOT / "scripts/money_provider.py")
+    provider = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(provider)
+    return provider
+
+
+def money_policy(provider):
+    content = provider.read_strategy(ROOT / provider.BUNDLE / provider.STRATEGY_FILE)
+    strategy = json.loads(content)
+    packages = [package for package in strategy["packages"] if package["id"] == "api.money"]
+    if len(packages) != 1 or packages[0]["repository"] != "PenniLogic/api" or packages[0]["money_path"] is not True:
+        raise ValueError("Accepted test strategy does not uniquely declare the API money package")
+    floors = {
+        "LINE": packages[0]["line_coverage_floor_percent"],
+        "BRANCH": packages[0]["branch_coverage_floor_percent"],
+        "MUTATION": packages[0]["mutation_score_floor_percent"],
+    }
+    if any(type(value) is not int or not 0 < value <= 100 for value in floors.values()):
+        raise ValueError("Accepted money-package strategy lacks valid numeric qualification floors")
+    if strategy["floor_policy"]["money_path_ratchet"] is not True:
+        raise ValueError("Accepted strategy does not declare the required money coverage ratchet")
+    return floors, hashlib.sha256(content).hexdigest()
+
+
+def read_money_coverage(path, class_names, source_names):
+    report = ET.parse(path).getroot()
+    packages = report.findall("package")
+    if len(packages) != 1 or packages[0].get("name") != MONEY_PACKAGE:
+        raise ValueError("Money coverage must report the complete authoritative package, not unrelated API classes")
+    package = packages[0]
+    classes = [entry.get("name") for entry in package.findall("class")]
+    sources = [entry.get("name") for entry in package.findall("sourcefile")]
+    if not class_names or len(classes) != len(set(classes)) or set(classes) != set(class_names):
+        raise ValueError("Money coverage class inventory differs from the actual compiled dependency")
+    if not source_names or len(sources) != len(set(sources)) or set(sources) != set(source_names):
+        raise ValueError("Money coverage source inventory differs from the immutable provider inputs")
+    counters = {}
+    for kind in ("LINE", "BRANCH"):
+        matching = report.findall(f"./counter[@type='{kind}']")
+        package_matching = package.findall(f"./counter[@type='{kind}']")
+        if len(matching) != 1 or len(package_matching) != 1:
+            raise ValueError(f"Money coverage report lacks a unique {kind} counter")
+        counter = matching[0]
+        if counter.attrib != package_matching[0].attrib:
+            raise ValueError(f"Money coverage {kind} package and report counters differ")
+        missed, covered = int(counter.get("missed")), int(counter.get("covered"))
+        counters[kind] = {"covered": covered, "total": covered + missed}
+        ratio(counters[kind])
+    return counters
+
+
+def enforce_money_coverage(counters, floors, baseline=None):
+    for kind in ("LINE", "BRANCH"):
+        actual = ratio(counters[kind])
+        if actual < Fraction(floors[kind], 100):
+            raise ValueError(f"Authoritative Money {kind} coverage below the accepted floor")
+        if baseline is not None and actual < ratio(baseline[kind]):
+            raise ValueError(f"Authoritative Money {kind} coverage decreased from the recorded baseline")
+
+
+def check_money_coverage(base=None, write_baseline=False):
+    provider = money_provider_module()
+    source_paths = provider.verify_outputs()
+    floors, strategy_sha256 = money_policy(provider)
+    compiled = ROOT / MONEY_CLASSES
+    if not compiled.is_dir() or compiled.is_symlink() or compiled.is_junction():
+        raise ValueError("Authoritative Money dependency classes are missing or linked")
+    class_names = set()
+    for directory, directories, files in os.walk(compiled, followlinks=False, onerror=provider.refused_walk):
+        parent = Path(directory)
+        if any((parent / name).is_symlink() or (parent / name).is_junction() for name in directories):
+            raise ValueError("Linked Money class inventory cannot qualify coverage")
+        for name in files:
+            path = parent / name
+            if path.suffix == ".class":
+                if path.is_symlink():
+                    raise ValueError("Linked Money class cannot qualify coverage")
+                class_names.add(path.relative_to(compiled).with_suffix("").as_posix())
+    counters = read_money_coverage(
+        ROOT / MONEY_REPORT, class_names, {path.name for path in source_paths},
+    )
+    suites = [
+        ET.parse(path).getroot()
+        for path in (ROOT / "build/test-results/moneyTest").glob("TEST-*.xml")
+    ]
+    tests = sum(int(suite.get("tests")) for suite in suites)
+    skipped = sum(int(suite.get("skipped")) for suite in suites)
+    failed = sum(int(suite.get("failures")) + int(suite.get("errors")) for suite in suites)
+    if not tests or skipped or failed:
+        raise ValueError("Money qualification requires executed target tests without failures or skips")
+    record = {
+        "event": "money_package_coverage",
+        "strategy_package": "api.money",
+        "jvm_package": MONEY_PACKAGE,
+        "contracts_source_ref": provider.SOURCE_REF,
+        "docs_source_ref": provider.DOCS_REF,
+        "strategy_sha256": strategy_sha256,
+        "source_file_count": len(source_paths),
+        "compiled_class_count": len(class_names),
+        "source_files": sorted(path.name for path in source_paths),
+        "compiled_classes": sorted(class_names),
+        "target_tests": tests,
+        "skipped": skipped,
+        "failed": failed,
+        "counters": counters,
+        "floor_percent": floors,
+        "mutation": {
+            "status": "not_measured",
+            "reason": "No executable mutation harness or tool is declared in this API build; API #22 owns it",
+            "score": None,
+            "surviving_operators": None,
+        },
+    }
+    print(json.dumps(record))
+    enforce_money_coverage(counters, floors)
+    target = ROOT / MONEY_BASELINE
+    baseline_record = {
+        "strategy_package": "api.money",
+        "contracts_source_ref": provider.SOURCE_REF,
+        "source_file_count": len(source_paths),
+        "compiled_class_count": len(class_names),
+        **counters,
+    }
+    baseline = json.loads(target.read_text(encoding="utf-8")) if target.is_file() else None
+    if baseline is not None:
+        if baseline["strategy_package"] != "api.money":
+            raise ValueError("Recorded money baseline names a different package")
+        enforce_money_coverage(counters, floors, baseline)
+    if base is not None:
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", base):
+            raise ValueError("Money coverage ratchet requires the full trusted base commit SHA")
+        paths = set(run(["git", "ls-tree", "-r", "--name-only", base], capture=True).splitlines())
+        if MONEY_BASELINE in paths:
+            reviewed = json.loads(run(["git", "show", f"{base}:{MONEY_BASELINE}"], capture=True))
+            enforce_money_coverage(counters, floors, reviewed)
+        else:
+            print(json.dumps({
+                "event": "money_coverage_initial_baseline",
+                "base": base,
+                "reason": "No authoritative-package coverage baseline existed at this base",
+            }))
+    if write_baseline:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(baseline_record, indent=2) + "\n", encoding="utf-8", newline="\n")
+    elif baseline != baseline_record:
+        raise ValueError("Money coverage baseline differs from the measured report; generate and review the actual baseline")
+
+
 def gate_self_test(artifact_dir):
     inputs = [
         "settings.gradle.kts", "build.gradle.kts", "gradle.properties", ".editorconfig",
         "gradlew", "gradlew.bat", "gradle.lockfile", "gradle", "src", "scripts/check_money.py",
         "scripts/money_provider.py", "build/contracts-money/source",
+        "scripts/quality.py", "build/contracts-money/strategy",
+        MONEY_BASELINE,
     ]
     with tempfile.TemporaryDirectory(prefix="api-gate-self-test-", dir=artifact_dir) as temporary:
         root = Path(temporary)
@@ -232,7 +389,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=["version", "install", "build", "test", "lint", "format", "coverage", "gate-self-test", "money-guard"],
+        choices=[
+            "version", "install", "build", "test", "lint", "format", "coverage", "gate-self-test", "money-guard",
+            "money-coverage", "money-coverage-report",
+        ],
     )
     parser.add_argument("--base", help="Full trusted PR base commit SHA; required for coverage")
     parser.add_argument("--write-baseline", action="store_true")
@@ -258,10 +418,16 @@ def main():
         elif args.command == "coverage":
             if not args.base:
                 parser.error("coverage requires --base; no implicit or stale CI base is accepted")
-            gradle("jacocoTestReport", "jacocoTestCoverageVerification")
+            gradle("jacocoTestReport", "jacocoTestCoverageVerification", "moneyCoverageReport")
             check_coverage(args.base, args.write_baseline)
+            check_money_coverage(args.base, args.write_baseline)
         elif args.command == "money-guard":
             run([sys.executable, str(ROOT / "scripts/check_money.py")])
+        elif args.command == "money-coverage":
+            gradle("moneyCoverageReport")
+            check_money_coverage(args.base, args.write_baseline)
+        elif args.command == "money-coverage-report":
+            check_money_coverage(args.base, args.write_baseline)
         else:
             gate_self_test(args.artifact_dir)
     except (subprocess.CalledProcessError, ValueError, OSError, ET.ParseError) as error:

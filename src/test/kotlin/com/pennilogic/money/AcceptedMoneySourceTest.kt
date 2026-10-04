@@ -5,12 +5,18 @@ import com.pennilogic.contracts.money.Money
 import com.pennilogic.contracts.money.MoneyReason
 import com.pennilogic.contracts.money.MoneySerializer
 import com.pennilogic.contracts.money.MoneyWireException
+import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.descriptors.PrimitiveKind
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.encoding.AbstractDecoder
+import kotlinx.serialization.encoding.AbstractEncoder
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.modules.EmptySerializersModule
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotEquals
@@ -221,6 +227,7 @@ class AcceptedMoneySourceTest {
         assertThrows(IllegalArgumentException::class.java) { first - second }
         assertThrows(IllegalArgumentException::class.java) { first.compareTo(second) }
         assertNotEquals(first, second)
+        assertNotEquals(first, Money.ofMinorUnits(2, "INR"))
         assertNotEquals(first, 1L)
         assertEquals(first.hashCode(), Money.ofMinorUnits(1, "INR").hashCode())
         assertTrue(first < Money.ofMinorUnits(2, "INR"))
@@ -299,5 +306,59 @@ class AcceptedMoneySourceTest {
                 .map { it.name }
                 .toSet()
         assertFalse(names.any { it in setOf("div", "divide", "times", "round") })
+    }
+
+    @Test
+    fun `the existing descriptor exposes exactly the two canonical string fields`() {
+        val descriptor = MoneySerializer.descriptor
+        assertEquals("com.pennilogic.contracts.money.Money", descriptor.serialName)
+        assertEquals(2, descriptor.elementsCount)
+        assertEquals("amount", descriptor.getElementName(0))
+        assertEquals("currency", descriptor.getElementName(1))
+        assertEquals(PrimitiveKind.STRING, descriptor.getElementDescriptor(0).kind)
+        assertEquals(PrimitiveKind.STRING, descriptor.getElementDescriptor(1).kind)
+    }
+
+    @OptIn(ExperimentalSerializationApi::class)
+    @Test
+    fun `the existing serializer refuses a non JSON encoder before emitting any value`() {
+        val encoder =
+            object : AbstractEncoder() {
+                override val serializersModule = EmptySerializersModule()
+
+                override fun encodeValue(value: Any): Unit = throw AssertionError("The JSON-only serializer must refuse before encoding")
+            }
+        val instance = Money.ofMinorUnits(1, "INR")
+        val error = assertThrows(IllegalStateException::class.java) { MoneySerializer.serialize(encoder, instance) }
+        assertEquals("Money is a JSON-only wire type", error.message)
+    }
+
+    @OptIn(ExperimentalSerializationApi::class)
+    @Test
+    fun `the existing serializer refuses a non JSON decoder before reading any value`() {
+        val decoder =
+            object : AbstractDecoder() {
+                override val serializersModule = EmptySerializersModule()
+
+                override fun decodeElementIndex(descriptor: SerialDescriptor): Int =
+                    throw AssertionError("The JSON-only serializer must refuse before decoding")
+
+                override fun decodeValue(): Any = throw AssertionError("The JSON-only serializer must refuse before decoding")
+            }
+        val error = assertThrows(IllegalStateException::class.java) { MoneySerializer.deserialize(decoder) }
+        assertEquals("Money is a JSON-only wire type", error.message)
+    }
+
+    @Test
+    fun `existing diagnostic rendering uses accepted scale without locale or floating conversion`() {
+        for (code in CurrencyRegistry.entries.keys) {
+            val instance = Money.ofMinorUnits(-1, code)
+            val canonical =
+                encoded(instance)
+                    .jsonObject
+                    .getValue("amount")
+                    .jsonPrimitive.content
+            assertEquals("$canonical $code", instance.toString())
+        }
     }
 }

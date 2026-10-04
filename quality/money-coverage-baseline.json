@@ -1,0 +1,14 @@
+{
+  "strategy_package": "api.money",
+  "contracts_source_ref": "ea56c63d5c9b679537bd9205b04626049c20c572",
+  "source_file_count": 2,
+  "compiled_class_count": 8,
+  "LINE": {
+    "covered": 75,
+    "total": 75
+  },
+  "BRANCH": {
+    "covered": 81,
+    "total": 86
+  }
+}

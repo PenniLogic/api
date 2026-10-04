@@ -116,5 +116,97 @@ class CoverageGateTest(unittest.TestCase):
                 quality.check_coverage("a" * 40)
 
 
+class MoneyCoverageQualificationTest(unittest.TestCase):
+    def report(self, directory, classes=("Money", "CurrencyRegistry"), sources=("Money.kt", "CurrencyRegistry.kt")):
+        class_nodes = "".join(f'<class name="{quality.MONEY_PACKAGE}/{name}"/>' for name in classes)
+        source_nodes = "".join(f'<sourcefile name="{name}"/>' for name in sources)
+        counters = (
+            '<counter type="LINE" missed="3" covered="97"/>'
+            '<counter type="BRANCH" missed="7" covered="93"/>'
+        )
+        path = Path(directory) / "money.xml"
+        path.write_text(
+            f'<report><package name="{quality.MONEY_PACKAGE}">{class_nodes}{source_nodes}'
+            f'{counters}</package>{counters}</report>', encoding="utf-8",
+        )
+        return path
+
+    def test_complete_authoritative_class_and_source_inventories_are_required(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.report(temporary)
+            classes = {f"{quality.MONEY_PACKAGE}/{name}" for name in ("Money", "CurrencyRegistry")}
+            sources = {"Money.kt", "CurrencyRegistry.kt"}
+            counters = quality.read_money_coverage(path, classes, sources)
+            self.assertEqual({"covered": 97, "total": 100}, counters["LINE"])
+            self.assertEqual({"covered": 93, "total": 100}, counters["BRANCH"])
+            for missing in classes:
+                with self.subTest(missing=missing), self.assertRaisesRegex(ValueError, "class inventory"):
+                    quality.read_money_coverage(path, classes - {missing}, sources)
+            for missing in sources:
+                with self.subTest(missing=missing), self.assertRaisesRegex(ValueError, "source inventory"):
+                    quality.read_money_coverage(path, classes, sources - {missing})
+
+    def test_unrelated_package_or_disagreeing_aggregate_cannot_mask_money_coverage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.report(temporary)
+            original = path.read_text(encoding="utf-8")
+            classes = {f"{quality.MONEY_PACKAGE}/{name}" for name in ("Money", "CurrencyRegistry")}
+            sources = {"Money.kt", "CurrencyRegistry.kt"}
+            path.write_text(original.replace(quality.MONEY_PACKAGE, "unrelated/package"), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "authoritative package"):
+                quality.read_money_coverage(path, classes, sources)
+            path.write_text(original.replace('missed="3"', 'missed="0"', 1), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "counters differ"):
+                quality.read_money_coverage(path, classes, sources)
+
+    def test_money_thresholds_come_from_the_bound_strategy_not_local_defaults(self):
+        class SyntheticProvider:
+            BUNDLE = Path("synthetic")
+            STRATEGY_FILE = Path("test-strategy.json")
+
+            def __init__(self, package):
+                self.package = package
+
+            def read_strategy(self, _):
+                return json.dumps({
+                    "packages": [self.package], "floor_policy": {"money_path_ratchet": True},
+                }).encode()
+
+        package = {
+            "id": "api.money", "repository": "PenniLogic/api", "money_path": True,
+            "line_coverage_floor_percent": 97, "branch_coverage_floor_percent": 93,
+            "mutation_score_floor_percent": 90,
+        }
+        floors, _ = quality.money_policy(SyntheticProvider(package))
+        self.assertEqual({"LINE": 97, "BRANCH": 93, "MUTATION": 90}, floors)
+        altered = {**package, "line_coverage_floor_percent": 99}
+        self.assertEqual(99, quality.money_policy(SyntheticProvider(altered))[0]["LINE"])
+        for invalid in (None, 0, 101, True, "97"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "numeric"):
+                quality.money_policy(SyntheticProvider({**package, "line_coverage_floor_percent": invalid}))
+
+    def test_exact_money_floors_pass_and_each_one_below_fails(self):
+        floors = {"LINE": 97, "BRANCH": 93, "MUTATION": 90}
+        counters = {
+            "LINE": {"covered": 97, "total": 100},
+            "BRANCH": {"covered": 93, "total": 100},
+        }
+        quality.enforce_money_coverage(counters, floors)
+        for kind in ("LINE", "BRANCH"):
+            insufficient = {**counters, kind: {"covered": counters[kind]["covered"] - 1, "total": 100}}
+            with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, kind):
+                quality.enforce_money_coverage(insufficient, floors)
+
+    def test_money_ratchet_refuses_a_decline_even_above_the_declared_floor(self):
+        floors = {"LINE": 97, "BRANCH": 93, "MUTATION": 90}
+        baseline = {"LINE": {"covered": 100, "total": 100}, "BRANCH": {"covered": 99, "total": 100}}
+        unchanged = {"LINE": {"covered": 100, "total": 100}, "BRANCH": {"covered": 99, "total": 100}}
+        quality.enforce_money_coverage(unchanged, floors, baseline)
+        for kind in ("LINE", "BRANCH"):
+            declined = {**unchanged, kind: {"covered": baseline[kind]["covered"] - 1, "total": 100}}
+            with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "decreased"):
+                quality.enforce_money_coverage(declined, floors, baseline)
+
+
 if __name__ == "__main__":
     unittest.main()

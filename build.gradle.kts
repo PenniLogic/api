@@ -134,6 +134,53 @@ tasks.test {
     finalizedBy(tasks.jacocoTestReport)
 }
 
+val targetedMoneyTest =
+    tasks.register<Test>("moneyTest") {
+        description = "Runs the actual immutable Money dependency's source-seam and arithmetic tests."
+        group = "verification"
+        testClassesDirs =
+            sourceSets.test
+                .get()
+                .output.classesDirs
+        classpath = sourceSets.test.get().runtimeClasspath
+        useJUnitPlatform()
+        include("com/pennilogic/money/**")
+        systemProperty(
+            "pennilogic.money.source",
+            layout.buildDirectory
+                .dir("contracts-money/source")
+                .get()
+                .asFile.path,
+        )
+        inputs.dir(layout.buildDirectory.dir("contracts-money/source/spec"))
+        testLogging {
+            events("failed", "skipped")
+        }
+    }
+
+val acceptedCoverageReport =
+    tasks.register<JacocoReport>("moneyCoverageReport") {
+        description = "Measures every compiled class of the immutable Contracts Money source dependency."
+        group = "verification"
+        dependsOn(targetedMoneyTest)
+        executionData.setFrom(layout.buildDirectory.file("jacoco/moneyTest.exec"))
+        classDirectories.setFrom(acceptedSourceSet.output.classesDirs)
+        sourceDirectories.setFrom(acceptedSourceSet.allSource.sourceDirectories)
+        reports {
+            xml.required.set(true)
+            html.required.set(true)
+        }
+    }
+
+val acceptedCoverageCheck =
+    tasks.register<Exec>("moneyCoverageCheck") {
+        description = "Qualifies the full Money package against the exact accepted Docs line and branch floors."
+        group = "verification"
+        dependsOn(acceptedCoverageReport)
+        workingDir(rootDir)
+        commandLine("python", "scripts/quality.py", "money-coverage-report")
+    }
+
 // Digest-pinned image for the disposable migration test database (PostgreSQL 17.11).
 val postgresImage = "postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f"
 
@@ -340,6 +387,7 @@ registerMigrationTask("migrateStatus", "Prints the registry state: current versi
 tasks.jacocoTestReport {
     dependsOn(tasks.test)
     mustRunAfter(integrationTest)
+    mustRunAfter(targetedMoneyTest)
     // Merge every test task's execution data that exists; a skipped integrationTest leaves none behind.
     executionData.setFrom(fileTree(layout.buildDirectory.dir("jacoco")) { include("*.exec") })
     reports {
@@ -350,6 +398,7 @@ tasks.jacocoTestReport {
 
 tasks.jacocoTestCoverageVerification {
     dependsOn(tasks.jacocoTestReport)
+    mustRunAfter(targetedMoneyTest)
     executionData.setFrom(fileTree(layout.buildDirectory.dir("jacoco")) { include("*.exec") })
     val docker = dockerAvailable
     val ci = providers.environmentVariable("CI")
@@ -378,7 +427,14 @@ tasks.jacocoTestCoverageVerification {
 }
 
 tasks.check {
-    dependsOn(moneyGuard, tasks.spotlessCheck, tasks.jacocoTestCoverageVerification, integrationTest, migrationConventionCheck)
+    dependsOn(
+        moneyGuard,
+        acceptedCoverageCheck,
+        tasks.spotlessCheck,
+        tasks.jacocoTestCoverageVerification,
+        integrationTest,
+        migrationConventionCheck,
+    )
 }
 
 tasks.withType<AbstractArchiveTask>().configureEach {

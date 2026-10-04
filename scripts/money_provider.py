@@ -31,6 +31,8 @@ OUTPUT_HASHES = {
     MONEY: "7d973d9f2a43859cc20c79789c57ebb793c051b9e7ce7652126d32e79cb97459",
     REGISTRY: "10d491ae90bc8f077afe5d45be671af52a5b7891c88eacfccd437a10f4956b21",
 }
+STRATEGY_FILE = Path("strategy/governance/test-strategy.json")
+STRATEGY_PIN = (80953, "a0322e0337c7c0e496711f21a1aea01136c6047b787318fd805a0788c2239bb2")
 
 
 class ProviderError(ValueError):
@@ -118,9 +120,20 @@ def source_outputs(contents, registry):
     }
 
 
+def read_strategy(path):
+    path = safe_path(path.parent, path.name)
+    if not path.is_file():
+        raise ProviderError("Accepted Docs test strategy is missing; materialize the fixed Docs source input.")
+    content = path.read_bytes()
+    if (len(content), digest(content)) != STRATEGY_PIN:
+        raise ProviderError("Accepted Docs test strategy source mismatch; preserve it and stop.")
+    return content
+
+
 def verify_outputs(root=ROOT):
     bundle = owned_target(root, BUNDLE)
     read_source(bundle / "source")
+    read_strategy(owned_target(root, BUNDLE / STRATEGY_FILE))
     sources = bundle / "kotlin"
     expected_paths = {sources / path for path in OUTPUT_HASHES}
     actual_paths = set()
@@ -143,16 +156,22 @@ def verify_outputs(root=ROOT):
     return sorted(expected_paths)
 
 
-def prepare(source=None, root=ROOT):
+def prepare(source=None, root=ROOT, strategy_file=None):
     bundle = owned_target(root, BUNDLE)
     cache = bundle / "source"
     source = (source or cache).absolute()
     if not source.is_dir():
         raise ProviderError(
             "Accepted Money SOURCE is not prepared. Run python scripts/money_provider.py "
-            "--source-root <owned snapshot of contracts ea56c63>; no release or fallback is assumed."
+            "--source-root <owned snapshot of contracts ea56c63> "
+            "--strategy-file <owned Docs a700e63 governance/test-strategy.json>; "
+            "no release or fallback is assumed."
         )
     contents = read_source(source)
+    strategy_target = owned_target(root, BUNDLE / STRATEGY_FILE)
+    strategy = read_strategy((strategy_file or strategy_target).absolute())
+    if strategy_target.exists():
+        read_strategy(strategy_target)
     outputs = source_outputs(contents, render_registry(source))
     for relative, content in outputs.items():
         target = owned_target(root, BUNDLE / "kotlin" / relative)
@@ -166,6 +185,8 @@ def prepare(source=None, root=ROOT):
         target = owned_target(root, BUNDLE / "source" / relative)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
+    strategy_target.parent.mkdir(parents=True, exist_ok=True)
+    strategy_target.write_bytes(strategy)
     for relative, content in outputs.items():
         target = owned_target(root, BUNDLE / "kotlin" / relative)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -178,6 +199,13 @@ def prepare(source=None, root=ROOT):
         "docs_ref": DOCS_REF,
         "source_inputs": {name: {"bytes": size, "sha256": sha} for name, (size, sha) in SOURCE_FILES.items()},
         "kotlin_source_sha256": OUTPUT_HASHES,
+        "qualification_input": {
+            "repository": "PenniLogic/docs",
+            "source_ref": DOCS_REF,
+            "path": "governance/test-strategy.json",
+            "bytes": STRATEGY_PIN[0],
+            "sha256": STRATEGY_PIN[1],
+        },
         "release_consumed": False,
         "generated_clients_tested": False,
     }
@@ -186,13 +214,15 @@ def prepare(source=None, root=ROOT):
     )
     print(json.dumps({
         "event": "money_provider", "source_ref": SOURCE_REF, "source_files_verified": len(contents),
-        "dependency_sources_verified": len(outputs), "kind": "accepted_source_only",
+        "dependency_sources_verified": len(outputs), "qualification_inputs_verified": 1,
+        "kind": "accepted_source_only",
     }))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, help="Owned immutable accepted Contracts source snapshot")
+    parser.add_argument("--strategy-file", type=Path, help="Exact accepted Docs governance/test-strategy.json")
     parser.add_argument("--verify", action="store_true", help="Verify prepared inputs/output without writing")
     args = parser.parse_args()
     try:
@@ -200,7 +230,7 @@ def main():
             verify_outputs()
             print(json.dumps({"event": "money_provider_verified", "source_ref": SOURCE_REF, "dependency_sources_verified": 2}))
         else:
-            prepare(args.source_root)
+            prepare(args.source_root, strategy_file=args.strategy_file)
     except ProviderError as error:
         print(str(error), file=sys.stderr)
         return 1
