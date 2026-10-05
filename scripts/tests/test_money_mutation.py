@@ -638,11 +638,14 @@ class ProcessBudgetTest(unittest.TestCase):
             patch.object(quality, "money_provider_module", return_value=provider),
             patch.object(quality, "gradle") as gradle,
             patch.object(quality, "test_metrics"),
+            patch.object(quality, "script_module") as loader,
         ):
             self.assertEqual(0, quality.main())
             self.assertEqual(("build", "installDist"), gradle.call_args.args)
             self.assertGreater(gradle.call_args.kwargs["budget"], 0)
             self.assertLessEqual(gradle.call_args.kwargs["budget"], 600)
+            loader.assert_called_once_with("money_mutation")
+            loader.return_value.check_latest.assert_called_once_with()
 
     def test_budget_overrun_after_the_build_also_fails(self):
         with (
@@ -650,6 +653,7 @@ class ProcessBudgetTest(unittest.TestCase):
             patch.object(quality, "money_provider_module", return_value=SyntheticStrategy()),
             patch.object(quality, "gradle"),
             patch.object(quality, "test_metrics"),
+            patch.object(quality, "script_module"),
             patch.object(quality.time, "monotonic", side_effect=[0, 0, 601, 602]),
             patch("sys.stdout", new_callable=io.StringIO),
             patch("sys.stderr", new_callable=io.StringIO) as errors,

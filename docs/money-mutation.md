@@ -27,6 +27,7 @@ a branch, release claim, alternative codec, or an unaccepted Infra materializer.
 
 ```text
 python scripts\quality.py build
+python scripts\quality.py coverage --base <full-trusted-base-commit-SHA>
 python scripts\quality.py money-mutation
 python scripts\quality.py money-mutation-report
 python -m unittest discover -s scripts\tests
@@ -36,6 +37,11 @@ The normal build reaches `check -> moneyMutation -> moneyCoverageCheck -> moneyT
 `moneyTest` is deliberately re-executed rather than restored from the build cache. The focused
 mutation command has the same dependencies and selection. The report command verifies the
 latest attempt; it neither launches PIT nor falls back to an older passing attempt.
+Full `coverage` also runs `moneyMutation` after its newly forced Money tests and coverage,
+in the same Gradle invocation. Build, full coverage and focused mutation all perform strict
+final report readback before returning success. Coverage-only `money-coverage` and
+`money-coverage-report` do not claim mutation qualification; rerunning the former can stale
+an earlier mutation result. The standalone mutation report remains read-only.
 The ordinary candidate gate remains blocking for below-floor, incomplete or error outcomes.
 A historical scratch result cannot qualify it; it requires its own current-source native run.
 
@@ -287,6 +293,37 @@ No full build, ledger/Postgres test, gate-self-test or native CI run is claimed.
 
 ## Fail-closed reports, diagnostics and budgets
 
+### Terminal freshness after full coverage
+
+The preserved local candidate sequence at frozen `6e89aedb87a56a3ee9894180ef946e018e50f487`
+took 312.866060 seconds with all eight commands exiting 0, including explicit-base coverage
+against accepted API `37fc85503994fd03f2f41ab5bfd87191db6d9b56`. Its final standalone mutation
+consumer correctly exited 1. Coverage had forced the 29 Money controls again (9 Java,
+20 Kotlin), changing two JUnit XML timestamp/duration bindings: only 214 of 216 mutation
+inputs still matched. The genuine 309/342 build-time record, failed terminal readback and
+all older packets remain unchanged. The earlier seven-command-only result is not full
+workflow evidence.
+
+Full `coverage` now requests the existing `moneyMutation` target with its coverage tasks.
+The target's dependency on `moneyCoverageCheck -> moneyCoverageReport -> moneyTest` ensures
+the newly executed Money tests and coverage precede mutation. Gradle executes that shared
+test dependency once per invocation, not once for each requested task. The existing strict
+`check_latest()` consumer then runs after the aggregate and Money coverage/base checks,
+before the CLI can succeed. Normal `build` and focused `money-mutation` also require this
+final consumer. Missing/stale evidence or refresh failure stays blocking; there is no
+fallback to a prior passing attempt or repair command after a failed readback.
+
+A normal build followed by full coverage therefore costs **two real PIT runs**: one in
+each command, plus the second execution of the 29 dedicated Money controls. Full coverage
+is not a harmless report read. Each full command gives Gradle only its remaining
+strategy-derived, at-most-600-second budget and includes final verification in its elapsed
+deadline. Native timings and duplicated executions must be reported separately, not added
+as unique tests or hidden by reusing an old mutation record.
+
+No XML binding, timestamp, cache/up-to-date rule, provider, native selection, threshold,
+baseline or generated workflow/profile is changed. The correction needs fresh separate
+Core/QA admission; frozen 6e's finite source reviews do not approve it.
+
 ### Q1 native-summary consistency correction
 
 The frozen `35267fc` executor compared the native generated count with XML, but the
@@ -353,8 +390,9 @@ The XML `partial` attribute describes line coverage, not mutation-run completion
 
 `money_budget` reads `money_path_harness_minutes` and `pull_request_gate_minutes` from the same
 exact strategy used for package floors and takes their minimum with the preserved 600-second
-native process ceiling. Missing/non-integer/non-positive budgets fail. Normal build and focused
-mutation commands enforce their elapsed deadline; PIT catalogue and engine share the remaining
+native process ceiling. Missing/non-integer/non-positive budgets fail. Normal build, full coverage
+and focused mutation commands enforce their elapsed deadline, including final report readback;
+PIT catalogue and engine share the remaining
 mutation budget. The frozen 27-test normal build took 70.338562 seconds wall time and its mutation
 harness 43.608505 seconds, failing solely on the score. The 29-test correction's focused
 `python scripts\quality.py money-mutation` took 78.411215 seconds wall time, including
@@ -402,7 +440,7 @@ consumer fixtures are not counted as real PIT mutants or independent-model evide
 | Below published package mutation floor fails the build | Implemented for the materialized `api.money` package: historical native failures and unchanged normal wiring are preserved; `MutationPolicyTest` and the standalone consumer prove numeric-floor refusal and restoration. One actual candidate run passes at 309/342 within the new scope; independent scope/source/QA approval is pending, and old RED runs are not qualified by it. |
 | Duplicate idempotency key has one ledger effect | Not implemented. API #3 remains dependent on API #2's real ledger; migration tests are not financial idempotency evidence. |
 | Serializable concurrent writes stay non-negative and balanced | Not implemented. No live ledger endpoint or financial concurrency suite exists in this slice. |
-| Published numeric pipeline budget is enforced | Implemented locally for normal build and Money mutation processes; `ProcessBudgetTest` proves failure, owned-child containment and restoration. Native required-CI execution and container behavior on forced host termination remain unqualified. |
+| Published numeric pipeline budget is enforced | Implemented locally for normal build, full coverage and Money mutation processes, including final readback; dispatch and `ProcessBudgetTest` probes cover failure, owned-child containment and restoration. Native required-CI execution and container behavior on forced host termination remain unqualified. |
 | Every money package meets published line/branch floors; missing numbers fail | The sole current materialized Money package passes actual full-class coverage and missing-number probes. This is not acceptance of future debt, budgeting, allocation or ledger packages. |
 
 | Original definition-of-done item | Status |

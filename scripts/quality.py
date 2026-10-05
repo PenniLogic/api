@@ -484,7 +484,11 @@ def main():
         elif args.command == "coverage":
             if not args.base:
                 parser.error("coverage requires --base; no implicit or stale CI base is accepted")
-            gradle("jacocoTestReport", "jacocoTestCoverageVerification", "moneyCoverageReport")
+            budget = money_budget(money_provider_module())["enforced_seconds"]
+            gradle(
+                "jacocoTestReport", "jacocoTestCoverageVerification", "moneyCoverageReport", "moneyMutation",
+                budget=budget - (time.monotonic() - started),
+            )
             check_coverage(args.base, args.write_baseline)
             check_money_coverage(args.base, args.write_baseline)
         elif args.command == "money-guard":
@@ -501,6 +505,8 @@ def main():
             script_module("money_mutation").check_latest()
         else:
             gate_self_test(args.artifact_dir)
+        if args.command in ("build", "coverage", "money-mutation"):
+            script_module("money_mutation").check_latest()
         if budget is not None and time.monotonic() - started > budget:
             raise TimeoutError("Quality command exceeded its enforced elapsed budget")
     except (subprocess.CalledProcessError, ValueError, OSError, ET.ParseError) as error:
