@@ -5,9 +5,9 @@ stacked on unaccepted local preparation `8e79ddd25f4cebff550999ca37bfbe02cc0d18a
 (tree `c843380583ef3a706967662ffc6d416ea1c8c145`). It is not a released provider, protected-source
 adoption, native CI result, non-author approval, or completion of #1, #3 or #22.
 
-**The gate exists; qualification remains RED.** The actual result is 376 killed out of 439
-mutants (85.649203%), below the numeric `api.money` mutation floor read from the accepted
-Docs strategy. There are 58 survivors and five uncovered mutants, with no local waivers.
+**The gate exists; qualification remains RED.** The actual result is 378 killed out of 439
+mutants (86.104784%), below the numeric `api.money` mutation floor read from the accepted
+Docs strategy. There are 56 survivors and five uncovered mutants, with no local waivers.
 
 ## Reproduce
 
@@ -85,8 +85,9 @@ Native attempt directories are retained under `build/reports/money-mutation/`.
 | 25 | 372 | 62 | 5 | 84.738041% | `20261005T102350Z-23d1de244227` |
 | 26 | 376 | 58 | 5 | 85.649203% | `20261005T104612Z-5f6a16387fcc` |
 | 27 | 376 | 58 | 5 | 85.649203% | `20261005T110632Z-b73b3d5a6bde` |
+| 29 | 378 | 56 | 5 | 86.104784% | `20261005T133436Z-6846f9b950e5` |
 
-All five shown runs have zero timeouts, non-viable mutants, memory/run errors, started-but-incomplete
+All shown runs have zero timeouts, non-viable mutants, memory/run errors, started-but-incomplete
 and not-started outcomes. PIT exits 1 for the below-floor score; this is a real gate failure,
 not a passing build. Earlier dependency, launch and report-parser failures and repeat runs are preserved too.
 No failed attempt is relabelled as a successful baseline.
@@ -97,17 +98,34 @@ existing JVM-visible internal parser/destruction seams, extra-member rejection a
 missing-before-extra rejection precedence. They never alter provider bytes or private state,
 admit `Long.MIN_VALUE`, widen ledger currencies, or implement another codec.
 
-The 58 survivors currently include 20 hash variants, 21 redundant/defensive void-call
-removals, eight inline/default-argument constant changes, and nine remaining redundant
-guard/unused-result candidates. These are investigation categories, **not proven equivalences**.
-The five uncovered mutants are in defensive destruction failures unreachable through the
-valid immutable construction paths exercised here. Arbitrary exact-hash assertions,
-compiler-message snapshots, private-state corruption and fake kills are not remedies.
-Every unresolved mutant remains in the native XML and normalized outcome catalogue, with
-its original status. Twenty additional genuine kills would be needed for this denominator
-to reach the currently published floor; no reduction or waiver is applied.
+The two latest tests adopt the genuine gaps demonstrated by the sealed independent bounded
+assessment of frozen source `fbf57bf174fb2eb9880647735033415b2375e4d8`. That assessment is not
+full Core/QA approval. The API adopted only these two methods, not its four exploratory tests:
 
-Money coverage is 75/75 lines and 82/86 branches, across all eight classes, with 27 tests,
+| Test | Actual newly killed native identity | Required behavior |
+| --- | --- | --- |
+| `arrayAndObjectMembersAreShapeRejectionsWithTheirField` | `4da1ee067b2d665db0bc28340cc69efc1e527c19b3f3bc66a0626f03aaeade36` | Array/object amount and currency members reject with `MoneyWireException(SHAPE, field)`, not a cast exception, as ADR-015 section 1.5 requires. |
+| `validUnorderedCollectionKeysDoNotInvokeMixedCurrencyArithmetic` | `aa5bc4d4baf98e331e31379882a2417bbaf975e217e2dea7a73d82bfdd0dc8ac` | A fixed valid 17-key unordered set accepts distinct values and retrieves freshly constructed equal values without requesting cross-currency ordering. No exact hash or collision-free distribution is asserted. |
+
+All 439 mutant identities, 125 factories, eight targets and provider bytes are unchanged.
+The remaining **61 obligations** are 56 survivors and five uncovered mutants. The bounded
+assessment distinguishes runtime no-ops, contract-permitted hash alternatives, domain-conditioned
+redundancy and blocked defensive observability; those classifications are not exemptions.
+The five uncovered mutants remain in `Money.toWire` defensive paths. Arbitrary exact-hash
+assertions, compiler-message snapshots, private-state corruption and fake kills are not remedies.
+Every unresolved mutant retains its native status and denominator membership. Eighteen further
+genuine kills would be needed at this denominator; no demonstrated valid-contract route was found
+in the bounded assessment, and no speculative broad mutation loop or waiver is substituted.
+
+The assessment also reproduced a separate failure in the **unmutated** provider: another valid
+cross-currency hash-set corpus reaches the provider's partial `Comparable` implementation and
+throws during unordered insertion. Root has routed that defect to Contracts. These API tests
+require successful collection behavior and never expect that defect. A proper provider fix may
+remove the distinguishing behavior of the current hash-addition mutation; the defect must not be
+retained to preserve a kill. Any provider correction needs new accepted input/catalogue evidence
+and fresh Core/QA review, not a local provider edit or pin substitution.
+
+Money coverage is 75/75 lines and 83/86 branches, across all eight classes, with 29 tests,
 zero failures and zero skips. Actual successful loop completion emits 10,030 round-trip cases,
 10,000 associativity cases and 384 collision keys. The consumer matches numeric suite counters
 to named Money test cases and requires each property category. Independent-oracle status is
@@ -133,8 +151,18 @@ The XML `partial` attribute describes line coverage, not mutation-run completion
 exact strategy used for package floors and takes their minimum with the preserved 600-second
 native process ceiling. Missing/non-integer/non-positive budgets fail. Normal build and focused
 mutation commands enforce their elapsed deadline; PIT catalogue and engine share the remaining
-mutation budget. The latest normal build took 70.338562 seconds wall time and the mutation
-harness 43.608505 seconds, failing solely on the score.
+mutation budget. The frozen 27-test normal build took 70.338562 seconds wall time and its mutation
+harness 43.608505 seconds, failing solely on the score. The 29-test correction's focused
+`python scripts\quality.py money-mutation` took 78.411215 seconds wall time, including
+48.966025 seconds in the mutation harness, and also failed solely on the score.
+
+The correction's earlier `moneyMutation build installDist` task-order attempt failed before PIT:
+the shape test raised actual branch coverage, requiring the existing baseline to ratchet from
+82/86 to 83/86. Despite the requested task order, Gradle also executed 22 migration tests, contrary
+to this correction's Money-only execution intent. The failure and execution deviation are retained,
+not relabelled as a Money-only normal build. After generating the higher baseline with the existing
+coverage consumer, only the focused Money gate was rerun; no further ledger execution occurred.
+The normal build wiring is unchanged, but a fresh post-correction full normal build is not claimed.
 
 Windows uses a private kill-on-close Job Object. A stdin-gated bootstrap cannot launch the
 real command before attachment, closing the process-start race. POSIX uses an owned process

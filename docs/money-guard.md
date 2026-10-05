@@ -78,8 +78,9 @@ omitted source files, unrelated package totals or inconsistent counters are refu
 The initial twelve tests measured 74/75 lines and 76/86 branches, and the branch gate failed.
 Additional equality, descriptor, rendering and non-JSON encoder/decoder tests improved the
 actual complete-package result to 75/75 lines (100%) and 81/86 branches (94.19%) across sixteen
-tests. The additive API #22 JVM/value/diagnostic tests now measure 75/75 lines and 82/86 branches
-across 27 tests. All four remaining branches stay in the denominator; no fabricated invalid
+tests. The additive API #22 JVM/value/diagnostic tests reached 75/75 lines and 82/86 branches
+across 27 tests. Two independently demonstrated regression cases now raise that result to 75/75
+lines and 83/86 branches across 29 tests. All three remaining branches stay in the denominator; no fabricated invalid
 instance, registry mutation or provider-source change was used to erase them.
 
 `quality/money-coverage-baseline.json` is generated from this actual report. The native package
@@ -92,11 +93,15 @@ undercoverage or a decline; changing report counters or the accepted strategy is
 
 **Mutation is executable and currently RED.** [The API #22 gate](money-mutation.md) runs pinned
 PIT against the actual provider, with the complete selected catalogue. The first fully parsed
-baseline killed 284/439 mutants; meaningful additional tests kill 376/439 (85.649203%).
-The remaining 58 survivors and five uncovered mutants receive no credit, and the normal build
+baseline killed 284/439 mutants; meaningful additional tests kill 378/439 (86.104784%).
+The remaining 56 survivors and five uncovered mutants receive no credit, and the normal build
 fails the mutation floor read from the same accepted strategy. Coverage is reported separately,
 never substituted for mutation evidence. No equivalent-mutant waiver, target pruning or
-provider-source modification makes this result pass.
+provider-source modification makes this result pass. The two adopted tests require shape/field
+rejection and successful valid unordered-key behavior, not exact hashes. A separate unmutated
+provider collection defect is Contracts-owned; fixing it may change a currently observed hash
+mutation kill and requires new accepted inputs and fresh review. It is not an expected failure
+in these API tests.
 
 `build.gradle.kts`, `scripts/quality.py`, its tests and this guide are manual API source;
 they are not outputs of the accepted Infra `governance/generate.py` artifact inventory.

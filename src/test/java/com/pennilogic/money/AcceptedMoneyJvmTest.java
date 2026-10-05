@@ -14,6 +14,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import kotlinx.serialization.json.Json;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -151,6 +152,41 @@ class AcceptedMoneyJvmTest {
         }
         same(cases, values.size(), "collision-key-cardinality");
         System.out.println("{\"event\":\"money_property_cases\",\"property\":\"collision_keys\",\"count\":" + cases + "}");
+    }
+
+    @Test
+    void validUnorderedCollectionKeysDoNotInvokeMixedCurrencyArithmetic() {
+        var values = new HashSet<Money>(128);
+        for (int index = 1; index <= 16; index++) {
+            long minor = ((long) index << 32) | index;
+            assertTrue(values.add(Money.Companion.ofMinorUnits(minor, "INR")), "distinct-unordered-key");
+        }
+        // This fixed valid corpus exercises a cross-currency collision after the native hash addition mutation.
+        assertTrue(values.add(Money.Companion.ofMinorUnits(831284026L, "JPY")), "distinct-unordered-currency-key");
+        assertTrue(values.size() == 17, "unordered-key-cardinality");
+        assertTrue(values.contains(Money.Companion.ofMinorUnits(831284026L, "JPY")), "unordered-key-lookup");
+        for (int index = 1; index <= 16; index++) {
+            long minor = ((long) index << 32) | index;
+            assertTrue(values.contains(Money.Companion.ofMinorUnits(minor, "INR")), "unordered-original-key-lookup");
+        }
+    }
+
+    @Test
+    void arrayAndObjectMembersAreShapeRejectionsWithTheirField() {
+        String[][] cases = {
+            {"{\"amount\":[],\"currency\":\"INR\"}", "amount"},
+            {"{\"amount\":{},\"currency\":\"INR\"}", "amount"},
+            {"{\"amount\":\"0.00\",\"currency\":[]}", "currency"},
+            {"{\"amount\":\"0.00\",\"currency\":{}}", "currency"}
+        };
+        int index = 0;
+        for (String[] item : cases) {
+            String id = "member-shape-" + index++;
+            MoneyWireException error = assertThrows(MoneyWireException.class,
+                () -> Money.Companion.fromWire(Json.Default.parseToJsonElement(item[0])), id);
+            assertTrue(error.getReason() == MoneyReason.SHAPE, id + "-reason");
+            assertTrue(error.getField().equals(item[1]), id + "-field");
+        }
     }
 
     @Test
