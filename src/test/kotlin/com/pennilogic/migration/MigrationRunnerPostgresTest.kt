@@ -76,7 +76,7 @@ class MigrationRunnerPostgresTest {
         assertTrue(applied.require("migration_applied").contains("\"id\":\"V001__create_pennilogic_schema\""))
         applied.require("migration_lock_released")
         assertEquals(1L, database.count("SELECT count(*) FROM pg_namespace WHERE nspname = 'pennilogic'"))
-        assertEquals(1, currentVersion(status(database, shipped)))
+        assertEquals(2, currentVersion(status(database, shipped)))
 
         val emptyReverse = Output()
         assertEquals(
@@ -96,12 +96,21 @@ class MigrationRunnerPostgresTest {
         val populatedReverse = Output()
         assertEquals(0, cli(database, populatedReverse, "migrate-down", "--holder", "test@junit", "--migrations", shipped.toString()))
         assertEquals(2L, database.count("SELECT count(*) FROM public.fixture"))
+        assertEquals(1, currentVersion(status(database, shipped)))
+        assertNull(database.scalar("SELECT to_regclass('pennilogic.entries')"))
+        assertEquals(1L, database.count("SELECT count(*) FROM pg_namespace WHERE nspname = 'pennilogic'"))
+        val completeReverse = Output()
+        assertEquals(
+            0,
+            cli(database, completeReverse, "migrate-down", "--holder", "test@junit", "--migrations", shipped.toString(), "--target", "0"),
+        )
+        assertEquals(2L, database.count("SELECT count(*) FROM public.fixture"))
         assertEquals(0, currentVersion(status(database, shipped)))
         migrate(database, shipped)
         val finalStatus = status(database, shipped)
-        assertEquals(1, currentVersion(finalStatus))
-        assertTrue(finalStatus.contains("\"lastApplied\":{\"version\":1,\"id\":\"V001__create_pennilogic_schema\""))
-        assertEquals(5L, database.count("SELECT count(*) FROM migration_runner.migration_registry"))
+        assertEquals(2, currentVersion(finalStatus))
+        assertTrue(finalStatus.contains("\"lastApplied\":{\"version\":2,\"id\":\"V002__create_ledger\""))
+        assertEquals(10L, database.count("SELECT count(*) FROM migration_runner.migration_registry"))
         assertEquals(1L, database.count("SELECT count(*) FROM migration_runner.migration_lock WHERE holder IS NULL"))
         assertRunnerSchemaHoldsOnlyTheRegistry(database)
     }
@@ -148,7 +157,10 @@ class MigrationRunnerPostgresTest {
         migrate(database, shipped)
         database.execute("CREATE TABLE pennilogic.ledger_probe (id integer)")
         val output = Output()
-        assertEquals(1, cli(database, output, "migrate-down", "--holder", "test@junit", "--migrations", shipped.toString()))
+        assertEquals(
+            1,
+            cli(database, output, "migrate-down", "--holder", "test@junit", "--migrations", shipped.toString(), "--target", "0"),
+        )
         val failed = output.require("migration_failed")
         assertTrue(failed.contains("\"direction\":\"down\""))
         assertTrue(failed.contains("\"sqlState\":\"2BP01\""))
@@ -742,7 +754,7 @@ class MigrationRunnerPostgresTest {
         assertEquals(0, process.exitValue(), text)
         assertTrue(text.contains("\"event\":\"migration_applied\""))
         assertFalse(text.contains(database.password))
-        assertEquals(1, currentVersion(status(database, shipped)))
+        assertEquals(2, currentVersion(status(database, shipped)))
     }
 
     @Test
@@ -760,8 +772,9 @@ class MigrationRunnerPostgresTest {
                 )
             assertEquals(0, runner.migrate(null, includeContract = false, dryRun = false))
             val snapshot = runner.snapshot()
-            assertEquals(1, snapshot.currentVersion)
+            assertEquals(2, snapshot.currentVersion)
             assertEquals("applied", snapshot.states.getValue(1).label)
+            assertEquals("applied", snapshot.states.getValue(2).label)
             assertNull(snapshot.lock)
             assertEquals(0, runner.migrateDown(0, dryRun = false))
             assertEquals(
@@ -779,9 +792,10 @@ class MigrationRunnerPostgresTest {
                 "migration_plan",
                 "migration_lock_claimed",
                 "migration_applied",
+                "migration_applied",
                 "migration_lock_released",
             ),
-            events.take(4).map {
+            events.take(5).map {
                 it.substringAfter("\"event\":\"").substringBefore('"')
             },
         )

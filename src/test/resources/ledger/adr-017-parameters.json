@@ -1,0 +1,188 @@
+{
+  "artifact": "adr-017-ledger-parameters",
+  "schema_version": 1,
+  "record": "ADR-017",
+  "ticket": "T-ADR-LEDGER-03",
+  "money": {
+    "storage": {"amount": "BIGINT minor units", "currency": "CHAR(3) ISO 4217"},
+    "wire": "ADR-015 Money",
+    "range_minor": {"min": "-9223372036854775807", "max": "9223372036854775807"},
+    "zero_entry": "forbidden"
+  },
+  "sign_convention": {
+    "positive": "debit",
+    "negative": "credit",
+    "natural_balance": {"ASSET": "debit", "EXPENSE": "debit", "LIABILITY": "credit", "INCOME": "credit", "EQUITY": "credit", "CLEARING": "either"},
+    "owed_for_liability": "-balance"
+  },
+  "entry": {
+    "table": "entries",
+    "columns": ["id", "transaction_id", "owner_id", "account_id", "currency", "amount_minor"],
+    "foreign_keys": [
+      {"columns": ["transaction_id", "owner_id"], "references": "transactions (id, owner_id)"},
+      {"columns": ["transaction_id", "currency"], "references": "transactions (id, currency)"},
+      {"columns": ["account_id", "owner_id"], "references": "accounts (id, owner_id)"},
+      {"columns": ["account_id", "currency"], "references": "accounts (id, currency)"}
+    ],
+    "checks": ["amount_minor <> 0", "amount_minor >= -9223372036854775807"]
+  },
+  "constraints": [
+    {"id": "transaction_zero_sum", "statement": "for every (transaction_id, currency): SUM(amount_minor) = 0 and COUNT(*) >= 2 when any entry exists", "mechanism": "postgresql.constraint_trigger.deferrable_initially_deferred", "trigger": "transaction_zero_sum", "function": "ledger.assert_transaction_balanced", "security": "INVOKER", "error": "ledger.transaction_zero_sum", "sqlstate": "23514"},
+    {"id": "transaction_sealed", "statement": "COUNT(entries) = transactions.entry_count at COMMIT; entry_count is written once at posting; raises when the transactions row is not visible to the invoking role or fewer than entry_count entries are visible", "mechanism": "postgresql.constraint_trigger.deferrable_initially_deferred", "trigger": "transaction_sealed", "security": "INVOKER"},
+    {"id": "reversal_exact_negation", "statement": "a REVERSAL's entries are the exact negation of its target's entries (same account multiset, negated amounts) and its occurred_at, value_date (IS NOT DISTINCT FROM) and entry_count equal its target's", "mechanism": "postgresql.constraint_trigger.deferrable_initially_deferred", "trigger": "transaction_sealed", "security": "INVOKER"},
+    {"id": "reversal_terminal", "statement": "a REVERSAL's target has kind <> 'REVERSAL' and entry_count >= 2 (posted); a REVERSAL is never a reversal target", "mechanism": "postgresql.constraint_trigger.deferrable_initially_deferred", "trigger": "transaction_sealed", "security": "INVOKER", "rejection_reasons": ["reversal_of_reversal", "reversal_target_not_posted"]},
+    {"id": "repost_without_reversal", "statement": "a REPOST's replaces target has kind <> 'REVERSAL' and a REVERSAL at COMMIT; the REPOST carries a value_date whenever the target has one", "mechanism": "postgresql.constraint_trigger.deferrable_initially_deferred", "security": "INVOKER", "rejection_reasons": ["repost_without_reversal"]},
+    {"id": "repost_supersedes_prior", "statement": "for a REPOST with replaces = X, every REPOST with replaces = X and a different correction_id is REVERSED at COMMIT", "mechanism": "postgresql.constraint_trigger.deferrable_initially_deferred", "security": "INVOKER", "rejection_reasons": ["repost_not_superseding"]},
+    {"id": "status_reversed_equivalence", "statement": "(transactions.status = 'reversed') = EXISTS (SELECT 1 FROM transactions r WHERE r.reverses = transactions.id) at COMMIT, evaluated for every transactions row inserted or updated and for the reverses target of every REVERSAL inserted (NEW.reverses when NEW.kind = 'REVERSAL')", "mechanism": "postgresql.constraint_trigger.deferrable_initially_deferred", "security": "INVOKER"},
+    {"id": "transaction_single_currency", "statement": "entries.currency = transactions.currency", "mechanism": "composite_foreign_key"},
+    {"id": "entry_account_currency", "statement": "entries.currency = accounts.currency", "mechanism": "composite_foreign_key"},
+    {"id": "entry_owner", "statement": "entries.owner_id = transactions.owner_id = accounts.owner_id", "mechanism": "composite_foreign_key"},
+    {"id": "reversal_target", "statement": "(reverses, owner_id, currency) references transactions (id, owner_id, currency) [UNIQUE (id, owner_id, currency) on transactions]; (replaces, owner_id) references transactions (id, owner_id)", "mechanism": "composite_foreign_key", "rejection_reasons": ["transaction_not_found"]},
+    {"id": "exchange_group_owner", "statement": "(transactions.exchange_group_id, owner_id) references exchange_groups (id, owner_id); (exchange_groups.reverses_group_id, owner_id) references exchange_groups (id, owner_id) [UNIQUE (id, owner_id) on exchange_groups]", "mechanism": "composite_foreign_key", "status": "reserved"},
+    {"id": "entry_nonzero_or_range", "statement": "amount_minor <> 0 and amount_minor >= -(2^63 - 1)", "mechanism": "check"},
+    {"id": "candidate_entry_count", "statement": "(status IN ('candidate', 'suppressed_by_link')) = (entry_count = 0) AND (entry_count = 0) = (booked_at IS NULL)", "mechanism": "check"},
+    {"id": "booked_at_plausible", "statement": "BEFORE INSERT OR UPDATE OF booked_at on transactions and BEFORE INSERT on statement_snapshots and exchange_groups: a non-NULL booked_at satisfies abs(booked_at - clock_timestamp()) <= PT5M; validates, never assigns (ADR-015 §3.1)", "mechanism": "postgresql.before_write_validation_trigger", "skew": "PT5M"},
+    {"id": "exchange_group_shape", "statement": "exactly two legs, currencies = {base, quote}, one positive base clearing entry and one negative quote clearing entry (signs inverted in a reversal group), at least one non-system account entry per leg, same owner and occurred_at", "mechanism": "postgresql.constraint_trigger.deferrable_initially_deferred", "security": "INVOKER", "status": "reserved"},
+    {"id": "exchange_group_reversal", "statement": "a reversal group reverses both legs; a leg of a group is reversed only inside a reversal group; the target of reverses_group_id has reverses_group_id IS NULL (a reversal group is never itself reversed); the reversal group copies base_currency, quote_currency, quoted_rate_e10, rate_source, rate_feed, rate_instant, rounding_side and occurred_at", "mechanism": "postgresql.constraint_trigger.deferrable_initially_deferred", "security": "INVOKER", "status": "reserved"},
+    {"id": "clearing_entry_membership", "statement": "an entry on an FX_CLEARING account belongs to an EXCHANGE_LEG or its REVERSAL", "mechanism": "postgresql.constraint_trigger.deferrable_initially_deferred", "security": "INVOKER", "status": "reserved"},
+    {"id": "split_shares_sum", "statement": "SUM(split_shares.share_minor) = split_expenses.amount_minor per expense", "mechanism": "postgresql.constraint_trigger.deferrable_initially_deferred", "security": "INVOKER", "owner": "T-SPL-01"}
+  ],
+  "trigger_visibility_precondition": "every role permitted to INSERT into transactions or entries is admitted to SELECT every row of the same transaction (ADR-018 §4.2 owner_rows is FOR ALL); a later write policy must be FOR ALL or paired with a SELECT policy of at least the same scope; triggers fail closed when rows are not visible",
+  "rejection_reasons": {
+    "binding": "T-CON-12 validation_rejected reasons; the API returns them without any amount",
+    "values": ["currency_not_admitted", "exchange_rate_inconsistent", "already_reversed", "reversal_of_reversal", "reversal_target_not_posted", "repost_without_reversal", "repost_not_superseding", "snapshot_already_reconciled", "transaction_not_found"],
+    "transaction_not_found": "a reversal or re-post target the principal does not own, or in another currency, receives exactly the not-found answer"
+  },
+  "append_only": {
+    "no_update_no_delete": ["entries", "statement_snapshots", "exchange_groups"],
+    "transactions_immutable_columns": ["owner_id", "currency", "kind", "occurred_at", "booked_at", "value_date", "reverses", "replaces", "correction_id", "reason_code", "reason_ref", "reason_note", "reconciles_snapshot_id", "exchange_group_id"],
+    "transactions_write_once_columns": {"entry_count": "0 at candidate creation; set once when status moves to posted; never changed afterwards", "booked_at": "NULL at candidate creation; set once, with entry_count, when status moves to posted; written at INSERT for every non-candidate kind; never changed afterwards"},
+    "mutable_metadata": "ADR-018 §4.1, extended by this record with the one-time posting write of entry_count and booked_at; status is constrained by status_reversed_equivalence",
+    "runtime_role": "pennilogic_app",
+    "extends_adr_018": {"pinned_commit": "08c2c149ff5f1dae550d5751109e5d5e63dc8384 (merged to main)", "section_1_2": "adds ledger_currencies (reference), statement_snapshots and exchange_groups (constrained; evidence_ref opaque) and the new transactions/accounts columns to the inventory", "section_4_1": "adds the one-time trigger-guarded posting write of transactions.entry_count and transactions.booked_at to the column-level UPDATE list (ADR-018 lists .booked_at as never updatable; the exception is exactly the NULL-to-value write at posting)", "section_4_2_exemption": "adds ledger_currencies to the merchants/trial_fingerprints exception sentence (no row-level security; SELECT grant only)", "section_4_2_lint": "adds DISABLE TRIGGER, session_replication_role and GRANT SET ON PARAMETER session_replication_role to the migration lint tokens"},
+    "cites_adr_020": {"pinned_commit": "8d15a4c1b014d7947b982a12a33deb69189199d8 (merged to main)", "sections": ["4.4", "5 item 7"]}
+  },
+  "account_types": ["ASSET", "LIABILITY", "INCOME", "EXPENSE", "EQUITY", "CLEARING"],
+  "account_system_roles": {
+    "OPENING_BALANCE": {"type": "EQUITY", "one_per": ["owner_id", "currency"]},
+    "RECONCILIATION": {"type": "EQUITY", "one_per": ["owner_id", "currency"]},
+    "FX_CLEARING": {"type": "CLEARING", "one_per": ["owner_id", "currency"], "status": "reserved"},
+    "FX_FEE": {"type": "EXPENSE", "one_per": ["owner_id", "currency"], "status": "reserved"}
+  },
+  "transaction_kinds": ["STANDARD", "OPENING_BALANCE", "REVERSAL", "REPOST", "RECONCILIATION_ADJUSTMENT", "EXCHANGE_LEG"],
+  "reason_codes": ["USER_CORRECTION", "DUPLICATE_LINK", "RECONCILIATION", "EXCHANGE_REVERSAL", "ADMINISTRATIVE"],
+  "reason_ref": {"required_for": {"DUPLICATE_LINK": "duplicate_links.id (ADR-018 §7.3)", "ADMINISTRATIVE": "the pending ledger request record ADR-020 §5 item 7 creates and its audit event references"}, "forbidden_otherwise": true, "cross_check_signal": "ledger.administrative.unmatched"},
+  "correction_id": {"set_on": ["REVERSAL", "REPOST"], "rule": "one server-generated value per correction operation, shared by every row that operation posts; a re-correction of the same target uses a new value and must reverse the earlier re-posts in the same database transaction (repost_supersedes_prior)"},
+  "effective_status": {"derived": true, "values": ["ACTIVE", "REVERSED"], "rule": "REVERSED iff a transaction with reverses = id exists; a REVERSAL is terminal (never a reversal target) and therefore always ACTIVE; transactions.status = 'reversed' is a projection of the same rule, never returned to posted, guarded by status_reversed_equivalence"},
+  "ledger_currencies": {
+    "table": "ledger_currencies",
+    "columns": ["code", "exponent", "admitted_at"],
+    "registry": "currency-registry.v1.json",
+    "mvp_admitted": ["INR"],
+    "widening": "additive INSERT under the E30 flag",
+    "removal": "forbidden",
+    "rejection_reason": "currency_not_admitted",
+    "rls": "exempt from ENABLE/FORCE ROW LEVEL SECURITY exactly like ADR-018 §4.2 merchants (global reference table, no user data); GRANT SELECT to pennilogic_app and nothing else to any runtime role; rows written by migrations as table owner; no USING (true) policy (ADR-018 §4.2/§4.4 reserve that shape for resolver_read)"
+  },
+  "derivation": {
+    "effective_date": "value_date if present, else the local calendar date of occurred_at in the profile time zone (ADR-015 §3.3)",
+    "balance": "SUM(amount_minor) over every entry of the account, with no status predicate: entries exist only on posted transactions, and a reversed transaction's entries remain in every sum, cancelled by its reversal's",
+    "balance_asof": "SUM over entries whose transaction effective_date <= D (a REVERSAL carries its target's occurred_at and value_date, so every as-of figure is restored)",
+    "balance_recorded": "SUM over entries whose transaction booked_at <= r; booked_at is the posting instant (NULL until a candidate posts), so no entry appears for an r before it existed",
+    "owed": "-balance for a LIABILITY account",
+    "position_fields": ["as_of", "max_booked_at", "entry_count"],
+    "read_models": "non-authoritative; recomputed from entries; reconciled on schedule; never synced; never a write input"
+  },
+  "statement_snapshot": {
+    "table": "statement_snapshots",
+    "columns": ["id", "owner_id", "account_id", "currency", "statement_date", "statement_balance_minor", "source", "evidence_ref", "captured_at", "booked_at"],
+    "statement_balance_sign": "ledger sign (debit positive)",
+    "sources": ["MANUAL", "IMPORT"],
+    "immutable": true
+  },
+  "reconciliation_adjustment": {
+    "kind": "RECONCILIATION_ADJUSTMENT",
+    "reason_code": "RECONCILIATION",
+    "delta": "statement_balance_minor - balance_asof(account, statement_date)",
+    "entries": [{"account": "reconciled account", "amount_minor": "+delta"}, {"account": "RECONCILIATION equity account, same currency", "amount_minor": "-delta"}],
+    "value_date": "statement_date",
+    "link": "transactions.reconciles_snapshot_id UNIQUE",
+    "rejection_reason_second_adjustment": "snapshot_already_reconciled",
+    "states": ["EXACT", "ADJUSTED", "UNRECONCILED"]
+  },
+  "exchange": {
+    "status": "reserved",
+    "implementation_phase": "P6 Moat (E30, PenniLogic/docs#33)",
+    "table": "exchange_groups",
+    "columns": ["id", "owner_id", "base_currency", "quote_currency", "quoted_rate_e10", "rate_source", "rate_feed", "rate_instant", "rounding_side", "occurred_at", "booked_at", "evidence_ref", "reverses_group_id"],
+    "not_null": ["id", "owner_id", "base_currency", "quote_currency", "quoted_rate_e10", "rate_source", "rate_instant", "rounding_side", "occurred_at", "booked_at"],
+    "legs": {"count": 2, "kind": "EXCHANGE_LEG", "base_clearing_sign": "positive", "quote_clearing_sign": "negative", "reversal_group_signs": "inverted", "owner_key": "(exchange_group_id, owner_id) references exchange_groups (id, owner_id)"},
+    "rate": {"column": "quoted_rate_e10", "type": "BIGINT", "scale": 10, "direction": "quote major units per one base major unit", "wire": "canonical decimal string with exactly 10 fraction digits, positive-only pattern published by T-CON-05 as QuotedRate", "min": "0.0000000001", "max": "922337203.6854775807"},
+    "rate_sources": ["PROVIDER_STATEMENT", "USER_ENTERED", "REFERENCE_FEED"],
+    "rate_feed_list_owner": "T-CON-05",
+    "rounding_side_values": {"QUOTE": "provider fixed the base amount and computed the quote amount", "BASE": "provider fixed the quote amount and computed the base amount (fixed-destination exchange)"},
+    "recompute_from_later_rate": "forbidden",
+    "fees": {"account_role": "FX_FEE", "currency": "the currency charged", "placement": "inside the leg when deducted from the exchanged amount, otherwise its own STANDARD transaction", "absorbed_into_rate": "forbidden", "markup_function": "ExchangeArithmetic.feeMinor(gross_minor, markup_bps)", "rounding": "HALF_EVEN"},
+    "identity": {
+      "evaluated_on": "rounding_side",
+      "QUOTE": {"expected_q": "HALF_EVEN(b * quoted_rate_e10 * 10^e_quote / 10^(e_base + 10))", "residual": "q - expected_q (quote minor units)"},
+      "BASE": {"expected_b": "HALF_EVEN(q * 10^(e_base + 10) / (quoted_rate_e10 * 10^e_quote))", "residual": "b - expected_b (base minor units)"},
+      "arithmetic": "arbitrary-precision integer (BigInteger or NUMERIC), never BIGINT",
+      "max_abs_residual_minor": 1,
+      "unit": "one minor unit of the rounded side (exact: the discrepancy between any provider rounding mode or truncation and HALF_EVEN of the same rational)",
+      "rejection_reason": "exchange_rate_inconsistent",
+      "residual_stored": false
+    },
+    "atomicity": "postgresql.constraint_trigger.deferrable_initially_deferred",
+    "reversal": {"unit": "whole group", "link": "exchange_groups.reverses_group_id UNIQUE", "leg_reason_code": "EXCHANGE_REVERSAL", "partial": "impossible", "reversal_of_reversal_group": "impossible; reinstatement is a new group", "copies": ["base_currency", "quote_currency", "quoted_rate_e10", "rate_source", "rate_feed", "rate_instant", "rounding_side", "occurred_at"]},
+    "descriptive_merchant_amount": {"columns": ["merchant_amount_minor", "merchant_currency"], "is_entry": false, "status": "reserved"}
+  },
+  "totals": {
+    "scalar_mixed_currency_total": "forbidden",
+    "component": "MoneyByCurrency",
+    "derivation_component": "Derivation",
+    "converted_component": "ConvertedMoney",
+    "converted_breakdown_component": {"name": "ConvertedBreakdown", "fields": ["reporting_currency", "buckets", "total", "derivation"], "invariant": "total = sum of buckets[i].amount in bucket order", "scalar_total_allowed": "only here, next to its buckets"},
+    "conversion_function": "ExchangeArithmetic.convert(bucket_minor, quote, e_from, e_to)",
+    "conversion_rounding": "HALF_EVEN per bucket, then sum in bucket order",
+    "historical_quote_rule": "latest reference quote at or before the transaction's effective instant from the named feed",
+    "valuation_quote_rule": "latest reference quote at or before the as-of instant, labelled with its instant"
+  },
+  "tests": [
+    {"id": "LedgerZeroSumTriggerTest", "phase": "MVP", "owners": ["PenniLogic/api#2", "PenniLogic/api#22", "PenniLogic/api#3"], "category": "domain_ledger_property"},
+    {"id": "LedgerAppendOnlyPrivilegeTest", "phase": "MVP", "owners": ["PenniLogic/api#2", "PenniLogic/api#37"], "category": "integration_tests"},
+    {"id": "AdministrativeCorrectionCrossCheckTest", "phase": "MVP", "owners": ["PenniLogic/api#7", "PenniLogic/api#37"], "category": "integration_tests"},
+    {"id": "CorrectionByAdjustmentTest", "phase": "MVP", "owners": ["PenniLogic/api#7", "PenniLogic/api#22"], "category": "domain_ledger_property"},
+    {"id": "ReversalOfReversalRejectedTest", "phase": "MVP; E30 group case", "owners": ["PenniLogic/api#7", "PenniLogic/api#22", "PenniLogic/api#46"], "category": "domain_ledger_property"},
+    {"id": "NoStoredBalanceGuardTest", "phase": "MVP", "owners": ["PenniLogic/api#11", "PenniLogic/api#6"], "category": "integration_tests"},
+    {"id": "DerivedDebtBalanceTest", "phase": "MVP", "owners": ["PenniLogic/api#11", "PenniLogic/api#13", "PenniLogic/api#16", "PenniLogic/api#22"], "category": "debt_maths_independent_model"},
+    {"id": "LenderDiscrepancySnapshotTest", "phase": "MVP", "owners": ["PenniLogic/api#11", "PenniLogic/contracts#5"], "category": "domain_ledger_property"},
+    {"id": "ExchangeGroupAtomicityTest", "phase": "E30", "mvp_negative_owner": "PenniLogic/api#2", "owners": ["PenniLogic/api#46", "PenniLogic/api#2"], "category": "domain_ledger_property"},
+    {"id": "ExchangeGroupPairedReversalTest", "phase": "E30", "owners": ["PenniLogic/api#46"], "category": "domain_ledger_property"},
+    {"id": "RateProvenanceTest", "phase": "E30", "owners": ["PenniLogic/api#46", "PenniLogic/contracts#9"], "category": "domain_ledger_property"},
+    {"id": "ExplicitFeeTest", "phase": "E30", "owners": ["PenniLogic/api#46", "PenniLogic/contracts#9"], "category": "domain_ledger_property"},
+    {"id": "NoMixedCurrencyTotalTest", "phase": "MVP shape, E30 data", "owners": ["PenniLogic/contracts#9", "PenniLogic/contracts#12", "PenniLogic/api#54", "PenniLogic/api#72"], "category": "domain_ledger_property"},
+    {"id": "MigrationEquivalenceTest", "phase": "E30", "owners": ["PenniLogic/api#46"], "category": "integration_tests", "change_class": "data_migration"},
+    {"id": "SplitSharesSumTriggerTest", "phase": "E15", "owners": ["PenniLogic/api#33"], "category": "domain_ledger_property"}
+  ],
+  "signals": [
+    "ledger.constraint.violation{constraint}",
+    "ledger.transaction.posted{kind}",
+    "ledger.transaction.reversed{reason_code}",
+    "ledger.reversal.age_seconds",
+    "ledger.administrative.unmatched",
+    "ledger.balance.reconciliation_run",
+    "ledger.balance.reconciliation_mismatch{read_model}",
+    "ledger.statement_snapshot.recorded{source}",
+    "ledger.reconciliation.adjustment{direction}",
+    "ledger.reconciliation.state{state}",
+    "ledger.reconciliation.unreconciled_age_days",
+    "ledger.exchange.group{outcome}",
+    "ledger.exchange.rate_inconsistent",
+    "ledger.exchange.rate_residual{side,value}",
+    "ledger.exchange.reversal",
+    "ledger.currency.not_admitted",
+    "ledger.total.mixed_currency_assertion"
+  ],
+  "constraint_violation_label_set": "constraints[].id of this artifact"
+}

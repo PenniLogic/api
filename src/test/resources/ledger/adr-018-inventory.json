@@ -1,0 +1,1005 @@
+{
+ "schema_version": 1,
+ "record": "ADR-018",
+ "ticket": "T-ADR-CRYPTO-04",
+ "classes": [
+  "constrained",
+  "encrypted",
+  "blind_indexed",
+  "key_material",
+  "reference",
+  "absent"
+ ],
+ "default_class_for_unlisted_column": "encrypted",
+ "tables": [
+  {
+   "table": "users",
+   "key_scope": "user",
+   "constrained": [
+    "id",
+    "status",
+    "created_at",
+    "time_zone"
+   ],
+   "encrypted": [
+    "display_name"
+   ],
+   "reason": "identity row; ADR-019's account; owner_id everywhere"
+  },
+  {
+   "table": "channels",
+   "key_scope": "platform",
+   "index_key": "global",
+   "constrained": [
+    "id",
+    "account_id",
+    "type",
+    "verified_at",
+    "matured_at",
+    "suspect",
+    "value_bidx_version",
+    "created_at"
+   ],
+   "blind_indexed": [
+    "value"
+   ],
+   "reason": "ADR-019 contact channels; CK ciphertext; single GIK equality index; partial unique (type, value_bidx) where verified"
+  },
+  {
+   "table": "trial_fingerprints",
+   "key_scope": "platform",
+   "constrained": [
+    "fingerprint",
+    "first_trial_at",
+    "trials_used"
+   ],
+   "rls": false,
+   "reason": "K_abuse fingerprint; no subject link; retention per T-CMP-04 profile"
+  },
+  {
+   "table": "user_keys",
+   "constrained": [
+    "user_id",
+    "key_id",
+    "purpose",
+    "kek_id",
+    "state",
+    "encrypt_count",
+    "created_at",
+    "rotated_at",
+    "retired_at",
+    "destroyed_at"
+   ],
+   "key_material": [
+    "wrapped_key",
+    "canary"
+   ],
+   "reason": "wrapped DEK/IK/AK rows"
+  },
+  {
+   "table": "accounts",
+   "key_scope": "user",
+   "index_key": "user",
+   "constrained": [
+    "id",
+    "owner_id",
+    "type",
+    "currency",
+    "is_archived",
+    "created_at"
+   ],
+   "encrypted": [
+    "name",
+    "institution"
+   ],
+   "blind_indexed": [
+    "mask"
+   ],
+   "reason": "financial accounts; mask resolves incoming account_ref"
+  },
+  {
+   "table": "transactions",
+   "key_scope": "user",
+   "index_key": "user",
+   "constrained": [
+    "id",
+    "owner_id",
+    "occurred_at",
+    "booked_at",
+    "source",
+    "source_confidence",
+    "needs_review",
+    "status",
+    "category_id",
+    "source_event_id",
+    "dedupe_key",
+    "dedupe_key_version",
+    "created_at"
+   ],
+   "encrypted": [
+    "description",
+    "merchant_raw",
+    "note"
+   ],
+   "blind_indexed": [
+    "merchant_display",
+    "external_ref"
+   ],
+   "reason": "grant predicate compares owner_id, category_id, needs_review; dedupe_key is a K_dedupe fingerprint"
+  },
+  {
+   "table": "entries",
+   "constrained": [
+    "id",
+    "transaction_id",
+    "owner_id",
+    "account_id",
+    "amount_minor",
+    "currency"
+   ],
+   "reason": "zero-sum invariant; composite FK (transaction_id, owner_id)"
+  },
+  {
+   "table": "duplicate_links",
+   "constrained": [
+    "id",
+    "owner_id",
+    "surviving_id",
+    "linked_id",
+    "reason",
+    "confidence",
+    "decided_by",
+    "created_at",
+    "reversed_at",
+    "reversed_by"
+   ],
+   "reason": "reversible fuzzy-merge link"
+  },
+  {
+   "table": "merchants",
+   "class": "reference",
+   "constrained": [
+    "id",
+    "canonical_name",
+    "normalised_key",
+    "aliases",
+    "default_category_hint"
+   ],
+   "rls": false,
+   "reason": "global dictionary; no per-row link from user rows"
+  },
+  {
+   "table": "merchant_rules",
+   "key_scope": "user",
+   "index_key": "user",
+   "constrained": [
+    "id",
+    "owner_id",
+    "category_id",
+    "created_at"
+   ],
+   "encrypted": [
+    "merchant_display"
+   ],
+   "blind_indexed": [
+    "merchant_bidx"
+   ],
+   "reason": "learned rules keyed by blind index"
+  },
+  {
+   "table": "sharing_grants",
+   "constrained": [
+    "id",
+    "grantor_id",
+    "grantee_id",
+    "category_id",
+    "detail_level",
+    "granted_at",
+    "expires_at",
+    "revoked_at"
+   ],
+   "reason": "resolved by the setter into app.grant_set"
+  },
+  {
+   "table": "access_events",
+   "constrained": [
+    "id",
+    "viewer_id",
+    "owner_id",
+    "category_id",
+    "detail_level",
+    "policy_identifier",
+    "request_id",
+    "occurred_at"
+   ],
+   "reason": "relay-fed projection of the sharing.* audit.event the API inserts (ADR-020); id = audit_event_id; no pennilogic_app write path; erasure step by the ADR-021 job"
+  },
+  {
+   "table": "period_aggregates",
+   "constrained": [
+    "owner_id",
+    "category_id",
+    "period_id",
+    "currency",
+    "total_minor",
+    "entry_count",
+    "snapshot_version",
+    "completeness"
+   ],
+   "reason": "closed-period sums admitted to aggregate grants"
+  },
+  {
+   "table": "split_groups",
+   "key_scope": "group",
+   "constrained": [
+    "id",
+    "currency",
+    "simplify_debts",
+    "created_at"
+   ],
+   "encrypted": [
+    "name"
+   ],
+   "compared_column": "id",
+   "key_scope_pending": "ADR-021"
+  },
+  {
+   "table": "split_group_members",
+   "key_scope": "group",
+   "constrained": [
+    "group_id",
+    "member_id",
+    "user_id",
+    "role",
+    "joined_at",
+    "left_at"
+   ],
+   "encrypted": [
+    "placeholder_name",
+    "display_alias"
+   ],
+   "key_scope_pending": "ADR-021"
+  },
+  {
+   "table": "split_expenses",
+   "key_scope": "group",
+   "constrained": [
+    "id",
+    "group_id",
+    "payer_member_id",
+    "amount_minor",
+    "currency",
+    "occurred_at"
+   ],
+   "encrypted": [
+    "description"
+   ],
+   "key_scope_pending": "ADR-021"
+  },
+  {
+   "table": "split_shares",
+   "constrained": [
+    "expense_id",
+    "group_id",
+    "member_id",
+    "share_minor"
+   ],
+   "reason": "sum constraint; composite FK (expense_id, group_id)"
+  },
+  {
+   "table": "settlements",
+   "key_scope": "group",
+   "constrained": [
+    "id",
+    "group_id",
+    "from_member",
+    "to_member",
+    "amount_minor",
+    "currency",
+    "settled_at",
+    "method"
+   ],
+   "encrypted": [
+    "note"
+   ],
+   "key_scope_pending": "ADR-021"
+  },
+  {
+   "table": "debts",
+   "key_scope": "user",
+   "constrained": [
+    "id",
+    "owner_id",
+    "account_id",
+    "currency",
+    "due_day",
+    "created_at"
+   ],
+   "encrypted": [
+    "apr_bps",
+    "min_payment_minor",
+    "term_months",
+    "fees_minor",
+    "lender_display"
+   ],
+   "encrypted_money": [
+    "min_payment_minor",
+    "fees_minor"
+   ],
+   "currency_from": "currency"
+  },
+  {
+   "table": "income_sources",
+   "key_scope": "user",
+   "constrained": [
+    "id",
+    "owner_id",
+    "account_id",
+    "currency",
+    "cadence",
+    "next_expected_at"
+   ],
+   "encrypted": [
+    "expected_amount_minor",
+    "employer_display"
+   ],
+   "encrypted_money": [
+    "expected_amount_minor"
+   ],
+   "currency_from": "currency"
+  },
+  {
+   "table": "goals",
+   "key_scope": "user",
+   "constrained": [
+    "id",
+    "owner_id",
+    "currency",
+    "target_date",
+    "created_at"
+   ],
+   "encrypted": [
+    "name",
+    "target_amount_minor"
+   ],
+   "encrypted_money": [
+    "target_amount_minor"
+   ],
+   "currency_from": "currency"
+  },
+  {
+   "table": "budgets",
+   "key_scope": "user",
+   "constrained": [
+    "id",
+    "owner_id",
+    "category_id",
+    "currency",
+    "period"
+   ],
+   "encrypted": [
+    "limit_minor"
+   ],
+   "encrypted_money": [
+    "limit_minor"
+   ],
+   "currency_from": "currency"
+  },
+  {
+   "table": "key_rotation_jobs",
+   "constrained": [
+    "job_id",
+    "key_class",
+    "subject",
+    "old_key_id",
+    "new_key_id",
+    "priority",
+    "state",
+    "started_at",
+    "finished_at"
+   ]
+  },
+  {
+   "table": "key_rotation_progress",
+   "constrained": [
+    "job_id",
+    "table_name",
+    "column_group",
+    "watermark",
+    "rows_done",
+    "updated_at"
+   ]
+  },
+  {
+   "table": "app_private.context_keys",
+   "constrained": [
+    "key_id",
+    "valid_from",
+    "valid_to"
+   ],
+   "key_material": [
+    "key"
+   ],
+   "rls": false,
+   "reason": "K_ctx, database-internal, readable only by pennilogic_ctx"
+  },
+  {
+   "table": "app_private.restricted_acr",
+   "class": "reference",
+   "constrained": [
+    "acr"
+   ],
+   "rls": false
+  }
+ ],
+ "absent_everywhere": [
+  "raw message text",
+  "raw_hash",
+  "message_digest",
+  "any raw-derived digest",
+  "any *_bidx value in an API, sync or export schema"
+ ],
+ "encrypted_money_encoding": "ADR-015 Money wire object as UTF-8 JSON; row currency column must agree",
+ "policies": [
+  {
+   "identifier": "grant_mediated_read",
+   "command": "SELECT",
+   "roles": [
+    "pennilogic_app"
+   ],
+   "tables": [
+    "transactions",
+    "entries"
+   ],
+   "compared_columns": [
+    "transactions.owner_id",
+    "transactions.category_id",
+    "transactions.needs_review",
+    "entries.owner_id",
+    "entries.transaction_id"
+   ],
+   "context": [
+    "app.principal_id",
+    "app.grant_set"
+   ],
+   "level": "detail",
+   "grant_reference": true
+  },
+  {
+   "identifier": "grant_mediated_aggregate_read",
+   "command": "SELECT",
+   "roles": [
+    "pennilogic_app"
+   ],
+   "tables": [
+    "period_aggregates"
+   ],
+   "compared_columns": [
+    "period_aggregates.owner_id",
+    "period_aggregates.category_id"
+   ],
+   "context": [
+    "app.principal_id",
+    "app.grant_set"
+   ],
+   "level": "aggregate",
+   "grant_reference": true
+  },
+  {
+   "identifier": "admin_recorded_access",
+   "command": "SELECT",
+   "roles": [
+    "admin_api_owner",
+    "redaction_service"
+   ],
+   "tables": [],
+   "tables_owner": "ADR-020",
+   "compared_columns": [
+    "owner_id"
+   ],
+   "context": [
+    "app.admin_subject"
+   ],
+   "level": "administrative"
+  },
+  {
+   "identifier": "owner_rows",
+   "command": "ALL",
+   "roles": [
+    "pennilogic_app",
+    "pennilogic_keyops"
+   ],
+   "tables": [
+    "accounts",
+    "transactions",
+    "entries",
+    "duplicate_links",
+    "merchant_rules",
+    "period_aggregates",
+    "debts",
+    "income_sources",
+    "goals",
+    "budgets",
+    "user_keys",
+    "channels",
+    "key_rotation_jobs",
+    "key_rotation_progress"
+   ],
+   "compared_columns": [
+    "owner_id (user_id on user_keys; account_id on channels and ADR-019 tables)"
+   ],
+   "context": [
+    "app.principal_id"
+   ],
+   "admits_actors": [
+    "user",
+    "delegate:*",
+    "keyops:*"
+   ]
+  },
+  {
+   "identifier": "self_rows",
+   "command": "ALL",
+   "roles": [
+    "pennilogic_app"
+   ],
+   "tables": [
+    "users"
+   ],
+   "compared_columns": [
+    "id"
+   ],
+   "context": [
+    "app.principal_id"
+   ],
+   "admits_actors": [
+    "user",
+    "delegate:*",
+    "keyops:*"
+   ]
+  },
+  {
+   "identifier": "grant_mediated_key_read",
+   "command": "SELECT",
+   "roles": [
+    "pennilogic_app"
+   ],
+   "tables": [
+    "user_keys"
+   ],
+   "compared_columns": [
+    "user_keys.user_id",
+    "user_keys.purpose",
+    "user_keys.state"
+   ],
+   "restriction": "purpose = DEK AND state IN (ACTIVE, DECRYPT_ONLY) AND detail grant token present",
+   "context": [
+    "app.grant_set"
+   ]
+  },
+  {
+   "identifier": "group_member_rows",
+   "command": "ALL",
+   "roles": [
+    "pennilogic_app"
+   ],
+   "tables": [
+    "split_groups",
+    "split_group_members",
+    "split_expenses",
+    "split_shares",
+    "settlements"
+   ],
+   "compared_columns": [
+    "group_id (id on split_groups)"
+   ],
+   "context": [
+    "app.group_set"
+   ],
+   "admits_actors": [
+    "user",
+    "delegate:*",
+    "keyops:*"
+   ]
+  },
+  {
+   "identifier": "grant_party_rows",
+   "command": "SELECT",
+   "roles": [
+    "pennilogic_app"
+   ],
+   "tables": [
+    "sharing_grants"
+   ],
+   "compared_columns": [
+    "grantor_id",
+    "grantee_id"
+   ],
+   "context": [
+    "app.principal_id"
+   ]
+  },
+  {
+   "identifier": "grant_create",
+   "command": "INSERT",
+   "roles": [
+    "pennilogic_app"
+   ],
+   "tables": [
+    "sharing_grants"
+   ],
+   "compared_columns": [
+    "grantor_id"
+   ],
+   "context": [
+    "app.principal_id"
+   ]
+  },
+  {
+   "identifier": "grant_revoke",
+   "command": "UPDATE",
+   "roles": [
+    "pennilogic_app"
+   ],
+   "tables": [
+    "sharing_grants"
+   ],
+   "compared_columns": [
+    "grantor_id",
+    "grantee_id"
+   ],
+   "columns_updatable": [
+    "revoked_at"
+   ],
+   "context": [
+    "app.principal_id"
+   ]
+  },
+  {
+   "identifier": "erasure_grant_rows",
+   "command": "UPDATE",
+   "roles": [
+    "pennilogic_keyops"
+   ],
+   "tables": [
+    "sharing_grants"
+   ],
+   "compared_columns": [
+    "grantor_id",
+    "grantee_id"
+   ],
+   "columns_updatable": [
+    "revoked_at"
+   ],
+   "context": [
+    "app.principal_id"
+   ]
+  },
+  {
+   "identifier": "erasure_membership_rows",
+   "command": "UPDATE",
+   "roles": [
+    "pennilogic_keyops"
+   ],
+   "tables": [
+    "split_group_members"
+   ],
+   "compared_columns": [
+    "user_id"
+   ],
+   "columns_updatable": [
+    "left_at"
+   ],
+   "context": [
+    "app.principal_id"
+   ]
+  },
+  {
+   "identifier": "resolver_read",
+   "command": "SELECT",
+   "roles": [
+    "pennilogic_ctx"
+   ],
+   "tables": [
+    "sharing_grants",
+    "split_group_members"
+   ],
+   "compared_columns": [],
+   "using_true": true
+  },
+  {
+   "identifier": "preauth_lookup_rows",
+   "command": "SELECT",
+   "roles": [
+    "pennilogic_app"
+   ],
+   "tables": [
+    "channels",
+    "credentials",
+    "refresh_tokens"
+   ],
+   "compared_columns": [
+    "type + value_bidx",
+    "credential id",
+    "token hash"
+   ],
+   "context": [
+    "app.preauth_kind",
+    "app.preauth_value"
+   ],
+   "admits_actors": [
+    "preauth"
+   ]
+  },
+  {
+   "identifier": "preauth_subject_rows",
+   "command": "SELECT",
+   "roles": [
+    "pennilogic_app"
+   ],
+   "tables": [
+    "channels",
+    "devices",
+    "push tokens",
+    "recovery_requests"
+   ],
+   "compared_columns": [
+    "account_id"
+   ],
+   "context": [
+    "app.preauth_account"
+   ],
+   "admits_actors": [
+    "preauth"
+   ]
+  },
+  {
+   "identifier": "preauth_token_family_revoke",
+   "command": "UPDATE",
+   "roles": [
+    "pennilogic_app"
+   ],
+   "tables": [
+    "refresh_tokens"
+   ],
+   "compared_columns": [
+    "family_id"
+   ],
+   "columns_updatable": [
+    "revoked_at",
+    "revoked_reason"
+   ],
+   "context": [
+    "app.preauth_value"
+   ],
+   "admits_actors": [
+    "preauth"
+   ]
+  },
+  {
+   "identifier": "preauth_recovery_write",
+   "command": "INSERT, UPDATE",
+   "roles": [
+    "pennilogic_app"
+   ],
+   "tables": [
+    "recovery_requests",
+    "channels (suspect)"
+   ],
+   "compared_columns": [
+    "account_id"
+   ],
+   "context": [
+    "app.preauth_account"
+   ],
+   "admits_actors": [
+    "preauth"
+   ]
+  }
+ ],
+ "session_context_keys": [
+  "app.principal_id",
+  "app.request_id",
+  "app.acr",
+  "app.grant_set",
+  "app.group_set",
+  "app.actor",
+  "app.preauth_kind",
+  "app.preauth_value",
+  "app.preauth_account",
+  "app.admin_event",
+  "app.admin_subject",
+  "app.recorded_admin_events",
+  "app.recorded_admin_events_mac",
+  "app.ctx_mac"
+ ],
+ "mac_payload": "v2|principal|request|acr|grant_set|group_set|actor|preauth_kind|preauth_value|preauth_account|admin_event|admin_subject|pg_backend_pid()|transaction_timestamp()",
+ "setters": [
+  "app_ctx.begin_request",
+  "app_ctx.begin_keyops",
+  "app_ctx.begin_preauth",
+  "app_ctx.begin_admin_access",
+  "app_ctx.begin_redaction"
+ ],
+ "definer_owners": [
+  "pennilogic_ctx",
+  "ADR-020 administrative function owner",
+  "ADR-020 audit-trail function owner",
+  "ADR-020 transparency-relay function owner"
+ ],
+ "roles": [
+  {
+   "role": "pennilogic_app",
+   "login": true,
+   "bypassrls": false,
+   "superuser": false,
+   "settings": {
+    "statement_timeout": "15s",
+    "transaction_timeout": "20s",
+    "idle_in_transaction_session_timeout": "5s",
+    "lock_timeout": "5s",
+    "log_error_verbosity": "terse",
+    "log_statement": "none",
+    "log_parameter_max_length": 0,
+    "log_parameter_max_length_on_error": 0
+   }
+  },
+  {
+   "role": "pennilogic_keyops",
+   "login": true,
+   "bypassrls": false,
+   "superuser": false,
+   "settings": {
+    "log_error_verbosity": "terse"
+   },
+   "erasure_grants": {
+    "delete": [
+     "channels",
+     "push tokens",
+     "duplicate_links",
+     "period_aggregates",
+     "access_events (subject's own rows; transparency_erasure, ADR-020)"
+    ],
+    "update": [
+     "user_keys.state/destroyed_at/wrapped_key",
+     "sharing_grants.revoked_at (erasure_grant_rows)",
+     "split_group_members.left_at (erasure_membership_rows)",
+     "access_events.viewer_id pseudonym (transparency_erasure, ADR-020)"
+    ],
+    "context": "begin_keyops(subject, erasure job)",
+    "never": [
+     "entries"
+    ]
+   }
+  },
+  {
+   "role": "pennilogic_ctx",
+   "login": false,
+   "bypassrls": false,
+   "superuser": false
+  }
+ ],
+ "key_classes": [
+  {
+   "id": "KEK",
+   "scope": "platform",
+   "cryptoperiod_days": 365,
+   "custody": "custodian, non-exportable"
+  },
+  {
+   "id": "DEK",
+   "scope": "user",
+   "cryptoperiod_days": 730,
+   "encrypt_cap": 268435456,
+   "rotation_due_at": 134217728,
+   "fail_closed_at": 251658240
+  },
+  {
+   "id": "IK",
+   "scope": "user",
+   "cryptoperiod_days": 730,
+   "rotates_with": "DEK"
+  },
+  {
+   "id": "AK",
+   "scope": "user",
+   "cryptoperiod": "no scheduled rotation",
+   "destroyed_on_erasure": true,
+   "purpose": "analytics pseudonym HMAC(AK,'analytics')"
+  },
+  {
+   "id": "GIK",
+   "scope": "platform",
+   "cryptoperiod_days": 365,
+   "rotation": "single transaction over channels"
+  },
+  {
+   "id": "CK",
+   "scope": "platform",
+   "cryptoperiod_days": 365,
+   "rotation": "single transaction over channels"
+  },
+  {
+   "id": "K_abuse",
+   "scope": "platform",
+   "cryptoperiod": "T-CMP-04 abuse window"
+  },
+  {
+   "id": "K_dedupe",
+   "scope": "platform",
+   "cryptoperiod_days": 730,
+   "version_column": "transactions.dedupe_key_version"
+  },
+  {
+   "id": "K_ctx",
+   "scope": "database",
+   "cryptoperiod_days": 90,
+   "rotated_on_restore": true
+  },
+  {
+   "id": "K_install",
+   "scope": "device",
+   "cryptoperiod": "install lifetime",
+   "custody": "Android Keystore"
+  }
+ ],
+ "retirement_rule": "zero live references AND re-encryption completion + backup retention elapsed AND canary decrypt AND journal proof",
+ "erasure_completeness_bound": "T-PLT-02 backup retention",
+ "dedupe_artefacts": [
+  {
+   "name": "raw_event_digest",
+   "location": "device only",
+   "key": "K_install",
+   "inputs": [
+    "sender_id",
+    "normalised_body",
+    "channel"
+   ]
+  },
+  {
+   "name": "transactions.dedupe_key",
+   "location": "server column",
+   "key": "K_dedupe[v]",
+   "inputs": [
+    "owner_id",
+    "account_id|account:unresolved",
+    "amount_minor",
+    "currency",
+    "direction",
+    "occurred_at@minute UTC"
+   ],
+   "output_only": true
+  },
+  {
+   "name": "fuzzy_candidate_match",
+   "location": "server pipeline / duplicate_links",
+   "key": null,
+   "outcome": "reversible link + audit; never delete"
+  }
+ ],
+ "request_replay_artefact": "ADR-015 Idempotency-Key (not a deduplication artefact)",
+ "triggers": [
+  "app_ctx.record_admin_event() BEFORE INSERT ON audit.event (no EXECUTE granted)"
+ ],
+ "key_scope_values": [
+  "user",
+  "group",
+  "platform",
+  "none"
+ ],
+ "access_events_model": "relay-fed projection of the sharing.* audit.event (ADR-020); id = audit_event_id (UUIDv7); subject reads under owner_rows; transparency_append withdrawn",
+ "adr020_interface": {
+  "sharing_audit_event_insert_with_check": "actor_principal_id = app_ctx.verified_customer_principal() AND CASE WHEN action LIKE '<cross-user-read prefix>%' THEN subject_id in grant-set owners AND policy_identifier IN (grant_mediated_read, grant_mediated_aggregate_read) ELSE subject_id = actor_principal_id END",
+  "record_admin_event_trigger": "attached BEFORE INSERT ON audit.event by ADR-020's trail migration; no insert path bypasses it",
+  "event_committed": "audit.event_committed(id) is true only when the inserting top-level transaction has completed and committed; the current transaction and its subtransactions never satisfy it; ADR-020 defines the stage-and-fetch pair",
+  "context_transaction_returns_no_rows": "a transaction holding an administrative context writes masked results to admin_api.staged_result (unreadable by admin_app) and returns only the event id; disclosure only from the frozen stage in a later transaction after audit.event_committed and single consumption",
+  "transparency_erasure": "FOR UPDATE, DELETE TO pennilogic_keyops on access_events, admitting exactly the erasure projection step under begin_keyops(subject, erasure job)",
+  "materialisation_committed": "collect requires audit.event_committed(event) AND materialisation_committed: the tuple that set materialised_at was written by a completed, committed top-level transaction that is not the current transaction or one of its subtransactions; consume once; frozen rows only",
+  "tests": [
+   "admin_context_denied_for_uncommitted_event",
+   "admin_read_and_stage_admitted_only_for_committed_event",
+   "admin_context_transaction_returns_no_rows",
+   "same_transaction_materialise_then_collect_yields_nothing"
+  ]
+ }
+}
