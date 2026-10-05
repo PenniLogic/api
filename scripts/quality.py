@@ -24,13 +24,16 @@ MONEY_PACKAGE = "com/pennilogic/contracts/money"
 MONEY_BASELINE = "quality/money-coverage-baseline.json"
 
 
-def run(command, root=ROOT, capture=False):
+def run(command, root=ROOT, capture=False, budget=None):
     print("+ " + subprocess.list2cmdline([str(part) for part in command]), flush=True)
-    result = subprocess.run(
-        command, cwd=root, text=True, encoding="utf-8", errors="replace",
-        stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.STDOUT if capture else None, check=False,
-    )
+    if budget is not None:
+        result = script_module("process_budget").run(command, root, budget, capture)
+    else:
+        result = subprocess.run(
+            command, cwd=root, text=True, encoding="utf-8", errors="replace",
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.STDOUT if capture else None, check=False,
+        )
     if result.returncode:
         if capture:
             print(result.stdout)
@@ -38,10 +41,13 @@ def run(command, root=ROOT, capture=False):
     return result.stdout if capture else ""
 
 
-def gradle(*tasks, root=ROOT, capture=False):
+def gradle(*tasks, root=ROOT, capture=False, budget=None):
     wrapper = root / ("gradlew.bat" if os.name == "nt" else "gradlew")
     command = [str(wrapper)] if os.name == "nt" else ["sh", str(wrapper)]
-    return run([*command, "--no-daemon", "--console=plain", *tasks], root, capture)
+    return run(
+        [*command, "--no-daemon", "--console=plain", "-Pkotlin.compiler.execution.strategy=in-process", *tasks],
+        root, capture, budget,
+    )
 
 
 def read_report(path):
@@ -139,29 +145,46 @@ def check_coverage(base, write_baseline=False):
         raise ValueError("Coverage baseline does not match report; run coverage --write-baseline and review it")
 
 
+def script_module(name):
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).parent / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def money_provider_module():
-    spec = importlib.util.spec_from_file_location("money_quality_provider", ROOT / "scripts/money_provider.py")
-    provider = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(provider)
-    return provider
+    return script_module("money_provider")
 
 
 def money_policy(provider):
     content = provider.read_strategy(ROOT / provider.BUNDLE / provider.STRATEGY_FILE)
     strategy = json.loads(content)
-    packages = [package for package in strategy["packages"] if package["id"] == "api.money"]
-    if len(packages) != 1 or packages[0]["repository"] != "PenniLogic/api" or packages[0]["money_path"] is not True:
+    packages = [package for package in strategy.get("packages", []) if package.get("id") == "api.money"]
+    if len(packages) != 1 or packages[0].get("repository") != "PenniLogic/api" or packages[0].get("money_path") is not True:
         raise ValueError("Accepted test strategy does not uniquely declare the API money package")
     floors = {
-        "LINE": packages[0]["line_coverage_floor_percent"],
-        "BRANCH": packages[0]["branch_coverage_floor_percent"],
-        "MUTATION": packages[0]["mutation_score_floor_percent"],
+        "LINE": packages[0].get("line_coverage_floor_percent"),
+        "BRANCH": packages[0].get("branch_coverage_floor_percent"),
+        "MUTATION": packages[0].get("mutation_score_floor_percent"),
     }
     if any(type(value) is not int or not 0 < value <= 100 for value in floors.values()):
         raise ValueError("Accepted money-package strategy lacks valid numeric qualification floors")
-    if strategy["floor_policy"]["money_path_ratchet"] is not True:
+    if strategy.get("floor_policy", {}).get("money_path_ratchet") is not True:
         raise ValueError("Accepted strategy does not declare the required money coverage ratchet")
     return floors, hashlib.sha256(content).hexdigest()
+
+
+def money_budget(provider):
+    strategy = json.loads(provider.read_strategy(ROOT / provider.BUNDLE / provider.STRATEGY_FILE))
+    budgets = strategy.get("pipeline_budgets", {})
+    names = ("money_path_harness_minutes", "pull_request_gate_minutes")
+    if any(type(budgets.get(name)) is not int or budgets[name] <= 0 for name in names):
+        raise ValueError("Accepted strategy lacks numeric Money harness and pipeline budgets")
+    return {
+        **{name: budgets[name] for name in names},
+        "native_process_seconds": 600,
+        "enforced_seconds": min(600, *(budgets[name] * 60 for name in names)),
+    }
 
 
 def read_money_coverage(path, class_names, source_names):
@@ -200,14 +223,11 @@ def enforce_money_coverage(counters, floors, baseline=None):
             raise ValueError(f"Authoritative Money {kind} coverage decreased from the recorded baseline")
 
 
-def check_money_coverage(base=None, write_baseline=False):
-    provider = money_provider_module()
-    source_paths = provider.verify_outputs()
-    floors, strategy_sha256 = money_policy(provider)
+def money_class_inventory(provider):
     compiled = ROOT / MONEY_CLASSES
     if not compiled.is_dir() or compiled.is_symlink() or compiled.is_junction():
         raise ValueError("Authoritative Money dependency classes are missing or linked")
-    class_names = set()
+    classes = {}
     for directory, directories, files in os.walk(compiled, followlinks=False, onerror=provider.refused_walk):
         parent = Path(directory)
         if any((parent / name).is_symlink() or (parent / name).is_junction() for name in directories):
@@ -217,19 +237,64 @@ def check_money_coverage(base=None, write_baseline=False):
             if path.suffix == ".class":
                 if path.is_symlink():
                     raise ValueError("Linked Money class cannot qualify coverage")
-                class_names.add(path.relative_to(compiled).with_suffix("").as_posix())
-    counters = read_money_coverage(
-        ROOT / MONEY_REPORT, class_names, {path.name for path in source_paths},
-    )
-    suites = [
-        ET.parse(path).getroot()
-        for path in (ROOT / "build/test-results/moneyTest").glob("TEST-*.xml")
-    ]
+                classes[path.relative_to(compiled).with_suffix("").as_posix()] = path
+    if not classes or any(not name.startswith(MONEY_PACKAGE + "/") for name in classes):
+        raise ValueError("Authoritative Money class inventory is empty or contains another package")
+    return classes
+
+
+def money_test_metrics(root=ROOT):
+    suites = [ET.parse(path).getroot() for path in (root / "build/test-results/moneyTest").glob("TEST-*.xml")]
+    identities = set()
+    for suite in suites:
+        if any(
+            not re.fullmatch(r"0|[1-9][0-9]*", suite.get(name, ""))
+            for name in ("tests", "skipped", "failures", "errors")
+        ):
+            raise ValueError("Money test evidence lacks valid numeric execution counters")
+        cases = suite.findall("testcase")
+        if suite.tag != "testsuite" or len(cases) != int(suite.get("tests")) or any(
+            sum(case.find(element) is not None for case in cases) != int(suite.get(counter))
+            for counter, element in (("skipped", "skipped"), ("failures", "failure"), ("errors", "error"))
+        ):
+            raise ValueError("Money test counters disagree with their executed cases")
+        for case in cases:
+            identity = (case.get("classname", ""), case.get("name", ""))
+            if not identity[0].startswith("com.pennilogic.money.") or not identity[1] or identity in identities:
+                raise ValueError("Money test evidence has an unrelated, unnamed or duplicate case")
+            identities.add(identity)
     tests = sum(int(suite.get("tests")) for suite in suites)
     skipped = sum(int(suite.get("skipped")) for suite in suites)
     failed = sum(int(suite.get("failures")) + int(suite.get("errors")) for suite in suites)
     if not tests or skipped or failed:
         raise ValueError("Money qualification requires executed target tests without failures or skips")
+    properties = {}
+    for suite in suites:
+        for node in suite.findall("system-out"):
+            for line in (node.text or "").splitlines():
+                if line.startswith('{"event":"money_property_cases"'):
+                    event = json.loads(line)
+                    name, count = event.get("property"), event.get("count")
+                    if name in properties or type(count) is not int or count <= 0:
+                        raise ValueError("Money property case evidence is duplicated or non-numeric")
+                    properties[name] = count
+    if set(properties) != {"round_trip", "associativity", "collision_keys"}:
+        raise ValueError("Money property case evidence is missing or has an unknown category")
+    return {
+        "target_tests": tests, "skipped": skipped, "failed": failed, "property_cases": properties,
+        "independent_oracle": {"status": "not_implemented", "disagreements": None},
+    }
+
+
+def check_money_coverage(base=None, write_baseline=False):
+    provider = money_provider_module()
+    source_paths = provider.verify_outputs()
+    floors, strategy_sha256 = money_policy(provider)
+    class_names = set(money_class_inventory(provider))
+    counters = read_money_coverage(
+        ROOT / MONEY_REPORT, class_names, {path.name for path in source_paths},
+    )
+    test_evidence = money_test_metrics()
     record = {
         "event": "money_package_coverage",
         "strategy_package": "api.money",
@@ -241,16 +306,13 @@ def check_money_coverage(base=None, write_baseline=False):
         "compiled_class_count": len(class_names),
         "source_files": sorted(path.name for path in source_paths),
         "compiled_classes": sorted(class_names),
-        "target_tests": tests,
-        "skipped": skipped,
-        "failed": failed,
+        **test_evidence,
         "counters": counters,
         "floor_percent": floors,
         "mutation": {
-            "status": "not_measured",
-            "reason": "No executable mutation harness or tool is declared in this API build; API #22 owns it",
-            "score": None,
-            "surviving_operators": None,
+            "status": "separate_required_gate",
+            "command": "python scripts/quality.py money-mutation",
+            "reason": "Coverage is not mutation evidence; moneyMutation runs unconditionally in check",
         },
     }
     print(json.dumps(record))
@@ -294,6 +356,7 @@ def gate_self_test(artifact_dir):
         "gradlew", "gradlew.bat", "gradle.lockfile", "gradle", "src", "scripts/check_money.py",
         "scripts/money_provider.py", "build/contracts-money/source",
         "scripts/quality.py", "build/contracts-money/strategy",
+        "scripts/money_mutation.py", "scripts/process_budget.py", "scripts/PitCatalogue.java",
         MONEY_BASELINE,
     ]
     with tempfile.TemporaryDirectory(prefix="api-gate-self-test-", dir=artifact_dir) as temporary:
@@ -392,6 +455,7 @@ def main():
         choices=[
             "version", "install", "build", "test", "lint", "format", "coverage", "gate-self-test", "money-guard",
             "money-coverage", "money-coverage-report",
+            "money-mutation", "money-mutation-report",
         ],
     )
     parser.add_argument("--base", help="Full trusted PR base commit SHA; required for coverage")
@@ -399,13 +463,15 @@ def main():
     parser.add_argument("--artifact-dir", type=Path, help="Parent directory for isolated gate self-test copies")
     args = parser.parse_args()
     started = time.monotonic()
+    budget = None
     try:
         if args.command == "version":
             gradle("--version")
         elif args.command == "install":
             gradle("resolveDependencies")
         elif args.command == "build":
-            gradle("build", "installDist")
+            budget = money_budget(money_provider_module())["enforced_seconds"]
+            gradle("build", "installDist", budget=budget - (time.monotonic() - started))
             test_metrics()
         elif args.command == "test":
             run([sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests", "-v"])
@@ -428,8 +494,15 @@ def main():
             check_money_coverage(args.base, args.write_baseline)
         elif args.command == "money-coverage-report":
             check_money_coverage(args.base, args.write_baseline)
+        elif args.command == "money-mutation":
+            budget = money_budget(money_provider_module())["enforced_seconds"]
+            gradle("moneyMutation", budget=budget - (time.monotonic() - started))
+        elif args.command == "money-mutation-report":
+            script_module("money_mutation").check_latest()
         else:
             gate_self_test(args.artifact_dir)
+        if budget is not None and time.monotonic() - started > budget:
+            raise TimeoutError("Quality command exceeded its enforced elapsed budget")
     except (subprocess.CalledProcessError, ValueError, OSError, ET.ParseError) as error:
         print(f"Quality command failed: {error}", file=sys.stderr)
         return 1

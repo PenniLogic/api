@@ -64,6 +64,8 @@ val acceptedSourceJar =
         }
     }
 
+val mutationTool = configurations.create("moneyMutationTool")
+
 tasks.named("compileKotlin") {
     dependsOn(moneyGuard)
 }
@@ -85,6 +87,10 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter")
     testImplementation("io.ktor:ktor-server-test-host")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    mutationTool("org.pitest:pitest-command-line:1.30.0")
+    mutationTool("org.pitest:pitest-junit5-plugin:1.2.3")
+    mutationTool(platform("org.junit:junit-bom:6.1.3"))
+    mutationTool("org.junit.platform:junit-platform-launcher")
 }
 
 dependencyLocking {
@@ -143,6 +149,8 @@ val targetedMoneyTest =
                 .get()
                 .output.classesDirs
         classpath = sourceSets.test.get().runtimeClasspath
+        outputs.upToDateWhen { false }
+        outputs.cacheIf { false }
         useJUnitPlatform()
         include("com/pennilogic/money/**")
         systemProperty(
@@ -179,6 +187,34 @@ val acceptedCoverageCheck =
         dependsOn(acceptedCoverageReport)
         workingDir(rootDir)
         commandLine("python", "scripts/quality.py", "money-coverage-report")
+    }
+
+val acceptedMutationCheck =
+    tasks.register<Exec>("moneyMutation") {
+        description = "Runs the complete PIT Money catalogue and enforces the exact accepted package floor and budget."
+        group = "verification"
+        dependsOn(acceptedCoverageCheck)
+        workingDir(rootDir)
+        val inputFile = layout.buildDirectory.file("money-mutation-input.json")
+        val launcher = javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(21)) }
+        val toolClasspath = mutationTool.incoming.files
+        val targetClasspath = acceptedSourceSet.output.classesDirs + sourceSets.test.get().runtimeClasspath - files(acceptedSourceJar)
+        doFirst {
+            val inputs =
+                mapOf(
+                    "java" to
+                        launcher
+                            .get()
+                            .executablePath.asFile.absolutePath,
+                    "tool_classpath" to toolClasspath.files.map { it.absolutePath }.sorted(),
+                    "test_classpath" to
+                        targetClasspath.files
+                            .filter { it.exists() }
+                            .map { it.absolutePath },
+                )
+            inputFile.get().asFile.writeText(groovy.json.JsonOutput.toJson(inputs) + "\n")
+        }
+        commandLine("python", "scripts/money_mutation.py", "run", "--input-file", inputFile.get().asFile.path)
     }
 
 // Digest-pinned image for the disposable migration test database (PostgreSQL 17.11).
@@ -430,6 +466,7 @@ tasks.check {
     dependsOn(
         moneyGuard,
         acceptedCoverageCheck,
+        acceptedMutationCheck,
         tasks.spotlessCheck,
         tasks.jacocoTestCoverageVerification,
         integrationTest,

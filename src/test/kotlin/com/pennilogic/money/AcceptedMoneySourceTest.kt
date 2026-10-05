@@ -10,19 +10,22 @@ import kotlinx.serialization.descriptors.PrimitiveKind
 import kotlinx.serialization.descriptors.SerialDescriptor
 import kotlinx.serialization.encoding.AbstractDecoder
 import kotlinx.serialization.encoding.AbstractEncoder
+import kotlinx.serialization.encoding.Encoder
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.modules.EmptySerializersModule
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
-import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.opentest4j.AssertionFailedError
+import java.lang.reflect.InvocationTargetException
 import java.nio.file.Path
 import java.security.MessageDigest
 import kotlin.io.path.readText
@@ -44,11 +47,30 @@ class AcceptedMoneySourceTest {
 
     private fun encoded(value: Money): JsonElement = Json.parseToJsonElement(Json.encodeToString(MoneySerializer, value))
 
+    private fun <T> same(
+        expected: T,
+        actual: T,
+        caseId: String,
+    ) {
+        assertTrue(expected == actual, caseId)
+    }
+
+    @Test
+    fun `failed value comparisons report a case id without rendering either value`() {
+        val sensitive =
+            object {
+                override fun toString(): String = error("sensitive-value-rendered")
+            }
+        val failure = assertThrows(AssertionFailedError::class.java) { same(sensitive, Any(), "synthetic-redaction-probe") }
+        assertTrue(failure.message.orEmpty().contains("synthetic-redaction-probe"))
+        assertFalse(failure.message.orEmpty().contains("sensitive-value-rendered"))
+    }
+
     @Test
     fun `all accepted wire vectors round trip through the actual serializer`() {
         val rows = vectors.getValue("valid").jsonArray
         assertTrue(rows.isNotEmpty())
-        for (row in rows) {
+        for ((index, row) in rows.withIndex()) {
             val vector = row.jsonObject
             val wire = vector.getValue("wire")
             val instance = Json.decodeFromJsonElement(MoneySerializer, wire)
@@ -57,9 +79,9 @@ class AcceptedMoneySourceTest {
                     .getValue("minor_units")
                     .jsonPrimitive.content
                     .toLong()
-            assertEquals(expected, instance.minorUnits)
-            assertEquals(wire, encoded(instance))
-            assertEquals(instance, Money.ofMinorUnits(expected, instance.currency))
+            same(expected, instance.minorUnits, "accepted-$index-units")
+            same(wire, encoded(instance), "accepted-$index-wire")
+            same(instance, Money.ofMinorUnits(expected, instance.currency), "accepted-$index-value")
         }
     }
 
@@ -101,7 +123,7 @@ class AcceptedMoneySourceTest {
         val rows = fixture.getValue("values").jsonArray
         assertEquals(10030, rows.size)
         val digest = MessageDigest.getInstance("SHA-256")
-        for (row in rows) {
+        for ((index, row) in rows.withIndex()) {
             val vector = row.jsonObject
             val wire = vector.getValue("wire")
             val instance = Json.decodeFromJsonElement(MoneySerializer, wire)
@@ -111,9 +133,9 @@ class AcceptedMoneySourceTest {
                     .jsonPrimitive.content
                     .toLong()
             val output = encoded(instance)
-            assertEquals(expected, instance.minorUnits)
-            assertEquals(wire.toString(), output.toString())
-            assertEquals(instance, Json.decodeFromJsonElement(MoneySerializer, output))
+            same(expected, instance.minorUnits, "round-trip-$index-units")
+            same(wire.toString(), output.toString(), "round-trip-$index-wire")
+            same(instance, Json.decodeFromJsonElement(MoneySerializer, output), "round-trip-$index-value")
             val members = output.jsonObject
             val line =
                 listOf(
@@ -124,6 +146,7 @@ class AcceptedMoneySourceTest {
             digest.update(line.toByteArray(Charsets.UTF_8))
         }
         assertEquals(fixture.getValue("round_trip_sha256").jsonPrimitive.content, digest.digest().toHexString())
+        println("""{"event":"money_property_cases","property":"round_trip","count":${rows.size}}""")
     }
 
     @Test
@@ -162,21 +185,23 @@ class AcceptedMoneySourceTest {
                     .getValue("amount")
                     .jsonPrimitive.content
             assertEquals(exponent, text.substringAfter('.', "").length)
-            assertEquals(instance, Money.parse(text, code))
+            same(instance, Money.parse(text, code), "registry-$code-value")
         }
-        assertEquals(
+        same(
             "1",
             encoded(Money.ofMinorUnits(1, "JPY"))
                 .jsonObject
                 .getValue("amount")
                 .jsonPrimitive.content,
+            "registry-integral-render",
         )
-        assertEquals(
+        same(
             "0.001",
             encoded(Money.ofMinorUnits(1, "KWD"))
                 .jsonObject
                 .getValue("amount")
                 .jsonPrimitive.content,
+            "registry-three-digit-render",
         )
         assertEquals(null, CurrencyRegistry.exponentOf("XYZ"))
     }
@@ -186,13 +211,14 @@ class AcceptedMoneySourceTest {
         val first = Money.parse("0.10", "INR")
         val second = Money.parse("0.20", "INR")
         val total = first + second
-        assertEquals(30L, total.minorUnits)
-        assertEquals(
+        same(30L, total.minorUnits, "decimal-tenth-units")
+        same(
             "0.30",
             encoded(total)
                 .jsonObject
                 .getValue("amount")
                 .jsonPrimitive.content,
+            "decimal-tenth-render",
         )
         assertEquals(MoneyReason.SCALE_MISMATCH, assertThrows(MoneyWireException::class.java) { Money.parse("0.1", "INR") }.reason)
     }
@@ -202,6 +228,7 @@ class AcceptedMoneySourceTest {
         val random = Random(72131)
         val codes = CurrencyRegistry.entries.keys.sorted()
         val bound = Long.MAX_VALUE / 4
+        var cases = 0
         repeat(10000) { index ->
             val code = codes[index % codes.size]
             val firstInput = random.nextLong(-bound, bound)
@@ -212,11 +239,13 @@ class AcceptedMoneySourceTest {
             val third = Money.ofMinorUnits(thirdInput, code)
             val expected = Math.addExact(firstInput, secondInput)
             val combined = first + second
-            assertEquals((first + second) + third, first + (second + third))
-            assertEquals(expected, combined.minorUnits)
-            assertEquals(first, (first + second) - second)
-            assertEquals(first, -(-first))
+            same((first + second) + third, first + (second + third), "associativity-$index")
+            same(expected, combined.minorUnits, "addition-$index")
+            same(first, (first + second) - second, "subtraction-$index")
+            same(first, -(-first), "negation-$index")
+            cases += 1
         }
+        println("""{"event":"money_property_cases","property":"associativity","count":$cases}""")
     }
 
     @Test
@@ -226,10 +255,10 @@ class AcceptedMoneySourceTest {
         assertThrows(IllegalArgumentException::class.java) { first + second }
         assertThrows(IllegalArgumentException::class.java) { first - second }
         assertThrows(IllegalArgumentException::class.java) { first.compareTo(second) }
-        assertNotEquals(first, second)
-        assertNotEquals(first, Money.ofMinorUnits(2, "INR"))
-        assertNotEquals(first, 1L)
-        assertEquals(first.hashCode(), Money.ofMinorUnits(1, "INR").hashCode())
+        assertFalse(first == second, "distinct-currency-equality")
+        assertFalse(first == Money.ofMinorUnits(2, "INR"), "distinct-value-equality")
+        assertFalse(first.equals(1L), "distinct-type-equality")
+        same(first.hashCode(), Money.ofMinorUnits(1, "INR").hashCode(), "equal-value-hashes")
         assertTrue(first < Money.ofMinorUnits(2, "INR"))
         assertFalse(first > Money.ofMinorUnits(2, "INR"))
     }
@@ -239,8 +268,8 @@ class AcceptedMoneySourceTest {
         for (code in CurrencyRegistry.entries.keys) {
             val maximum = Money.ofMinorUnits(Long.MAX_VALUE, code)
             val minimum = Money.ofMinorUnits(-Long.MAX_VALUE, code)
-            assertEquals(minimum, -maximum)
-            assertEquals(maximum, -minimum)
+            same(minimum, -maximum, "negative-bound-$code")
+            same(maximum, -minimum, "positive-bound-$code")
             assertEquals(
                 MoneyReason.OUT_OF_RANGE,
                 assertThrows(MoneyWireException::class.java) { Money.ofMinorUnits(Long.MIN_VALUE, code) }.reason,
@@ -278,10 +307,10 @@ class AcceptedMoneySourceTest {
                 assertThrows(MoneyWireException::class.java) { Money.parse(input, "INR") }.reason,
             )
         }
-        assertEquals(85000L, Money.parse("85000", "JPY").minorUnits)
-        assertEquals(1005L, Money.parse("1.005", "KWD").minorUnits)
+        same(85000L, Money.parse("85000", "JPY").minorUnits, "integral-unit-parse")
+        same(1005L, Money.parse("1.005", "KWD").minorUnits, "three-digit-parse")
         val expected = -1005L
-        assertEquals(expected, Money.parse("-1.005", "KWD").minorUnits)
+        same(expected, Money.parse("-1.005", "KWD").minorUnits, "negative-three-digit-parse")
         assertEquals(
             MoneyReason.OUT_OF_RANGE,
             assertThrows(MoneyWireException::class.java) { Money.parse("9".repeat(10000) + ".00", "INR") }.reason,
@@ -358,7 +387,44 @@ class AcceptedMoneySourceTest {
                     .jsonObject
                     .getValue("amount")
                     .jsonPrimitive.content
-            assertEquals("$canonical $code", instance.toString())
+            same("$canonical $code", instance.toString(), "diagnostic-render-$code")
         }
+    }
+
+    @Test
+    fun `otherwise valid wire objects never admit additional properties`() {
+        val canonical = encoded(Money.ofMinorUnits(1, "INR")).jsonObject
+        for (key in listOf("extra", "metadata")) {
+            val extended = JsonObject(canonical + (key to JsonPrimitive("synthetic-extra")))
+            val error = assertThrows(MoneyWireException::class.java) { Money.fromWire(extended) }
+            assertEquals(MoneyReason.SHAPE, error.reason)
+            assertEquals(key, error.field)
+        }
+    }
+
+    @Test
+    fun `missing members take precedence over competing extra member failures`() {
+        val canonical = encoded(Money.ofMinorUnits(1, "INR")).jsonObject
+        for (missing in listOf("amount", "currency")) {
+            val extended = JsonObject((canonical - missing) + ("extra" to JsonPrimitive("synthetic-extra")))
+            val error = assertThrows(MoneyWireException::class.java) { Money.fromWire(extended) }
+            assertEquals(MoneyReason.SHAPE, error.reason)
+            assertEquals(missing, error.field)
+        }
+    }
+
+    @OptIn(ExperimentalSerializationApi::class)
+    @Test
+    fun `JVM serializer null values are rejected before inspecting an encoder`() {
+        val encoder =
+            object : AbstractEncoder() {
+                override val serializersModule = EmptySerializersModule()
+            }
+        val method = MoneySerializer::class.java.getMethod("serialize", Encoder::class.java, Money::class.java)
+        val error =
+            assertThrows(InvocationTargetException::class.java) {
+                method.invoke(MoneySerializer, encoder, null)
+            }
+        assertTrue(error.targetException is NullPointerException, "non-null-serializer-boundary")
     }
 }

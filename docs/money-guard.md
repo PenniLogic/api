@@ -2,8 +2,9 @@
 
 This is bounded local source preparation for [API #1](https://github.com/PenniLogic/api/issues/1),
 not issue acceptance, a published codec or authorization to integrate.
-[Infra #22](https://github.com/PenniLogic/infra/issues/22) and
-[Contracts #1](https://github.com/PenniLogic/contracts/issues/1) remain integration blockers.
+[PenniLogic/infra#22](https://github.com/PenniLogic/infra/issues/22) and
+[PenniLogic/contracts#1](https://github.com/PenniLogic/contracts/issues/1) remain integration blockers.
+The subsequent [API #22 mutation slice](money-mutation.md) is also local and unaccepted.
 
 ## Provider boundary
 
@@ -38,6 +39,8 @@ python scripts/quality.py money-guard
 python -m unittest discover -s scripts/tests
 python scripts/quality.py build
 python scripts/quality.py money-coverage
+python scripts/quality.py money-mutation
+python scripts/quality.py money-mutation-report
 python scripts/quality.py gate-self-test --artifact-dir <session-artifacts-directory>
 ```
 
@@ -59,6 +62,8 @@ hard failure, with no warn-only switch. The existing native CI command still inv
 explicitly. Canonical CI source materialization is a coordinator/Infra handoff, not a local CI
 exception or a generated-workflow edit.
 The existing test/lint checks, coverage floors and integration-test requirements are unchanged.
+The additional `moneyMutation` task is mandatory in `check`; it cannot be silently skipped by
+the normal build. Missing materialization or a red mutation score still prevents qualification.
 
 ## Actual Money-package qualification
 
@@ -73,8 +78,9 @@ omitted source files, unrelated package totals or inconsistent counters are refu
 The initial twelve tests measured 74/75 lines and 76/86 branches, and the branch gate failed.
 Additional equality, descriptor, rendering and non-JSON encoder/decoder tests improved the
 actual complete-package result to 75/75 lines (100%) and 81/86 branches (94.19%) across sixteen
-tests. The remaining five branches stay in the denominator; no fabricated invalid instance,
-registry mutation or provider-source change was used to erase them.
+tests. The additive API #22 JVM/value/diagnostic tests now measure 75/75 lines and 82/86 branches
+across 27 tests. All four remaining branches stay in the denominator; no fabricated invalid
+instance, registry mutation or provider-source change was used to erase them.
 
 `quality/money-coverage-baseline.json` is generated from this actual report. The native package
 gate refuses a decline from that recorded baseline even above the floors. The documented
@@ -84,14 +90,13 @@ which is reported explicitly rather than using its unrelated own-main coverage.
 Regeneration uses `money-coverage --write-baseline --base <full reviewed SHA>` and still refuses
 undercoverage or a decline; changing report counters or the accepted strategy is not a remedy.
 
-**Mutation qualification is not executable yet.** The accepted strategy section 7.1 and
-`mutation_testing` category charter the harness to [API #22](https://github.com/PenniLogic/api/issues/22),
-which remains open. Neither the actual API Gradle task/dependency inventory nor the accepted
-strategy/owner specification declares an implemented mutation command, tool/version, Money
-mutator catalogue or result. The strategy requires a 90% score; this change does not invent a
-tool, pretend branch coverage is mutation testing, weaken the floor or mark it met.
-Each package record reports `not_measured`, a null score/survivor set, and that precise missing
-executable-owner fact. Full Money qualification and issue completion remain blocked on it.
+**Mutation is executable and currently RED.** [The API #22 gate](money-mutation.md) runs pinned
+PIT against the actual provider, with the complete selected catalogue. The first fully parsed
+baseline killed 284/439 mutants; meaningful additional tests kill 376/439 (85.649203%).
+The remaining 58 survivors and five uncovered mutants receive no credit, and the normal build
+fails the mutation floor read from the same accepted strategy. Coverage is reported separately,
+never substituted for mutation evidence. No equivalent-mutant waiver, target pruning or
+provider-source modification makes this result pass.
 
 `build.gradle.kts`, `scripts/quality.py`, its tests and this guide are manual API source;
 they are not outputs of the accepted Infra `governance/generate.py` artifact inventory.
@@ -139,3 +144,7 @@ The isolated gate self-test plants a failed assertion and bad formatting, then m
 Float and BigDecimal fields, a floating conversion and raw integer arithmetic. Each monetary case
 must fail specifically at `moneyGuard` with its expected rule; the fixture is removed and a final
 normal build must recover. These fixtures are synthetic code, not a substitute Money implementation.
+While the real mutation result is below its floor, that final normal build remains red; the
+self-test must not bypass mutation to manufacture a recovery. The separate mutation-consumer
+tests demonstrate below-floor/missing-number rejection and restoration without claiming a
+passing real mutation run.
