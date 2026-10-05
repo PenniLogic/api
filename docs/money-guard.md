@@ -62,6 +62,22 @@ inputs or generated source. This repin changes only Money.kt and its upstream go
 binding among the ten inputs. The renderer, registry, fixtures, import mapping and
 accepted Docs strategy remain byte-identical.
 
+The existing canonical materialization catalogue must also move from the EA56 commit to
+`aa8d90cb98cec9b6dd08c91b3a4d869e47362662` (tree
+`da0d17d9deaee9c049776d16c1511c5840fa16fe`) before fresh CI inputs can satisfy these pins.
+Root must route that catalogue update even though command/profile shapes are unchanged:
+
+| Catalogue entry | Required accepted AA8 value |
+| --- | --- |
+| `runtime/kotlin/src/main/kotlin/com/pennilogic/contracts/money/Money.kt` | 8,489 bytes; SHA-256 `eddf78d0c9f694d660a7b13fd8e9e1154bc9b6c801ba0782b72973055d86c79d` |
+| `generator/golden.json` | 7,609 bytes; SHA-256 `62ea59630dfb1e1d028b82c411f7efce575c2403ba277ff807333cdc0423a328` |
+| Rendered Money.kt output | Same accepted Money.kt SHA-256 above |
+
+The other eight input sizes/hashes, registry output
+`10d491ae90bc8f077afe5d45be671af52a5b7891c88eacfccd437a10f4956b21`, and Docs strategy
+are unchanged. Neither stale EA56 pins nor an unaccepted Contracts branch are valid substitutes.
+No canonical Infra catalogue or generated consumer is edited by this API source owner.
+
 The manual `prepareMoneyProvider` and `moneyGuard` Gradle tasks run before Kotlin production/test
 compilation and as part of `check`, including direct Gradle builds. The guard is an unconditional
 hard failure, with no warn-only switch. The existing native CI command still invokes
@@ -101,14 +117,29 @@ which is reported explicitly rather than using its unrelated own-main coverage.
 Regeneration uses `money-coverage --write-baseline --base <full reviewed SHA>` and still refuses
 undercoverage or a decline; changing report counters or the accepted strategy is not a remedy.
 
-**Mutation is executable and currently RED.** [The API #22 gate](money-mutation.md) runs pinned
-PIT against the actual provider, with the complete selected catalogue. The first fully parsed
+**Mutation is executable; the proposed measurement scope is not accepted.**
+[The API #22 gate](money-mutation.md) runs pinned PIT against the actual provider, with the
+complete selected factory/class catalogue. The first fully parsed
 baseline killed 284/439 mutants; meaningful additional tests kill 378/439 (86.104784%).
 That EA56 history is preserved. The separately accepted provider correction produces a new
 baseline of 378/441 (85.714286%): 58 survivors and five uncovered mutants, with no credit for
-either category. The normal build still fails the mutation floor read from the same accepted
-strategy. Coverage is reported separately, never substituted for mutation evidence.
-No equivalent-mutant waiver, target pruning or configuration change makes this result pass.
+either category. Those disabled-FKOTLIN runs remain RED history. The current ordinary gate
+still blocks below the mutation floor read from the same accepted strategy. Coverage is
+reported separately, never substituted for mutation evidence.
+The prospective restoration of built-in FKOTLIN changes measurement scope, not those old
+results: Kotlin line-zero mutants, including meaningful generated bodies, are omitted.
+It does not prove stronger tests, unchanged sensitivity, equivalence or a better mutation
+ratchet. FLOGCALL stays disabled; all 125 factories, eight classes, tests, provider pins,
+numerical floors, coverage ratchet and budgets remain unchanged. Legacy reports cannot
+qualify the candidate because source fingerprints and native feature/argument readback
+must match. There is no nonblocking raw lane or per-mutant compensation.
+The one current-AA8 candidate run, `20261005T173812Z-9a4cde8485ad`, passes the same numerical
+floor at 309/342 (90.350877%): 28 survivors and five uncovered, no timeouts or mutant errors.
+It removes 99 identities (69 prior kills and 30 survivors) and adds no kills; 33 outcomes
+remain unresolved in the measured population. All original 61 and raw AA8 63 obligations
+remain historical evidence, not waived findings. The 29 controls and 75/75-line, 83/86-branch
+coverage are unchanged. This local prospective result still requires fresh Core and separate
+QA review and does not establish whole-API, native CI, ledger or release acceptance.
 The tests require shape/field rejection and successful valid unordered-key behavior, not exact
 hashes. The old hash-addition mutation no longer exists in the corrected provider and earns no
 current credit. The former unmutated collection defect is covered as successful behavior,
@@ -160,7 +191,8 @@ The isolated gate self-test plants a failed assertion and bad formatting, then m
 Float and BigDecimal fields, a floating conversion and raw integer arithmetic. Each monetary case
 must fail specifically at `moneyGuard` with its expected rule; the fixture is removed and a final
 normal build must recover. These fixtures are synthetic code, not a substitute Money implementation.
-While the real mutation result is below its floor, that final normal build remains red; the
-self-test must not bypass mutation to manufacture a recovery. The separate mutation-consumer
+If the real mutation result is below its floor, that final normal build remains red; the
+self-test must not bypass mutation to manufacture a recovery. No full self-test/ledger run
+is claimed for the bounded feature proposal. The separate mutation-consumer
 tests demonstrate below-floor/missing-number rejection and restoration without claiming a
 passing real mutation run.

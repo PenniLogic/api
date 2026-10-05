@@ -220,17 +220,36 @@ class MutationReportTest(unittest.TestCase):
         output = (
             "MUTATOR\tEXPERIMENTAL_REMOVE_SWITCH_MUTATOR_[0-99]\torg.pitest.Switch_0\n"
             "MUTATOR\tEXPERIMENTAL_REMOVE_SWITCH_MUTATOR_[0-99]\torg.pitest.Switch_1\n"
-            "FEATURE\tfkotlin\ttrue\nFEATURE\tflogcall\ttrue\nFEATURE\tfstati\ttrue\n"
+            "FEATURE\tfkotlin\ttrue\nFEATURE\tflogcall\ttrue\nFEATURE\tfstati\ttrue\nFEATURE\tfsynthetic\tfalse\n"
         )
         catalogue, features = mutation.read_catalogue(output)
         self.assertEqual(2, len(catalogue))
-        self.assertFalse(features["fkotlin"]["enabled"])
+        self.assertEqual(("-flogcall", "+fkotlin"), mutation.FEATURE_SELECTION)
+        self.assertTrue(features["fkotlin"]["enabled"])
         self.assertTrue(features["fkotlin"]["default_enabled"])
+        self.assertFalse(features["flogcall"]["enabled"])
+        self.assertTrue(features["flogcall"]["default_enabled"])
         self.assertTrue(features["fstati"]["enabled"])
+        self.assertFalse(features["fsynthetic"]["enabled"])
         with self.assertRaisesRegex(ValueError, "duplicate"):
             mutation.read_catalogue(output + "MUTATOR\tX\torg.pitest.Switch_0\n")
         with self.assertRaises(ValueError):
             mutation.read_catalogue("")
+
+    def test_catalogue_requires_both_native_feature_controls_and_valid_defaults(self):
+        mutator = "MUTATOR\tSYNTHETIC\torg.pitest.synthetic.Operator\n"
+        for output in (
+            "FEATURE\tfkotlin\ttrue\n",
+            "FEATURE\tflogcall\ttrue\n",
+        ):
+            with self.subTest(output=output), self.assertRaisesRegex(ValueError, "control is unavailable"):
+                mutation.read_catalogue(mutator + output)
+        for output in (
+            "FEATURE\tfkotlin\ttrue\nFEATURE\tfkotlin\ttrue\nFEATURE\tflogcall\ttrue\n",
+            "FEATURE\tfkotlin\tunknown\nFEATURE\tflogcall\ttrue\n",
+        ):
+            with self.subTest(output=output), self.assertRaisesRegex(ValueError, "feature catalogue"):
+                mutation.read_catalogue(mutator + output)
 
     def test_truncated_xml_never_qualifies(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -263,22 +282,39 @@ class MutationEvidenceTest(unittest.TestCase):
             floors, strategy_hash = quality.money_policy(provider)
             fixture = MutationReportTest()
 
+            def store(record):
+                (directory / "run.json").write_text(json.dumps(record))
+
             def save(killed):
                 document = ET.Element("mutations", {"partial": "true"})
                 document.extend(fixture.entry(index, "KILLED" if index < killed else "SURVIVED") for index in range(100))
                 ET.ElementTree(document).write(report)
                 result = mutation.read_report(report, {fixture.target}, catalogue, {"Money.kt"})
+                java = str(root / "synthetic-java")
+                commands = []
+                for name, arguments in (
+                    ("catalogue", ["SyntheticCatalogue"]),
+                    ("engine", ["SyntheticEngine", "--features=-flogcall,+fkotlin"]),
+                ):
+                    argfile = directory / f"{name}.args"
+                    mutation.java_arguments(argfile, arguments)
+                    commands.append({"exit_code": 0, "argv": [java, "@" + str(argfile)], "java_arguments": arguments})
                 record = {
+                    "schema_version": 2, "feature_selection": ["-flogcall", "+fkotlin"],
                     "status": "passed", "strategy_sha256": strategy_hash,
                     "floor_percent": floors, "budget": quality.money_budget(provider), "elapsed_seconds": 1,
-                    "inputs": {"synthetic": "bound"}, "config": {},
-                    "outputs": {"mutations.xml": mutation.file_record(report), "catalogue.log": mutation.file_record(catalogue_file)},
+                    "inputs": {"synthetic": "bound"}, "config": {"java": java},
+                    "outputs": {
+                        name: mutation.file_record(directory / name)
+                        for name in ("mutations.xml", "catalogue.log", "catalogue.args", "engine.args")
+                    },
                     "target_classes": [fixture.target], "target_sources": ["Money.kt"],
                     "catalogue": catalogue, "features": features,
-                    "commands": [{"exit_code": 0}, {"exit_code": 0}],
+                    "commands": commands,
                     "report": mutation.file_record(report), "result": result,
                 }
-                (directory / "run.json").write_text(json.dumps(record))
+                store(record)
+                return record
 
             with (
                 patch.object(mutation, "ROOT", root),
@@ -302,6 +338,56 @@ class MutationEvidenceTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "stale"):
                     mutation.check_latest()
                 snapshot.return_value = {"synthetic": "bound"}
+                mutation.check_latest()
+                for field, value in (
+                    ("schema_version", 1), ("feature_selection", None),
+                    ("feature_selection", ["-flogcall", "-fkotlin"]),
+                ):
+                    record = save(90)
+                    record[field] = value
+                    store(record)
+                    with self.subTest(field=field, value=value), self.assertRaisesRegex(ValueError, "measurement scope"):
+                        mutation.check_latest()
+                    save(90)
+                    mutation.check_latest()
+                record = save(90)
+                record["features"] = {**features, "fkotlin": {**features["fkotlin"], "enabled": False}}
+                store(record)
+                with self.assertRaisesRegex(ValueError, "complete successful engine invocation"):
+                    mutation.check_latest()
+                save(90)
+                mutation.check_latest()
+                for selections in (
+                    [], ["--features=-flogcall,-fkotlin"],
+                    ["--features", "-flogcall,+fkotlin"],
+                    ["--features=-flogcall,+fkotlin", "--features=-fkotlin"],
+                ):
+                    record = save(90)
+                    arguments = ["SyntheticEngine", *selections]
+                    record["commands"][1]["java_arguments"] = arguments
+                    mutation.java_arguments(directory / "engine.args", arguments)
+                    record["outputs"]["engine.args"] = mutation.file_record(directory / "engine.args")
+                    store(record)
+                    with self.subTest(selections=selections), self.assertRaisesRegex(ValueError, "feature selection"):
+                        mutation.check_latest()
+                    save(90)
+                    mutation.check_latest()
+                for name in ("catalogue", "engine"):
+                    record = save(90)
+                    argfile = directory / f"{name}.args"
+                    mutation.java_arguments(argfile, ["SyntheticOldInvocation", "--features=-flogcall,-fkotlin"])
+                    record["outputs"][argfile.name] = mutation.file_record(argfile)
+                    store(record)
+                    with self.subTest(argfile=name), self.assertRaisesRegex(ValueError, "argument file"):
+                        mutation.check_latest()
+                    save(90)
+                    mutation.check_latest()
+                record = save(90)
+                record["commands"][1]["argv"][-1] = "@" + str(directory / "unbound.args")
+                store(record)
+                with self.assertRaisesRegex(ValueError, "argument file"):
+                    mutation.check_latest()
+                save(90)
                 mutation.check_latest()
 
     def test_property_metrics_require_executed_categories_and_do_not_invent_an_oracle(self):

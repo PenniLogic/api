@@ -29,7 +29,8 @@ STATUSES = (
 )
 ERROR_STATUSES = ("NON_VIABLE", "MEMORY_ERROR", "RUN_ERROR", "STARTED", "NOT_STARTED")
 TEST_PACKAGE = "com.pennilogic.money."
-DISABLED_FEATURES = ("flogcall", "fkotlin")
+SCHEMA_VERSION = 2
+FEATURE_SELECTION = ("-flogcall", "+fkotlin")
 
 
 def file_record(path):
@@ -121,10 +122,11 @@ def read_catalogue(output):
         catalogue[identifier] = name
     if not catalogue or not features:
         raise ValueError("PIT returned an empty mutator catalogue")
-    for name in DISABLED_FEATURES:
+    for selection in FEATURE_SELECTION:
+        name = selection[1:]
         if name not in features:
             raise ValueError("Required PIT filter control is unavailable")
-        features[name]["enabled"] = False
+        features[name]["enabled"] = selection.startswith("+")
     return dict(sorted(catalogue.items())), dict(sorted(features.items()))
 
 
@@ -222,13 +224,14 @@ def enforce(result, floors):
         raise ValueError("Authoritative Money mutation score below the accepted floor")
 
 
-def java_arguments(path, arguments):
+def java_argument_text(arguments):
     if any("\n" in value or "\r" in value for value in arguments):
         raise ValueError("Invalid newline in mutation engine argument")
-    path.write_text(
-        "\n".join('"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"' for value in arguments) + "\n",
-        encoding="utf-8", newline="\n",
-    )
+    return "\n".join('"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"' for value in arguments) + "\n"
+
+
+def java_arguments(path, arguments):
+    path.write_text(java_argument_text(arguments), encoding="utf-8", newline="\n")
 
 
 def execute(input_file=ROOT / INPUT_FILE):
@@ -238,7 +241,8 @@ def execute(input_file=ROOT / INPUT_FILE):
     directory = provider.owned_target(ROOT, REPORTS / run_id)
     directory.mkdir(parents=True, exist_ok=False)
     record = {
-        "schema_version": 1, "event": "money_package_mutation", "status": "started",
+        "schema_version": SCHEMA_VERSION, "event": "money_package_mutation", "status": "started",
+        "feature_selection": list(FEATURE_SELECTION),
         "run_id": run_id, "strategy_package": "api.money",
         "commands": [], "result": None,
     }
@@ -262,6 +266,8 @@ def execute(input_file=ROOT / INPUT_FILE):
             "config": config, "inputs": snapshot, "test_evidence": quality.money_test_metrics(),
             "tool_limits": [
                 "PIT's native bytecode eligibility and listed default compiler/equivalence filters still apply.",
+                "FKOTLIN filters .kt mutations with native line zero, including meaningful generated bodies.",
+                "The Kotlin heuristic is incomplete and can have false positives; filtering is not kill or equivalence credit.",
                 "Static initializers and non-lambda synthetic methods are not mutated by PIT.",
                 "Registry fixture assertions are not static-initializer mutation kills.",
                 "Zero-mutant classes and operators remain in the catalogue; no equivalence is waived locally.",
@@ -312,7 +318,7 @@ def execute(input_file=ROOT / INPUT_FILE):
             "--mutableCodePaths", str(ROOT / quality.MONEY_CLASSES),
             "--classPath", ",".join(config["test_classpath"]),
             "--includeLaunchClasspath=false", "--mutators=ALL",
-            "--features=" + ",".join("-" + name for name in DISABLED_FEATURES),
+            "--features=" + ",".join(FEATURE_SELECTION),
             "--threads=2", "--timeoutFactor=1.25", "--timeoutConst=4000",
             "--jvmArgs", ",".join([
                 "-Xmx512m", "-Duser.timezone=UTC",
@@ -349,6 +355,7 @@ def execute(input_file=ROOT / INPUT_FILE):
         result = record["result"]
         print(json.dumps({
             "event": record["event"], "run_id": run_id, "status": record["status"],
+            "feature_selection": record["feature_selection"],
             "engine": record.get("engine"), "strategy_package": "api.money",
             "floor_percent": record.get("floor_percent", {}).get("MUTATION"),
             "elapsed_seconds": record["elapsed_seconds"], "failure": record.get("failure"),
@@ -372,6 +379,8 @@ def check_latest():
         raise ValueError("Mutation run reference is invalid")
     directory = provider.safe_path(ROOT / REPORTS, run_id)
     record = json.loads(provider.safe_path(directory, "run.json").read_text(encoding="utf-8"))
+    if record.get("schema_version") != SCHEMA_VERSION or record.get("feature_selection") != list(FEATURE_SELECTION):
+        raise ValueError("Mutation attempt uses a different native feature measurement scope")
     elapsed = record["elapsed_seconds"]
     if (
         record["status"] != "passed" or record["strategy_sha256"] != strategy_hash
@@ -391,6 +400,19 @@ def check_latest():
         or len(record["commands"]) != 2 or any(command["exit_code"] != 0 for command in record["commands"])
     ):
         raise ValueError("Mutation attempt is not the complete successful engine invocation")
+    arguments = record["commands"][1]["java_arguments"]
+    if [value for value in arguments if value == "--features" or value.startswith("--features=")] != [
+        "--features=" + ",".join(FEATURE_SELECTION),
+    ]:
+        raise ValueError("Mutation engine feature selection differs from the required measurement scope")
+    for name, command in zip(("catalogue", "engine"), record["commands"]):
+        argfile = provider.safe_path(directory, f"{name}.args")
+        if (
+            argfile.name not in record["outputs"]
+            or command["argv"] != [record["config"]["java"], "@" + str(argfile)]
+            or argfile.read_bytes() != java_argument_text(command["java_arguments"]).encode("utf-8")
+        ):
+            raise ValueError("Mutation native argument file differs from its recorded invocation")
     report = provider.safe_path(directory, "mutations.xml")
     if file_record(report) != record["report"]:
         raise ValueError("Mutation output changed after execution")
