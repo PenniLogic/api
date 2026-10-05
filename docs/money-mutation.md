@@ -2,12 +2,14 @@
 
 This is the executable Money-only source slice of [#22](https://github.com/PenniLogic/api/issues/22),
 stacked on unaccepted local preparation `8e79ddd25f4cebff550999ca37bfbe02cc0d18a9`
-(tree `c843380583ef3a706967662ffc6d416ea1c8c145`). It is not a released provider, protected-source
-adoption, native CI result, non-author approval, or completion of #1, #3 or #22.
+(tree `c843380583ef3a706967662ffc6d416ea1c8c145`). The API slice is not protected-source
+acceptance, a native CI result, non-author approval, or completion of #1, #3 or #22.
+Its current source dependency is the coordinator-confirmed protected accepted Contracts
+commit `aa8d90cb98cec9b6dd08c91b3a4d869e47362662`; that provider acceptance is not API acceptance.
 
-**The gate exists; qualification remains RED.** The actual result is 378 killed out of 439
-mutants (86.104784%), below the numeric `api.money` mutation floor read from the accepted
-Docs strategy. There are 56 survivors and five uncovered mutants, with no local waivers.
+**The gate exists; qualification remains RED.** The actual accepted-provider result is
+378 killed out of 441 mutants (85.714286%), below the numeric `api.money` mutation floor read
+from the accepted Docs strategy. There are 58 survivors and five uncovered mutants, with no local waivers.
 
 ## Reproduce
 
@@ -42,7 +44,7 @@ engine is used.
 
 `scripts/PitCatalogue.java` enumerates the installed engine's `ALL` factories and interceptor
 defaults. There are 125 distinct factory IDs, including every switch factory and operators
-that produce zero mutants. Twenty operator IDs produce the observed 439 mutants.
+that produce zero mutants. Twenty operator IDs produce the observed 441 mutants.
 `flogcall` and `fkotlin` are disabled, consistently from the first baseline, so logging calls
 and Kotlin line-zero code are not silently dropped by those filters. There are no configured
 class, method, test or mutator exclusions. `run.json` lists all 27 interceptor defaults and
@@ -54,7 +56,7 @@ Both immutable provider source files and every compiled provider class are inven
 | --- | ---: |
 | CurrencyEntry | 54 |
 | CurrencyRegistry | 10 |
-| Money | 79 |
+| Money | 81 |
 | Money$Companion | 206 |
 | MoneyReason | 1 |
 | MoneySerializer | 32 |
@@ -73,9 +75,9 @@ the report retains native class, method, descriptor and instruction indexes inst
 pretending every mutant has a literal source line. These limits and the catalogue require
 independent review; the author does not approve or discount them.
 
-## Actual progression and unresolved result
+## Preserved EA56 progression
 
-All rows below used the same engine, full selection and unchanged authoritative provider.
+All rows below used the same engine, full selection and original accepted EA56 provider.
 Native attempt directories are retained under `build/reports/money-mutation/`.
 
 | Control tests | Killed | Survived | No coverage | Score | Attempt |
@@ -107,23 +109,71 @@ full Core/QA approval. The API adopted only these two methods, not its four expl
 | `arrayAndObjectMembersAreShapeRejectionsWithTheirField` | `4da1ee067b2d665db0bc28340cc69efc1e527c19b3f3bc66a0626f03aaeade36` | Array/object amount and currency members reject with `MoneyWireException(SHAPE, field)`, not a cast exception, as ADR-015 section 1.5 requires. |
 | `validUnorderedCollectionKeysDoNotInvokeMixedCurrencyArithmetic` | `aa5bc4d4baf98e331e31379882a2417bbaf975e217e2dea7a73d82bfdd0dc8ac` | A fixed valid 17-key unordered set accepts distinct values and retrieves freshly constructed equal values without requesting cross-currency ordering. No exact hash or collision-free distribution is asserted. |
 
-All 439 mutant identities, 125 factories, eight targets and provider bytes are unchanged.
-The remaining **61 obligations** are 56 survivors and five uncovered mutants. The bounded
+At frozen API `931b0e2b77dbf3d776015797d5d762ddac706b37`, all 439 mutant identities,
+125 factories, eight targets and EA56 provider bytes were unchanged.
+That baseline's **61 obligations** are 56 survivors and five uncovered mutants. The bounded
 assessment distinguishes runtime no-ops, contract-permitted hash alternatives, domain-conditioned
 redundancy and blocked defensive observability; those classifications are not exemptions.
 The five uncovered mutants remain in `Money.toWire` defensive paths. Arbitrary exact-hash
 assertions, compiler-message snapshots, private-state corruption and fake kills are not remedies.
-Every unresolved mutant retains its native status and denominator membership. Eighteen further
-genuine kills would be needed at this denominator; no demonstrated valid-contract route was found
+Every unresolved mutant retains its historical native status and denominator membership. Eighteen further
+genuine kills would be needed at that denominator; no demonstrated valid-contract route was found
 in the bounded assessment, and no speculative broad mutation loop or waiver is substituted.
 
-The assessment also reproduced a separate failure in the **unmutated** provider: another valid
+The assessment also reproduced a separate failure in the **unmutated EA56** provider: another valid
 cross-currency hash-set corpus reaches the provider's partial `Comparable` implementation and
-throws during unordered insertion. Root has routed that defect to Contracts. These API tests
-require successful collection behavior and never expect that defect. A proper provider fix may
-remove the distinguishing behavior of the current hash-addition mutation; the defect must not be
-retained to preserve a kill. Any provider correction needs new accepted input/catalogue evidence
-and fresh Core/QA review, not a local provider edit or pin substitution.
+throws during unordered insertion. These API tests require successful collection behavior and never
+expect that defect. The Contracts-owned correction below removes the old hash-addition mutation;
+the defect is not retained to preserve a kill.
+
+## Accepted provider update
+
+The coordinator confirmed [PenniLogic/contracts#35](https://github.com/PenniLogic/contracts/pull/35)
+protected accepted commit `aa8d90cb98cec9b6dd08c91b3a4d869e47362662`,
+tree `da0d17d9deaee9c049776d16c1511c5840fa16fe`, sole parent
+`ea56c63d5c9b679537bd9205b04626049c20c572`. The API materializer and local source-JAR provenance
+now pin that commit. Only Money.kt (SHA-256
+`eddf78d0c9f694d660a7b13fd8e9e1154bc9b6c801ba0782b72973055d86c79d`) and its upstream golden
+binding changed among the same ten verified inputs. The renderer, registry, fixtures, import
+mapping, public ABI and accepted Docs strategy are unchanged. No provider implementation is
+forked or edited by the API.
+
+The existing unordered-key test retains its original corpus and also requires success for the
+separate valid corpus that exposed the unmutated EA56 failure. Both insert 17 distinct valid
+values and retrieve fresh equal keys. The test asserts no exact hash, collision-free
+distribution or expected provider failure; the logical control count remains 29.
+
+Exactly one new source baseline ran at the unchanged `ALL`/125-factory/eight-class selection,
+with `-flogcall,-fkotlin` and the same strategy-derived floors and budgets:
+
+| Attempt | Provider | Killed | Survived | No coverage | Total | Score |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `20261005T162549Z-c292caba4ecf` | `aa8d90c` | 378 | 58 | 5 | 441 | 85.714286% |
+
+Native PIT and the mandatory Money gate both exited 1 solely for below-floor mutation coverage.
+Timeouts, non-viable mutations, memory/run errors and incomplete outcomes are all zero.
+No full ledger, Postgres or native CI run is claimed for this repin.
+
+Compared with the frozen 439-member population, four native keys disappeared (two killed and
+two survived), six appeared (three killed and three survived), and 435 keys are shared.
+All four removals and six additions are in the changed Money.hashCode method. One shared key,
+`b22eaf7b1fd27fb83c56ca3b893d60d662df53ad180b94d14531b610098af8c9`, changes from killed to survived:
+its indexed target changed from removing String.hashCode to removing Long.hashCode.
+Two shared keys have different mutation descriptions, and 244 shared keys have shifted source
+lines. A matching native key across changed source is not proof of the same semantic mutation.
+The old `aa5bc4...` addition/subtraction kill is absent, not credited against the new source.
+
+The current **63 unresolved outcomes** and all original 61 obligation records are preserved
+separately. No prior equivalence classification is automatically carried into a changed
+hash implementation. Nineteen further genuine kills would be needed at the new denominator;
+no speculative repeat loop or waiver was used. Fresh Core/QA and affected Money review remain
+required for the new input and native catalogue.
+
+The earlier scratch-only FKOTLIN-default experiment on frozen `931b0e2` is separate evidence,
+not this configuration: its 309/340 ratio resulted from removing 99 line-zero identities,
+including 69 old kills, without any new kill. This source keeps FKOTLIN explicitly disabled
+rather than adopting that upstream-default heuristic. PIT's incomplete-Kotlin/plugin warning
+remains recorded; complete Kotlin support or a production configuration decision is not inferred.
 
 Money coverage is 75/75 lines and 83/86 branches, across all eight classes, with 29 tests,
 zero failures and zero skips. Actual successful loop completion emits 10,030 round-trip cases,
@@ -155,6 +205,8 @@ mutation budget. The frozen 27-test normal build took 70.338562 seconds wall tim
 harness 43.608505 seconds, failing solely on the score. The 29-test correction's focused
 `python scripts\quality.py money-mutation` took 78.411215 seconds wall time, including
 48.966025 seconds in the mutation harness, and also failed solely on the score.
+The accepted-provider baseline took 86.501164 seconds wall time, including 50.169704 seconds
+in the mutation harness and 47.698136 seconds in native PIT; it also failed solely on the score.
 
 The correction's earlier `moneyMutation build installDist` task-order attempt failed before PIT:
 the shape test raised actual branch coverage, requiring the existing baseline to ratchet from

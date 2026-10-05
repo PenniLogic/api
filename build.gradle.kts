@@ -54,11 +54,11 @@ val acceptedSourceJar =
     tasks.register<Jar>("contractsMoneyJar") {
         description = "Packages the accepted immutable Money source for this local API build only."
         from(acceptedSourceSet.output)
-        archiveBaseName.set("pennilogic-contracts-money-source-ea56c63")
+        archiveBaseName.set("pennilogic-contracts-money-source-aa8d90c")
         manifest {
             attributes(
                 "Source-Repository" to "PenniLogic/contracts",
-                "Source-Commit" to "ea56c63d5c9b679537bd9205b04626049c20c572",
+                "Source-Commit" to "aa8d90cb98cec9b6dd08c91b3a4d869e47362662",
                 "Provider-Kind" to "accepted-source-only",
             )
         }

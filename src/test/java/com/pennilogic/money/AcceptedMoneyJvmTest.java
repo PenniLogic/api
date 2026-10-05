@@ -156,18 +156,20 @@ class AcceptedMoneyJvmTest {
 
     @Test
     void validUnorderedCollectionKeysDoNotInvokeMixedCurrencyArithmetic() {
-        var values = new HashSet<Money>(128);
-        for (int index = 1; index <= 16; index++) {
-            long minor = ((long) index << 32) | index;
-            assertTrue(values.add(Money.Companion.ofMinorUnits(minor, "INR")), "distinct-unordered-key");
-        }
-        // This fixed valid corpus exercises a cross-currency collision after the native hash addition mutation.
-        assertTrue(values.add(Money.Companion.ofMinorUnits(831284026L, "JPY")), "distinct-unordered-currency-key");
-        assertTrue(values.size() == 17, "unordered-key-cardinality");
-        assertTrue(values.contains(Money.Companion.ofMinorUnits(831284026L, "JPY")), "unordered-key-lookup");
-        for (int index = 1; index <= 16; index++) {
-            long minor = ((long) index << 32) | index;
-            assertTrue(values.contains(Money.Companion.ofMinorUnits(minor, "INR")), "unordered-original-key-lookup");
+        // The second valid corpus exposed the former unmutated provider's cross-currency HashSet failure.
+        for (long foreignKey : new long[] {831284026L, 3463683270L}) {
+            var values = new HashSet<Money>(128);
+            for (int index = 1; index <= 16; index++) {
+                long minor = ((long) index << 32) | index;
+                assertTrue(values.add(Money.Companion.ofMinorUnits(minor, "INR")), "distinct-unordered-key");
+            }
+            assertTrue(values.add(Money.Companion.ofMinorUnits(foreignKey, "JPY")), "distinct-unordered-currency-key");
+            assertTrue(values.size() == 17, "unordered-key-cardinality");
+            assertTrue(values.contains(Money.Companion.ofMinorUnits(foreignKey, "JPY")), "unordered-key-lookup");
+            for (int index = 1; index <= 16; index++) {
+                long minor = ((long) index << 32) | index;
+                assertTrue(values.contains(Money.Companion.ofMinorUnits(minor, "INR")), "unordered-original-key-lookup");
+            }
         }
     }
 

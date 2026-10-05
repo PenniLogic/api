@@ -10,8 +10,10 @@ The subsequent [API #22 mutation slice](money-mutation.md) is also local and una
 
 The accepted [ADR-015](https://github.com/PenniLogic/docs/blob/a700e639585c61a4610e7b99dbd02b2dab28bdcc/adr/ADR-015.md)
 requires one Contracts-owned Kotlin wrapper and one serialization seam. The coordinator confirmed
-the accepted Contracts source at `ea56c63d5c9b679537bd9205b04626049c20c572` is reusable locally
-despite the absence of release tags. `scripts/money_provider.py` checks the size and SHA-256 of
+the protected accepted Contracts source at `aa8d90cb98cec9b6dd08c91b3a4d869e47362662`
+([PenniLogic/contracts#35](https://github.com/PenniLogic/contracts/pull/35)) is reusable locally
+despite the absence of release tags. It supersedes `ea56c63d5c9b679537bd9205b04626049c20c572`
+only as this source dependency, not as API acceptance. `scripts/money_provider.py` checks the size and SHA-256 of
 every required source input, invokes the unchanged upstream registry renderer, and checks both
 Kotlin outputs against the upstream golden hashes. The API packages those exact outputs as a
 separate, local source dependency. No second Money class, codec, registry format, currency fallback,
@@ -54,6 +56,11 @@ The script performs no downloads, credential operations, full client generation 
 Prepared Contracts inputs live in `build/contracts-money/source`, and the exact Docs input in
 `build/contracts-money/strategy/governance/test-strategy.json`; missing or changed inputs/output stop,
 without overwriting a mismatched cache or synthesizing a registry.
+On an authorized provider repin, preserve the old `build/contracts-money` bundle before
+materializing the new snapshot; the preparer intentionally refuses to overwrite stale
+inputs or generated source. This repin changes only Money.kt and its upstream golden
+binding among the ten inputs. The renderer, registry, fixtures, import mapping and
+accepted Docs strategy remain byte-identical.
 
 The manual `prepareMoneyProvider` and `moneyGuard` Gradle tasks run before Kotlin production/test
 compilation and as part of `check`, including direct Gradle builds. The guard is an unconditional
@@ -82,6 +89,9 @@ tests. The additive API #22 JVM/value/diagnostic tests reached 75/75 lines and 8
 across 27 tests. Two independently demonstrated regression cases now raise that result to 75/75
 lines and 83/86 branches across 29 tests. All three remaining branches stay in the denominator; no fabricated invalid
 instance, registry mutation or provider-source change was used to erase them.
+The accepted `aa8d90c` hash correction preserves that same measured coverage and 29-test
+inventory. The existing unordered-key control now also covers the former unmutated failure;
+the generated baseline changes its provider reference, not its counters or ratchet.
 
 `quality/money-coverage-baseline.json` is generated from this actual report. The native package
 gate refuses a decline from that recorded baseline even above the floors. The documented
@@ -94,14 +104,15 @@ undercoverage or a decline; changing report counters or the accepted strategy is
 **Mutation is executable and currently RED.** [The API #22 gate](money-mutation.md) runs pinned
 PIT against the actual provider, with the complete selected catalogue. The first fully parsed
 baseline killed 284/439 mutants; meaningful additional tests kill 378/439 (86.104784%).
-The remaining 56 survivors and five uncovered mutants receive no credit, and the normal build
-fails the mutation floor read from the same accepted strategy. Coverage is reported separately,
-never substituted for mutation evidence. No equivalent-mutant waiver, target pruning or
-provider-source modification makes this result pass. The two adopted tests require shape/field
-rejection and successful valid unordered-key behavior, not exact hashes. A separate unmutated
-provider collection defect is Contracts-owned; fixing it may change a currently observed hash
-mutation kill and requires new accepted inputs and fresh review. It is not an expected failure
-in these API tests.
+That EA56 history is preserved. The separately accepted provider correction produces a new
+baseline of 378/441 (85.714286%): 58 survivors and five uncovered mutants, with no credit for
+either category. The normal build still fails the mutation floor read from the same accepted
+strategy. Coverage is reported separately, never substituted for mutation evidence.
+No equivalent-mutant waiver, target pruning or configuration change makes this result pass.
+The tests require shape/field rejection and successful valid unordered-key behavior, not exact
+hashes. The old hash-addition mutation no longer exists in the corrected provider and earns no
+current credit. The former unmutated collection defect is covered as successful behavior,
+never an expected failure. New source/catalogue evidence still requires fresh independent review.
 
 `build.gradle.kts`, `scripts/quality.py`, its tests and this guide are manual API source;
 they are not outputs of the accepted Infra `governance/generate.py` artifact inventory.

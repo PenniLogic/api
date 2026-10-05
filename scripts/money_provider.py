@@ -10,7 +10,7 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE_REF = "ea56c63d5c9b679537bd9205b04626049c20c572"
+SOURCE_REF = "aa8d90cb98cec9b6dd08c91b3a4d869e47362662"
 DOCS_REF = "a700e639585c61a4610e7b99dbd02b2dab28bdcc"
 BUNDLE = Path("build/contracts-money")
 MONEY = "src/main/kotlin/com/pennilogic/contracts/money/Money.kt"
@@ -19,16 +19,16 @@ SOURCE_FILES = {
     "scripts/generate_clients.py": (15699, "cdfa31079fb5d327348fa311ed28ecb6da1fd8d9d62b83602fcf640261f86130"),
     "scripts/pl_contracts.py": (5163, "ce38c232e82e2d221655709cf944fb0a226462e78b98276f1be39c2928a9be61"),
     "scripts/toolchain.py": (7775, "9bbcb66cfd8d05de1b926872e653762c1eabe1a7395af55008b001e3184f46d7"),
-    "runtime/kotlin/" + MONEY: (8263, "7d973d9f2a43859cc20c79789c57ebb793c051b9e7ce7652126d32e79cb97459"),
+    "runtime/kotlin/" + MONEY: (8489, "eddf78d0c9f694d660a7b13fd8e9e1154bc9b6c801ba0782b72973055d86c79d"),
     "spec/currency-registry.v1.json": (615, "d9fd1f021993feb4c4b4c8bb131372ea5bd278a456978e5386992879b9fd44d5"),
     "spec/fixtures/money-wire-fixtures.v1.json": (14863, "3c95a95c290fd1aad5d58300c301ab3c8c6b3b2883a95fbb586b58336ab1cf1d"),
     "spec/fixtures/money-roundtrip-generated.v1.json": (901529, "22ed8a8ff3204a8962c10c8fcfada7d20dd6ed147fc2a07f98edef827ea28efe"),
-    "generator/golden.json": (7609, "e33f2691b56e0c76ff40c0df67486b3b9d162f6dfbffe258c6fd43e681dda2d8"),
+    "generator/golden.json": (7609, "62ea59630dfb1e1d028b82c411f7efce575c2403ba277ff807333cdc0423a328"),
     "generator/kotlin.json": (652, "8988671f62d532f76551c4bf25d8a46a2b0abc1ff8be8a834b427ad8cec5e248"),
     "spec/openapi.yaml": (6875, "4f315bc28a8e1d25841f8110e5dd90126e7b101a76cbfcfba5b6348dd0bfaba9"),
 }
 OUTPUT_HASHES = {
-    MONEY: "7d973d9f2a43859cc20c79789c57ebb793c051b9e7ce7652126d32e79cb97459",
+    MONEY: "eddf78d0c9f694d660a7b13fd8e9e1154bc9b6c801ba0782b72973055d86c79d",
     REGISTRY: "10d491ae90bc8f077afe5d45be671af52a5b7891c88eacfccd437a10f4956b21",
 }
 STRATEGY_FILE = Path("strategy/governance/test-strategy.json")
@@ -163,7 +163,7 @@ def prepare(source=None, root=ROOT, strategy_file=None):
     if not source.is_dir():
         raise ProviderError(
             "Accepted Money SOURCE is not prepared. Run python scripts/money_provider.py "
-            "--source-root <owned snapshot of contracts ea56c63> "
+            "--source-root <owned snapshot of contracts aa8d90c> "
             "--strategy-file <owned Docs a700e63 governance/test-strategy.json>; "
             "no release or fallback is assumed."
         )
