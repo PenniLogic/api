@@ -289,6 +289,7 @@ class MutationEvidenceTest(unittest.TestCase):
                 document = ET.Element("mutations", {"partial": "true"})
                 document.extend(fixture.entry(index, "KILLED" if index < killed else "SURVIVED") for index in range(100))
                 ET.ElementTree(document).write(report)
+                (directory / "engine.log").write_text(f">> Generated 100 mutations Killed {killed} ({killed}%)\n")
                 result = mutation.read_report(report, {fixture.target}, catalogue, {"Money.kt"})
                 java = str(root / "synthetic-java")
                 commands = []
@@ -306,7 +307,7 @@ class MutationEvidenceTest(unittest.TestCase):
                     "inputs": {"synthetic": "bound"}, "config": {"java": java},
                     "outputs": {
                         name: mutation.file_record(directory / name)
-                        for name in ("mutations.xml", "catalogue.log", "catalogue.args", "engine.args")
+                        for name in ("mutations.xml", "catalogue.log", "catalogue.args", "engine.args", "engine.log")
                     },
                     "target_classes": [fixture.target], "target_sources": ["Money.kt"],
                     "catalogue": catalogue, "features": features,
@@ -323,6 +324,35 @@ class MutationEvidenceTest(unittest.TestCase):
                 patch.object(mutation, "input_snapshot", return_value={"synthetic": "bound"}) as snapshot,
                 patch("sys.stdout", new_callable=io.StringIO),
             ):
+                save(90)
+                mutation.check_latest()
+                for change in ("omit-survivor", "reclassify-kill"):
+                    record = save(95)
+                    log_binding = record["outputs"]["engine.log"].copy()
+                    document = ET.parse(report)
+                    if change == "omit-survivor":
+                        entry = next(node for node in document.getroot() if node.get("status") == "SURVIVED")
+                        document.getroot().remove(entry)
+                    else:
+                        entry = next(node for node in document.getroot() if node.get("status") == "KILLED")
+                        entry.set("status", "SURVIVED")
+                        entry.set("detected", "false")
+                        entry.find("killingTest").text = ""
+                    document.write(report)
+                    record["report"] = record["outputs"]["mutations.xml"] = mutation.file_record(report)
+                    record["result"] = mutation.read_report(report, {fixture.target}, catalogue, {"Money.kt"})
+                    self.assertEqual(log_binding, mutation.file_record(directory / "engine.log"))
+                    mutation.enforce(record["result"], floors)
+                    store(record)
+                    with self.subTest(change=change), self.assertRaisesRegex(ValueError, "PIT console counts disagree"):
+                        mutation.check_latest()
+                    save(95)
+                    mutation.check_latest()
+                record = save(90)
+                del record["outputs"]["engine.log"]
+                store(record)
+                with self.assertRaisesRegex(ValueError, "native engine log"):
+                    mutation.check_latest()
                 save(90)
                 mutation.check_latest()
                 save(89)
@@ -461,6 +491,64 @@ class MutationEvidenceTest(unittest.TestCase):
             self.assertIsNone(record["result"])
             self.assertEqual([], record["commands"])
             self.assertEqual(original, (previous / "run.json").read_text())
+
+
+class MutationNativeConsoleTest(unittest.TestCase):
+    def test_required_log_binding_and_restoration(self):
+        result = MutationPolicyTest().result(90, 100)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "engine.log"
+            path.write_text(">> Generated 100 mutations Killed 90 (90%)\n")
+            binding = mutation.file_record(path)
+            for expected in (
+                None, {}, {"bytes": binding["bytes"]}, {"sha256": binding["sha256"]},
+                {**binding, "bytes": binding["bytes"] + 1}, {**binding, "sha256": "0" * 64},
+            ):
+                with self.subTest(expected=expected), self.assertRaisesRegex(ValueError, "native engine log"):
+                    mutation.check_native_summary(path, expected, result)
+                mutation.check_native_summary(path, binding, result)
+            path.unlink()
+            with self.assertRaisesRegex(ValueError, "missing"):
+                mutation.check_native_summary(path, binding, result)
+
+    def test_unique_complete_numeric_summary_and_exact_counts(self):
+        result = MutationPolicyTest().result(90, 100)
+        summary = ">> Generated 100 mutations Killed 90 (90%)"
+        subtotal = ">> Generated 25 Killed 25 (100%)\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "engine.log"
+            for output in (
+                "", subtotal, ">> Generated 100 mutations",
+                ">> Generated mutations Killed 90 (90%)",
+                ">> Generated unknown mutations Killed 90 (90%)",
+                ">> Generated 100 mutations Killed unknown (90%)",
+                ">> Generated 100 mutations Killed -1 (90%)",
+                ">> Generated 100.0 mutations Killed 90 (90%)",
+                ">> Generated 0100 mutations Killed 90 (90%)",
+                summary + "\n" + summary,
+                summary + "\n>> Generated 101 mutations Killed 90 (89%)",
+                ">> Generated 101 mutations Killed 90 (89%)",
+                ">> Generated 100 mutations Killed 89 (89%)",
+            ):
+                path.write_text(output)
+                with self.subTest(output=output), self.assertRaises(ValueError):
+                    mutation.check_native_summary(path, mutation.file_record(path), result)
+                path.write_text(subtotal + summary + "\n")
+                mutation.check_native_summary(path, mutation.file_record(path), result)
+
+    def test_rounded_native_percentage_never_supplies_floor_credit(self):
+        floors, _ = quality.money_policy(SyntheticStrategy())
+        result = MutationPolicyTest().result(89999, 100000)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "engine.log"
+            path.write_text(">> Generated 100000 mutations Killed 89999 (90%)\n")
+            mutation.check_native_summary(path, mutation.file_record(path), result)
+            with self.assertRaisesRegex(ValueError, "below the accepted floor"):
+                mutation.enforce(result, floors)
+            result = MutationPolicyTest().result(90000, 100000)
+            path.write_text(">> Generated 100000 mutations Killed 90000 (90%)\n")
+            mutation.check_native_summary(path, mutation.file_record(path), result)
+            mutation.enforce(result, floors)
 
 
 class ProcessBudgetTest(unittest.TestCase):

@@ -207,6 +207,24 @@ def read_report(path, classes, catalogue, sources):
     }
 
 
+def check_native_summary(path, expected, result):
+    if expected is None or file_record(path) != expected:
+        raise ValueError("Mutation native engine log lacks its declared byte/hash binding")
+    summaries = [
+        line for line in path.read_text(encoding="utf-8").splitlines()
+        if re.match(r"^>> Generated\b.*\bmutations\b", line)
+    ]
+    if len(summaries) != 1:
+        raise ValueError("PIT console lacks a unique complete mutation summary")
+    summary = re.fullmatch(r">> Generated (\S+) mutations Killed (\S+) \([0-9]+%\)", summaries[0])
+    if summary is None:
+        raise ValueError("PIT console lacks complete generated/killed numbers")
+    generated = natural_number(summary[1], "native generated")
+    killed = natural_number(summary[2], "native killed")
+    if (generated, killed) != (result["total"], result["counts"]["KILLED"]):
+        raise ValueError("PIT console counts disagree with its complete XML catalogue")
+
+
 def enforce(result, floors):
     floor = floors.get("MUTATION")
     if type(floor) is not int or not 0 < floor <= 100:
@@ -299,7 +317,9 @@ def execute(input_file=ROOT / INPUT_FILE):
             finally:
                 entry["elapsed_seconds"] = round(time.monotonic() - step_start, 6)
             entry["exit_code"] = result.returncode
-            (directory / f"{name}.log").write_text(result.stdout, encoding="utf-8", newline="\n")
+            log = directory / f"{name}.log"
+            log.write_text(result.stdout, encoding="utf-8", newline="\n")
+            record.setdefault("outputs", {})[log.name] = file_record(log)
             return result
 
         tool_path = os.pathsep.join(config["tool_classpath"])
@@ -331,9 +351,7 @@ def execute(input_file=ROOT / INPUT_FILE):
         report = directory / "mutations.xml"
         record["report"] = file_record(report)
         record["result"] = read_report(report, classes, catalogue, sources)
-        generated = re.findall(r"^>> Generated (\d+) mutations", engine.stdout, re.MULTILINE)
-        if generated != [str(record["result"]["total"])]:
-            raise ValueError("PIT console denominator disagrees with its complete XML catalogue")
+        check_native_summary(directory / "engine.log", record["outputs"].get("engine.log"), record["result"])
         if input_snapshot(config) != snapshot:
             raise ValueError("Mutation inputs changed during execution")
         enforce(record["result"], floors)
@@ -419,6 +437,7 @@ def check_latest():
     result = read_report(report, set(record["target_classes"]), record["catalogue"], set(record["target_sources"]))
     if result != record["result"]:
         raise ValueError("Mutation summary does not match its engine report")
+    check_native_summary(provider.safe_path(directory, "engine.log"), record["outputs"].get("engine.log"), result)
     enforce(result, floors)
     print(json.dumps({
         "event": "money_mutation_verified", "run_id": run_id,

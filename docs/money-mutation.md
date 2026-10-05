@@ -12,9 +12,12 @@ It restores the unmodified PIT 1.30.0 built-in FKOTLIN filter while keeping FLOG
 The frozen pre-proposal accepted-provider result at `0d386dfed7b98cadc54e1d05f7e90ea32627225f`
 remains RED: 378 killed out of 441 mutants (85.714286%), 58 survivors and five uncovered mutants.
 That result and all 63 obligations remain history; no old failure is relabelled or waived.
-One ordinary current-AA8 candidate run passes the unchanged numerical gate at
+The original prospective current-AA8 candidate run passed the unchanged numerical gate at
 **309/342 (90.350877%)**, with 28 survivors and five uncovered mutants. This result comes
 from a different measured population, not stronger tests or additional kills.
+Independent QA subsequently rejected frozen source `35267fcf20a0de02760187e8ff72421a78f722ff`
+for the Q1 readback-completeness defect below. Its genuine native result is preserved;
+neither that source decision nor the negative review is overwritten by this correction.
 
 ## Reproduce
 
@@ -284,6 +287,50 @@ No full build, ledger/Postgres test, gate-self-test or native CI run is claimed.
 
 ## Fail-closed reports, diagnostics and budgets
 
+### Q1 native-summary consistency correction
+
+The frozen `35267fc` executor compared the native generated count with XML, but the
+standalone report consumer did not. On an owned copy, removing one survivor and rebinding
+only the XML hashes and parsed summary incorrectly verified 309/341 while the unchanged
+native log still declared 342 generated and 309 killed. This is a report-qualification
+defect, not a claim that the real 309/342 native run was pruned or a financial endpoint
+was exploited. The copied negative fixture is not an additional native run or kill.
+
+Execution and readback now share `check_native_summary`. Both require a preserved
+`engine.log` with its declared byte-size/SHA-256 binding, exactly one complete native
+aggregate summary, and exact agreement of **both Generated and Killed counts** with the
+parsed XML. Per-operator subtotals are not aggregate summaries. Missing, malformed,
+duplicate or conflicting summaries fail, including a Killed-count contradiction with an
+unchanged total. Rebinding XML hashes and its parsed result cannot hide either discrepancy.
+The native rounded percentage supplies no score credit; the existing fraction-based floor
+check remains authoritative. This is cross-artifact consistency checking, not resistance
+to coherent wholesale artifact forgery or cryptographic proof of execution.
+
+The source correction does not change schema 2, features, catalogue, provider, financial controls,
+floors or budgets. The consumer's changed source fingerprint requires fresh native
+evidence; stale-input checks are not bypassed to reuse a prior passing report.
+Frozen `35267fc` remains unpublished/unaccepted, and the corrected head needs fresh
+separate review before Root can clear Q1.
+
+After the old report correctly refused the changed consumer as stale, exactly one ordinary
+corrective Money run, `20261005T185228Z-f3a128bb317d`, passed at **309/342 (90.350877%)**:
+28 survivors, five uncovered mutants and zero timeout/error/incomplete outcomes. Its command
+took 58.737244 seconds and its harness 39.294881 seconds, within the unchanged ceiling.
+All 342 identities, their statuses and source context match the original prospective
+candidate; 61 first-killing-test names differ, so identical execution traces are not claimed.
+There are no new kills, omitted mutants or methodology changes in this correction.
+
+The 35 focused mutation/coverage Python tests pass. The rebound omission, changed Killed
+count at an unchanged total, and missing-log-binding regression first failed on the old
+consumer. Real report-CLI copies then prove the omitted-survivor case changes from incorrect
+exit 0 to exit 1, while byte-exact pristine restoration still verifies 309/342. All 14
+negative current-source CLI cases refuse and both pristine readbacks pass. The original
+native attempts and QA evidence are never edited. The 29 Money controls and full-class
+75/75-line, 83/86-branch coverage are unchanged; original 33/63/61 unresolved populations
+and every historical RED record remain preserved, without waiver.
+
+### Preserved evidence and blocking behavior
+
 Every attempt updates `latest.json` before preflight, including missing-input failures.
 Unique attempt directories retain `run.json`, XML, argument files and native logs. The record
 binds SHA-256 and byte sizes for provider/strategy inputs, source and compiled/runtime
@@ -296,7 +343,8 @@ feature argument, and byte-exact catalogue/engine argument files bound to the ac
 Java command. Missing, legacy, duplicate or contradictory selections are refusals even when
 synthetic report numbers would pass. The changed consumer source is itself fingerprinted.
 
-The native console denominator must agree with complete XML. Missing/duplicate identities,
+The native console generated and killed counts must agree with complete XML in both
+execution and standalone readback, and the native log binding is mandatory. Missing/duplicate identities,
 unknown targets/operators/statuses, truncated XML, false kill evidence, changed inputs,
 modified outputs, failed/latest-stale attempts and unresolved engine errors are refusals.
 Only `KILLED` counts in the numerator. Timeouts and uncovered mutants stay in the denominator
@@ -340,7 +388,8 @@ Control diagnostics use synthetic cases and stable operation/category IDs, never
 records or monetary expected/actual values. The Kotlin value-comparison probe proves a failed
 comparison identifies its case without calling either value's renderer. Native mutation identities and operator descriptions
 remain preserved for review. The focused Python probes include exact-floor success, just-below-floor
-failure without rounding, missing-number failures, restoration, output/input tampering,
+failure without rounding, missing-number failures, restoration, rebound population/status
+changes, required-log/native-summary contradictions, output/input tampering,
 error/no-coverage/timeout accounting, and owned-process cleanup. Their explicitly synthetic
 consumer fixtures are not counted as real PIT mutants or independent-model evidence.
 

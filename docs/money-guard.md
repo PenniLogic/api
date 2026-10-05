@@ -140,6 +140,12 @@ remain unresolved in the measured population. All original 61 and raw AA8 63 obl
 remain historical evidence, not waived findings. The 29 controls and 75/75-line, 83/86-branch
 coverage are unchanged. This local prospective result still requires fresh Core and separate
 QA review and does not establish whole-API, native CI, ledger or release acceptance.
+Independent QA rejected frozen `35267fc` for accepting a rebound, survivor-omitting report
+despite contradictory native counts. The [Q1 correction](money-mutation.md#q1-native-summary-consistency-correction)
+requires the bound native log and exact Generated/Killed-to-XML agreement in both execution
+and readback. The correction has its own current-source native 309/342 result and still
+needs separate admission; it does not change the original genuine record, mutation scope,
+or the prior negative source decision.
 The tests require shape/field rejection and successful valid unordered-key behavior, not exact
 hashes. The old hash-addition mutation no longer exists in the corrected provider and earns no
 current credit. The former unmutated collection defect is covered as successful behavior,
