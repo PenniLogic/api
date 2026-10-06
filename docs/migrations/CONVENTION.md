@@ -88,6 +88,11 @@ normalized UTF-8 bytes per SQL direction. Output is one strict result object,
 at most 65,536 bytes; duplicate keys, multiple values, inconsistent exits,
 unknown fields, changed hashes/order/directions and any stderr block the run.
 Each provider invocation has a ten-second outer deadline and bounded cleanup.
+Cleanup waits for observed descendant exits as well as the provider and its I/O
+workers; sending a termination signal alone does not establish an exit. The
+descendant wait shares the existing two-second I/O cleanup budget after the
+provider's existing two-second exit wait. A cleanup timeout or failed exit
+observation still refuses with `PROCESS_CLEANUP`; it never becomes admission.
 Diagnostics contain static codes, never SQL, policy content, complete process
 output, or exception text. Internal protocol doubles in test sources exercise
 runner/recovery behavior; they are not real provider acceptance. Packaged

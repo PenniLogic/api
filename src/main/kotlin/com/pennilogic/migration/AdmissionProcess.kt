@@ -7,10 +7,12 @@ import java.nio.file.Files
 import java.nio.file.InvalidPathException
 import java.nio.file.Path
 import java.time.Duration
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 /** Internal transport primitive; only the installation builds production commands from fixed, reviewed source. */
 internal class AdmissionProcess(
@@ -90,10 +92,23 @@ internal class AdmissionProcess(
             val interrupted = Thread.interrupted()
             try {
                 val stopped = process.waitFor(2, TimeUnit.SECONDS)
-                val finished = executor.awaitTermination(2, TimeUnit.SECONDS)
+                val cleanupDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+                // A successful kill request is not an acknowledgement that the descendant has exited.
+                CompletableFuture
+                    .allOf(*descendants.values.map { it.onExit() }.toTypedArray())
+                    .get((cleanupDeadline - System.nanoTime()).coerceAtLeast(0), TimeUnit.NANOSECONDS)
+                val finished =
+                    executor.awaitTermination(
+                        (cleanupDeadline - System.nanoTime()).coerceAtLeast(0),
+                        TimeUnit.NANOSECONDS,
+                    )
                 admissionRequire(stopped && finished && descendants.values.none { it.isAlive }, AdmissionReason.PROCESS_CLEANUP)
             } catch (_: InterruptedException) {
                 throw interruptedRefusal()
+            } catch (_: ExecutionException) {
+                throw AdmissionRefused(AdmissionReason.PROCESS_CLEANUP)
+            } catch (_: TimeoutException) {
+                throw AdmissionRefused(AdmissionReason.PROCESS_CLEANUP)
             } finally {
                 if (interrupted) Thread.currentThread().interrupt()
             }

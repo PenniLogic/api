@@ -162,6 +162,7 @@ class AdmissionProcessTest {
 
     @Test
     fun `provider exit does not leave an inherited output pipe or its observed child alive`() {
+        val started = System.nanoTime()
         assertEquals(
             "PROCESS_TIMEOUT",
             assertThrows(AdmissionRefused::class.java) {
@@ -175,6 +176,33 @@ class AdmissionProcessTest {
         )
         val child = Files.readString(directory.resolve("child.pid")).trim().toLong()
         assertFalse(ProcessHandle.of(child).map { it.isAlive }.orElse(false))
+        assertTrue(TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - started) < 6)
+    }
+
+    @Test
+    fun `cleanup also awaits observed children without inherited input or output pipes`() {
+        val unrelated = ProcessBuilder("python", "-I", "-S", "-B", "-c", "import time; time.sleep(60)").start()
+        val started = System.nanoTime()
+        try {
+            val error =
+                assertThrows(AdmissionRefused::class.java) {
+                    run(
+                        "import subprocess,sys,time,pathlib; " +
+                            "child=subprocess.Popen([sys.executable,'-I','-S','-B','-c','import time; time.sleep(60)'], " +
+                            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); " +
+                            "pathlib.Path('child.pid').write_text(str(child.pid)); time.sleep(60)",
+                        timeout = Duration.ofSeconds(1),
+                    )
+                }
+            assertEquals("PROCESS_TIMEOUT", error.code)
+            val child = Files.readString(directory.resolve("child.pid")).trim().toLong()
+            assertFalse(ProcessHandle.of(child).map { it.isAlive }.orElse(false))
+            assertTrue(unrelated.isAlive)
+            assertTrue(TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - started) < 6)
+        } finally {
+            unrelated.destroyForcibly()
+            assertTrue(unrelated.waitFor(5, TimeUnit.SECONDS))
+        }
     }
 
     @Test
