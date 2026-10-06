@@ -76,7 +76,7 @@ class MigrationRunnerPostgresTest {
         assertTrue(applied.require("migration_applied").contains("\"id\":\"V001__create_pennilogic_schema\""))
         applied.require("migration_lock_released")
         assertEquals(1L, database.count("SELECT count(*) FROM pg_namespace WHERE nspname = 'pennilogic'"))
-        assertEquals(1, currentVersion(status(database, shipped)))
+        assertEquals(2, currentVersion(status(database, shipped)))
 
         val emptyReverse = Output()
         assertEquals(
@@ -96,12 +96,21 @@ class MigrationRunnerPostgresTest {
         val populatedReverse = Output()
         assertEquals(0, cli(database, populatedReverse, "migrate-down", "--holder", "test@junit", "--migrations", shipped.toString()))
         assertEquals(2L, database.count("SELECT count(*) FROM public.fixture"))
+        assertEquals(1, currentVersion(status(database, shipped)))
+        assertNull(database.scalar("SELECT to_regclass('pennilogic.entries')"))
+        assertEquals(1L, database.count("SELECT count(*) FROM pg_namespace WHERE nspname = 'pennilogic'"))
+        val completeReverse = Output()
+        assertEquals(
+            0,
+            cli(database, completeReverse, "migrate-down", "--holder", "test@junit", "--migrations", shipped.toString(), "--target", "0"),
+        )
+        assertEquals(2L, database.count("SELECT count(*) FROM public.fixture"))
         assertEquals(0, currentVersion(status(database, shipped)))
         migrate(database, shipped)
         val finalStatus = status(database, shipped)
-        assertEquals(1, currentVersion(finalStatus))
-        assertTrue(finalStatus.contains("\"lastApplied\":{\"version\":1,\"id\":\"V001__create_pennilogic_schema\""))
-        assertEquals(5L, database.count("SELECT count(*) FROM migration_runner.migration_registry"))
+        assertEquals(2, currentVersion(finalStatus))
+        assertTrue(finalStatus.contains("\"lastApplied\":{\"version\":2,\"id\":\"V002__create_ledger\""))
+        assertEquals(10L, database.count("SELECT count(*) FROM migration_runner.migration_registry"))
         assertEquals(1L, database.count("SELECT count(*) FROM migration_runner.migration_lock WHERE holder IS NULL"))
         assertRunnerSchemaHoldsOnlyTheRegistry(database)
     }
@@ -148,7 +157,10 @@ class MigrationRunnerPostgresTest {
         migrate(database, shipped)
         database.execute("CREATE TABLE pennilogic.ledger_probe (id integer)")
         val output = Output()
-        assertEquals(1, cli(database, output, "migrate-down", "--holder", "test@junit", "--migrations", shipped.toString()))
+        assertEquals(
+            1,
+            cli(database, output, "migrate-down", "--holder", "test@junit", "--migrations", shipped.toString(), "--target", "0"),
+        )
         val failed = output.require("migration_failed")
         assertTrue(failed.contains("\"direction\":\"down\""))
         assertTrue(failed.contains("\"sqlState\":\"2BP01\""))
@@ -367,6 +379,107 @@ class MigrationRunnerPostgresTest {
         assertEquals(2, currentVersion(recovered))
         assertFalse(recovered.contains("\"state\":\"failed\""))
         assertEquals(3L, database.count("SELECT count(*) FROM migration_runner.migration_registry"))
+    }
+
+    @Test
+    fun `status labels failed attempts independently of effective versions and successful retries`() {
+        val database = TestDatabase.fresh()
+        val migrations = directory.resolve("migrations")
+        Fixtures.write(
+            migrations,
+            "V001__status_target",
+            Fixtures.header() + "CREATE TABLE public.status_target (id integer PRIMARY KEY);\n",
+            "DROP TABLE public.status_target RESTRICT;\n",
+        )
+        val set = MigrationSet.load(migrations)
+        val migration = set.migrations.single()
+        val statusFile = directory.resolve("status.json")
+        database.connect().use { connection ->
+            val runner = MigrationRunner(connection, set, Identity("status@junit", "fixture", 1), Duration.ofSeconds(60)) {}
+            val registry = Registry(connection)
+
+            fun assertStatus(
+                label: String,
+                version: Int,
+                applied: RegistryRow?,
+                attempt: RegistryRow,
+            ) {
+                val snapshot = runner.snapshot()
+                assertEquals(version, snapshot.currentVersion)
+                assertEquals(applied, snapshot.states.getValue(1).appliedRow)
+                assertEquals(attempt, snapshot.states.getValue(1).lastAttempt)
+                assertNull(snapshot.lock)
+                val report = runner.status()
+                assertEquals(version, report["currentVersion"])
+                assertEquals(
+                    applied?.let { linkedMapOf("version" to it.version, "id" to it.id) + it.attempt() },
+                    report["lastApplied"],
+                )
+                val record = (report.getValue("migrations") as List<*>).single() as Map<*, *>
+                assertEquals(attempt.attempt(), record["lastAttempt"])
+                val output = Output()
+                assertEquals(
+                    0,
+                    cli(database, output, "status", "--migrations", migrations.toString(), "--status-file", statusFile.toString()),
+                )
+                assertEquals(Json.encode(report) + "\n", Files.readString(statusFile))
+                assertEquals(Json.encode(linkedMapOf("event" to "migration_status") + report), output.require("migration_status"))
+                println(
+                    Json.event(
+                        "migration_status_case",
+                        "expectedState" to label,
+                        "state" to record["state"],
+                        "currentVersion" to version,
+                        "lastAttempt" to attempt.attempt(),
+                    ),
+                )
+                assertEquals(label, record["state"])
+                assertEquals(label, snapshot.states.getValue(1).label)
+            }
+
+            migrate(database, migrations)
+            val applied = registry.rows().single()
+            assertStatus("applied", 1, applied, applied)
+            database.execute("CREATE VIEW public.status_dependency AS SELECT id FROM public.status_target")
+            val down = Output()
+            assertEquals(1, cli(database, down, "migrate-down", "--holder", "status@junit", "--migrations", migrations.toString()))
+            val failedDown = registry.rows().last()
+            assertEquals(RowState.FAILED, failedDown.state)
+            assertEquals("down", failedDown.direction)
+            assertEquals("2BP01", failedDown.failure?.sqlState)
+            down.require("migration_lock_released")
+            assertStatus("failed", 1, applied, failedDown)
+            assertTrue(migrate(database, migrations).require("migration_plan").contains("\"steps\":[]"))
+            assertEquals(listOf(applied, failedDown), registry.rows())
+            assertStatus("failed", 1, applied, failedDown)
+
+            database.execute("DROP VIEW public.status_dependency")
+            val retryDown = Output()
+            assertEquals(0, cli(database, retryDown, "migrate-down", "--holder", "status@junit", "--migrations", migrations.toString()))
+            val reversed = registry.rows().last()
+            assertEquals(RowState.REVERSED, reversed.state)
+            assertStatus("reversed", 0, null, reversed)
+
+            database.execute("CREATE TABLE public.status_target (id integer PRIMARY KEY)")
+            val up = Output()
+            assertEquals(1, cli(database, up, "migrate", "--holder", "status@junit", "--migrations", migrations.toString()))
+            val failedUp = registry.rows().last()
+            assertEquals(RowState.FAILED, failedUp.state)
+            assertEquals("up", failedUp.direction)
+            assertEquals("42P07", failedUp.failure?.sqlState)
+            up.require("migration_lock_released")
+            assertStatus("failed", 0, null, failedUp)
+
+            database.execute("DROP TABLE public.status_target RESTRICT")
+            migrate(database, migrations)
+            val reapplied = registry.rows().last()
+            assertEquals(RowState.APPLIED, reapplied.state)
+            assertStatus("applied", 1, reapplied, reapplied)
+            val history = registry.rows()
+            assertEquals(listOf(applied, failedDown, reversed, failedUp, reapplied), history)
+            assertEquals(listOf("up", "down", "down", "up", "up"), history.map { it.direction })
+            assertTrue(history.all { it.checksum == migration.checksum && it.reversalChecksum == migration.reversal.checksum })
+        }
     }
 
     @Test
@@ -742,7 +855,7 @@ class MigrationRunnerPostgresTest {
         assertEquals(0, process.exitValue(), text)
         assertTrue(text.contains("\"event\":\"migration_applied\""))
         assertFalse(text.contains(database.password))
-        assertEquals(1, currentVersion(status(database, shipped)))
+        assertEquals(2, currentVersion(status(database, shipped)))
     }
 
     @Test
@@ -760,8 +873,9 @@ class MigrationRunnerPostgresTest {
                 )
             assertEquals(0, runner.migrate(null, includeContract = false, dryRun = false))
             val snapshot = runner.snapshot()
-            assertEquals(1, snapshot.currentVersion)
+            assertEquals(2, snapshot.currentVersion)
             assertEquals("applied", snapshot.states.getValue(1).label)
+            assertEquals("applied", snapshot.states.getValue(2).label)
             assertNull(snapshot.lock)
             assertEquals(0, runner.migrateDown(0, dryRun = false))
             assertEquals(
@@ -779,9 +893,10 @@ class MigrationRunnerPostgresTest {
                 "migration_plan",
                 "migration_lock_claimed",
                 "migration_applied",
+                "migration_applied",
                 "migration_lock_released",
             ),
-            events.take(4).map {
+            events.take(5).map {
                 it.substringAfter("\"event\":\"").substringBefore('"')
             },
         )
