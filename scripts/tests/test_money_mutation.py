@@ -1,9 +1,12 @@
 """Synthetic report probes test the consumer, never stand in for real PIT results."""
 
 from collections import Counter
+import errno
+import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -124,6 +127,135 @@ class MutationPolicyTest(unittest.TestCase):
             del provider.strategy["pipeline_budgets"][name]
             with self.assertRaisesRegex(ValueError, "numeric"):
                 quality.money_budget(provider)
+
+
+class RuntimeFingerprintTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        names = (
+            "build.gradle.kts", "settings.gradle.kts", "gradle.lockfile",
+            "gradle/verification-metadata.xml", "scripts/quality.py", "scripts/process_budget.py",
+            "scripts/money_mutation.py", "scripts/PitCatalogue.java", "scripts/money_provider.py",
+            "scripts/check_money.py", "provider/source/example.kt", "provider/strategy.json",
+            "provider/output.kt", "src/main/kotlin/Example.kt", "compiled/Money.class",
+            "classpath/Test.class", "tool.jar", "runtime-image",
+        )
+        for name in names:
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"synthetic fingerprint input")
+        self.executable = self.root / "runtime-image"
+        self.executable.chmod(0o755)
+        provider = Mock()
+        provider.BUNDLE = Path("provider")
+        provider.SOURCE_FILES = ("example.kt",)
+        provider.STRATEGY_FILE = Path("strategy.json")
+        provider.verify_outputs.return_value = [self.root / "provider/output.kt"]
+        self.enterContext(patch.object(mutation, "ROOT", self.root))
+        self.enterContext(patch.object(quality, "money_provider_module", return_value=provider))
+        self.enterContext(patch.object(
+            quality, "money_class_inventory", return_value={"Money": self.root / "compiled/Money.class"},
+        ))
+        self.config = {
+            "java": str(self.executable),
+            "tool_classpath": [str(self.root / "tool.jar")],
+            "test_classpath": [str(self.root / "classpath")],
+        }
+
+    def link(self, path, target):
+        try:
+            path.symlink_to(target, target_is_directory=target.is_dir())
+        except OSError as error:
+            if error.errno in (errno.EPERM, errno.EACCES) or getattr(error, "winerror", None) == 1314:
+                self.skipTest("Creating filesystem symlinks is not permitted on this host")
+            raise
+
+    def test_selected_python_and_java_binaries_are_both_fingerprinted(self):
+        snapshot = mutation.input_snapshot(self.config)
+        python = Path(sys.executable).resolve(strict=True)
+        for executable in (python, self.executable):
+            data = executable.read_bytes()
+            self.assertEqual(
+                {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}, snapshot[str(executable)],
+            )
+
+    def test_runtime_link_chain_and_retargeted_endpoint_or_bytes_change_snapshot(self):
+        middle, selected = self.root / "middle", self.root / "any-runtime-name"
+        self.link(middle, self.executable)
+        self.link(selected, middle)
+        self.config["java"] = str(selected)
+        original = mutation.input_snapshot(self.config)
+        self.assertIn(str(self.executable), original)
+        self.assertNotIn(str(selected), original)
+        self.assertNotIn(str(middle), original)
+        replacement = self.root / "another-image"
+        replacement.write_bytes(self.executable.read_bytes())
+        replacement.chmod(0o755)
+        middle.unlink()
+        self.link(middle, replacement)
+        self.assertNotEqual(original, mutation.input_snapshot(self.config))
+        middle.unlink()
+        self.link(middle, self.executable)
+        self.assertEqual(original, mutation.input_snapshot(self.config))
+        self.executable.write_bytes(b"changed synthetic executable")
+        self.assertNotEqual(original, mutation.input_snapshot(self.config))
+
+    def test_missing_relative_directory_broken_or_cyclic_runtime_refuses(self):
+        broken, cycle = self.root / "broken", self.root / "cycle"
+        self.link(broken, self.root / "absent")
+        self.link(cycle, cycle)
+        for path in (self.root / "absent", Path("runtime-image"), self.root, broken, cycle):
+            with self.subTest(path=path), self.assertRaises((ValueError, OSError, RuntimeError)):
+                mutation.runtime_executable(path)
+        self.assertEqual(self.executable, mutation.runtime_executable(self.executable))
+
+    @unittest.skipIf(os.name == "nt", "Windows chmod does not express POSIX executable permissions")
+    def test_non_executable_runtime_refuses_and_permission_restoration_passes(self):
+        self.executable.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "executable regular file"):
+            mutation.input_snapshot(self.config)
+        self.executable.chmod(0o755)
+        self.assertIn(str(self.executable), mutation.input_snapshot(self.config))
+
+    def test_source_provider_and_class_files_still_refuse_links(self):
+        for name in (
+            "build.gradle.kts", "src/main/kotlin/Example.kt", "provider/output.kt",
+            "compiled/Money.class", "classpath/Test.class",
+        ):
+            path = self.root / name
+            original = path.read_bytes()
+            path.unlink()
+            self.link(path, self.executable)
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "missing or linked"):
+                mutation.input_snapshot(self.config)
+            path.unlink()
+            path.write_bytes(original)
+            mutation.input_snapshot(self.config)
+
+    def test_runtime_resolution_does_not_exempt_linked_classpath_roots_or_descendants(self):
+        selected = self.root / "shared-alias"
+        self.link(selected, self.executable)
+        self.config["java"] = str(selected)
+        self.config["tool_classpath"] = [str(selected)]
+        with self.assertRaisesRegex(ValueError, "unsafe or unsupported"):
+            mutation.input_snapshot(self.config)
+        self.config["tool_classpath"] = [str(self.root / "tool.jar")]
+        descendant = self.root / "classpath/linked"
+        self.link(descendant, self.root / "compiled")
+        with self.assertRaisesRegex(ValueError, "contains a link"):
+            mutation.input_snapshot(self.config)
+        descendant.unlink()
+        mutation.input_snapshot(self.config)
+
+    def test_report_outputs_do_not_gain_runtime_link_resolution(self):
+        output = self.root / "engine.log"
+        self.link(output, self.executable)
+        with self.assertRaisesRegex(ValueError, "missing or linked"):
+            mutation.file_record(output)
+        output.unlink()
+        output.write_text(">> Generated 100 mutations Killed 90 (90%)\n")
+        binding = mutation.file_record(output)
+        mutation.check_native_summary(output, binding, MutationPolicyTest().result(90, 100))
 
 
 class MutationReportTest(unittest.TestCase):

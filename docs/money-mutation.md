@@ -293,6 +293,37 @@ No full build, ledger/Postgres test, gate-self-test or native CI run is claimed.
 
 ## Fail-closed reports, diagnostics and budgets
 
+### Linux runtime executable aliases
+
+The first hosted Linux run of frozen `aa8c0cc97cac6c16f49b4a2c68c2ac65f70cc268`
+([#94](https://github.com/PenniLogic/api/pull/94), run `37399230953`) failed before PIT
+with `Mutation input or output is missing or linked`. Preparation, all 29 Money controls
+and package coverage had passed; Python discovery and explicit-base coverage were not reached.
+That failed CI result is preserved, not reclassified as a rate limit or timeout.
+
+The original fingerprint treated `sys.executable` as a source artifact that must not be a link.
+A real CPython 3.14.7 Linux reproduction reaches exactly that refusal at
+`/usr/local/bin/python -> python3 -> python3.14`, with no PIT process started.
+The pinned hosted setup-python action selects `<pythonLocation>/bin/python`; its log gives
+`/opt/hostedtoolcache/Python/3.14.7/x64`. The hosted filesystem itself was not retained,
+so the local reproduction does not claim to have read its exact symlink target or binary hash.
+
+Only the two selected runtime executables, Java from the Gradle toolchain and Python from
+`sys.executable`, are now resolved strictly before fingerprinting. Each must resolve from an
+absolute path to an executable regular file. The canonical path, byte size and SHA-256 of the
+actual binary remain in the input inventory. Resolution is repeated for both end-of-run and
+standalone readback snapshots: retargeting to a different canonical path, even with identical
+bytes, or changing the binary bytes makes the old result stale. Missing/broken/cyclic targets,
+directories, relative selections and non-executable targets fail rather than fall back.
+
+This is not a general link exemption or a path/name allowlist. Tracked source, provider files,
+compiled classes, classpath roots/descendants and report outputs retain their existing link
+refusals. Java still launches through the recorded selected toolchain path; no executable,
+test, source or report is copied to bypass a check. The source fingerprint requires new
+native evidence. Feature selection, catalogue, package floors, budgets and strict terminal
+freshness are unchanged. These snapshots are not an attestation of all runtime libraries
+or protection against a hostile concurrent binary/link replacement.
+
 ### Terminal freshness after full coverage
 
 The preserved local candidate sequence at frozen `6e89aedb87a56a3ee9894180ef946e018e50f487`
