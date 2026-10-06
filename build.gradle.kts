@@ -23,7 +23,61 @@ application {
     mainClass.set("com.pennilogic.bootstrap.ApplicationKt")
 }
 
+val prepareAcceptedSource =
+    tasks.register<Exec>("prepareMoneyProvider") {
+        description = "Verifies and prepares the immutable accepted Contracts Money source, not a release."
+        group = "verification"
+        workingDir(rootDir)
+        commandLine("python", "scripts/money_provider.py")
+    }
+
+val moneyGuard =
+    tasks.register<Exec>("moneyGuard") {
+        description = "Rejects unsafe monetary JVM fields, numeric serializers and raw minor-unit arithmetic."
+        group = "verification"
+        workingDir(rootDir)
+        commandLine("python", "scripts/check_money.py")
+        dependsOn(prepareAcceptedSource)
+    }
+
+val acceptedSourceSet =
+    sourceSets.create("contractsMoney") {
+        java.setSrcDirs(emptyList<String>())
+        kotlin.srcDir(layout.buildDirectory.dir("contracts-money/kotlin/src/main/kotlin"))
+    }
+
+tasks.named("compileContractsMoneyKotlin") {
+    dependsOn(moneyGuard)
+}
+
+val acceptedSourceJar =
+    tasks.register<Jar>("contractsMoneyJar") {
+        description = "Packages the accepted immutable Money source for this local API build only."
+        from(acceptedSourceSet.output)
+        archiveBaseName.set("pennilogic-contracts-money-source-aa8d90c")
+        manifest {
+            attributes(
+                "Source-Repository" to "PenniLogic/contracts",
+                "Source-Commit" to "aa8d90cb98cec9b6dd08c91b3a4d869e47362662",
+                "Provider-Kind" to "accepted-source-only",
+            )
+        }
+    }
+
+val mutationTool = configurations.create("moneyMutationTool")
+
+tasks.named("compileKotlin") {
+    dependsOn(moneyGuard)
+}
+
+tasks.named("compileTestKotlin") {
+    dependsOn(moneyGuard)
+}
+
 dependencies {
+    implementation(files(acceptedSourceJar))
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
+    add(acceptedSourceSet.implementationConfigurationName, "org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
     implementation(platform("io.ktor:ktor-bom:3.5.2"))
     implementation("io.ktor:ktor-server-core")
     implementation("io.ktor:ktor-server-netty")
@@ -33,6 +87,10 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter")
     testImplementation("io.ktor:ktor-server-test-host")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    mutationTool("org.pitest:pitest-command-line:1.30.0")
+    mutationTool("org.pitest:pitest-junit5-plugin:1.2.3")
+    mutationTool(platform("org.junit:junit-bom:6.1.3"))
+    mutationTool("org.junit.platform:junit-platform-launcher")
 }
 
 dependencyLocking {
@@ -68,11 +126,96 @@ tasks.test {
     )
     // Pinned so migration timestamps and the Postgres session never depend on the machine's zone database.
     systemProperty("user.timezone", "UTC")
+    systemProperty(
+        "pennilogic.money.source",
+        layout.buildDirectory
+            .dir("contracts-money/source")
+            .get()
+            .asFile.path,
+    )
+    inputs.dir(layout.buildDirectory.dir("contracts-money/source/spec"))
     testLogging {
         events("failed", "skipped")
     }
     finalizedBy(tasks.jacocoTestReport)
 }
+
+val targetedMoneyTest =
+    tasks.register<Test>("moneyTest") {
+        description = "Runs the actual immutable Money dependency's source-seam and arithmetic tests."
+        group = "verification"
+        testClassesDirs =
+            sourceSets.test
+                .get()
+                .output.classesDirs
+        classpath = sourceSets.test.get().runtimeClasspath
+        outputs.upToDateWhen { false }
+        outputs.cacheIf { false }
+        useJUnitPlatform()
+        include("com/pennilogic/money/**")
+        systemProperty(
+            "pennilogic.money.source",
+            layout.buildDirectory
+                .dir("contracts-money/source")
+                .get()
+                .asFile.path,
+        )
+        inputs.dir(layout.buildDirectory.dir("contracts-money/source/spec"))
+        testLogging {
+            events("failed", "skipped")
+        }
+    }
+
+val acceptedCoverageReport =
+    tasks.register<JacocoReport>("moneyCoverageReport") {
+        description = "Measures every compiled class of the immutable Contracts Money source dependency."
+        group = "verification"
+        dependsOn(targetedMoneyTest)
+        executionData.setFrom(layout.buildDirectory.file("jacoco/moneyTest.exec"))
+        classDirectories.setFrom(acceptedSourceSet.output.classesDirs)
+        sourceDirectories.setFrom(acceptedSourceSet.allSource.sourceDirectories)
+        reports {
+            xml.required.set(true)
+            html.required.set(true)
+        }
+    }
+
+val acceptedCoverageCheck =
+    tasks.register<Exec>("moneyCoverageCheck") {
+        description = "Qualifies the full Money package against the exact accepted Docs line and branch floors."
+        group = "verification"
+        dependsOn(acceptedCoverageReport)
+        workingDir(rootDir)
+        commandLine("python", "scripts/quality.py", "money-coverage-report")
+    }
+
+val acceptedMutationCheck =
+    tasks.register<Exec>("moneyMutation") {
+        description = "Runs the complete PIT Money catalogue and enforces the exact accepted package floor and budget."
+        group = "verification"
+        dependsOn(acceptedCoverageCheck)
+        workingDir(rootDir)
+        val inputFile = layout.buildDirectory.file("money-mutation-input.json")
+        val launcher = javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(21)) }
+        val toolClasspath = mutationTool.incoming.files
+        val targetClasspath = acceptedSourceSet.output.classesDirs + sourceSets.test.get().runtimeClasspath - files(acceptedSourceJar)
+        doFirst {
+            val inputs =
+                mapOf(
+                    "java" to
+                        launcher
+                            .get()
+                            .executablePath.asFile.absolutePath,
+                    "tool_classpath" to toolClasspath.files.map { it.absolutePath }.sorted(),
+                    "test_classpath" to
+                        targetClasspath.files
+                            .filter { it.exists() }
+                            .map { it.absolutePath },
+                )
+            inputFile.get().asFile.writeText(groovy.json.JsonOutput.toJson(inputs) + "\n")
+        }
+        commandLine("python", "scripts/money_mutation.py", "run", "--input-file", inputFile.get().asFile.path)
+    }
 
 // Digest-pinned image for the disposable migration test database (PostgreSQL 17.11).
 val postgresImage = "postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f"
@@ -280,6 +423,7 @@ registerMigrationTask("migrateStatus", "Prints the registry state: current versi
 tasks.jacocoTestReport {
     dependsOn(tasks.test)
     mustRunAfter(integrationTest)
+    mustRunAfter(targetedMoneyTest)
     // Merge every test task's execution data that exists; a skipped integrationTest leaves none behind.
     executionData.setFrom(fileTree(layout.buildDirectory.dir("jacoco")) { include("*.exec") })
     reports {
@@ -290,6 +434,7 @@ tasks.jacocoTestReport {
 
 tasks.jacocoTestCoverageVerification {
     dependsOn(tasks.jacocoTestReport)
+    mustRunAfter(targetedMoneyTest)
     executionData.setFrom(fileTree(layout.buildDirectory.dir("jacoco")) { include("*.exec") })
     val docker = dockerAvailable
     val ci = providers.environmentVariable("CI")
@@ -318,7 +463,15 @@ tasks.jacocoTestCoverageVerification {
 }
 
 tasks.check {
-    dependsOn(tasks.spotlessCheck, tasks.jacocoTestCoverageVerification, integrationTest, migrationConventionCheck)
+    dependsOn(
+        moneyGuard,
+        acceptedCoverageCheck,
+        acceptedMutationCheck,
+        tasks.spotlessCheck,
+        tasks.jacocoTestCoverageVerification,
+        integrationTest,
+        migrationConventionCheck,
+    )
 }
 
 tasks.withType<AbstractArchiveTask>().configureEach {

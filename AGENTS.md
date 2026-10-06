@@ -32,6 +32,10 @@ cannot approve its own PR. Never invent another GitHub reviewer.
 ```text
 python scripts/setup.py
 python scripts/check_repository.py
+python scripts/materialize_money_sources.py
+python scripts/money_provider.py --source-root "build/source-materialization/contracts-aa8d90cb98cec9b6dd08c91b3a4d869e47362662" --strategy-file "build/source-materialization/docs-a700e639585c61a4610e7b99dbd02b2dab28bdcc/governance/test-strategy.json"
+python scripts/money_provider.py --verify
+python scripts/materialize_money_sources.py --verify
 python scripts/quality.py build
 python -m unittest discover -s scripts/tests
 ```
