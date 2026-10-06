@@ -356,6 +356,7 @@ def gate_self_test(artifact_dir):
         "gradlew", "gradlew.bat", "gradle.lockfile", "gradle", "src", "scripts/check_money.py",
         "scripts/money_provider.py", "build/contracts-money/source",
         "scripts/prepare_database_admission.py", "scripts/materialize_money_sources.py", "build/database-admission",
+        "database/admission-inventory.json",
         "scripts/quality.py", "build/contracts-money/strategy",
         "scripts/money_mutation.py", "scripts/process_budget.py", "scripts/PitCatalogue.java",
         MONEY_BASELINE,

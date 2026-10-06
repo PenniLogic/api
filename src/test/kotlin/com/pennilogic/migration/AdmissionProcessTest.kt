@@ -6,8 +6,10 @@ import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.attribute.PosixFilePermission
 import java.time.Duration
 import java.util.concurrent.TimeUnit
 
@@ -26,13 +28,82 @@ class AdmissionProcessTest {
         val result =
             run(
                 "import os,sys; data=sys.stdin.buffer.read(); " +
-                    "forbidden=['GH_TOKEN','GITHUB_TOKEN','MIGRATION_DB_PASSWORD','PYTHONPATH','PYTHONHOME','PATH']; " +
+                    "forbidden=['GH_TOKEN','GITHUB_TOKEN','MIGRATION_DB_PASSWORD'," +
+                    "'PYTHONPATH','PYTHONHOME','PATH','LD_LIBRARY_PATH','LD_PRELOAD']; " +
                     "assert not any(k in os.environ for k in forbidden); " +
                     "sys.stdout.buffer.write(data)",
                 "{\"opaque\":\"synthetic\"}".toByteArray(),
             )
         assertEquals(0, result.exitCode)
         assertEquals("{\"opaque\":\"synthetic\"}", result.stdout.toString(Charsets.UTF_8))
+    }
+
+    @Test
+    fun `isolated Python receives an absolute program name and can launch its own interpreter`() {
+        val result =
+            run(
+                """
+                import os, subprocess, sys
+                environment = {key: value for key, value in os.environ.items() if key.casefold() == 'systemroot'}
+                child = subprocess.run(
+                    [sys.executable, '-I', '-S', '-B', '-c',
+                     'import os,sys; assert os.path.isabs(sys.orig_argv[0]); '
+                     'assert not any(name in os.environ for name in sys.argv[1:]); sys.stdout.buffer.write(sys.stdin.buffer.read())',
+                     'PATH', 'LD_LIBRARY_PATH', 'LD_PRELOAD', 'PYTHONPATH', 'PYTHONHOME',
+                     'GH_TOKEN', 'GITHUB_TOKEN', 'MIGRATION_DB_PASSWORD'],
+                    input=sys.stdin.buffer.read(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    env=environment, timeout=2, check=False)
+                sys.stdout.write(str(os.path.isabs(sys.orig_argv[0])) + '/' + str(os.path.isabs(sys.executable)) +
+                                 '/' + str(child.returncode) + '/' + str(bool(child.stderr)) + '/')
+                sys.stdout.flush()
+                sys.stdout.buffer.write(child.stdout)
+                """.trimIndent(),
+            )
+        assertEquals(0, result.exitCode)
+        assertEquals("True/True/0/False/{}", result.stdout.toString(Charsets.UTF_8))
+    }
+
+    @Test
+    fun `managed Python lookup uses the first executable in absolute parent search directories`() {
+        val installed = Path.of(AdmissionProcess.pythonExecutable(System.getenv("PATH")))
+        assertTrue(installed.isAbsolute)
+        val first = Files.createDirectory(directory.resolve("first"))
+        val second = Files.createDirectory(directory.resolve("second"))
+        val firstFile = Files.createFile(first.resolve(installed.fileName))
+        val secondFile = Files.createFile(second.resolve(installed.fileName))
+        assertTrue(firstFile.toFile().setExecutable(true))
+        assertTrue(secondFile.toFile().setExecutable(true))
+        val searchPath =
+            listOf("", ".", "relative", directory.resolve("absent").toString(), first.toString(), second.toString())
+                .joinToString(File.pathSeparator)
+        assertEquals(firstFile.toString(), AdmissionProcess.pythonExecutable(searchPath))
+        assertEquals(
+            secondFile.toString(),
+            AdmissionProcess.pythonExecutable(listOf(second, first).joinToString(File.pathSeparator)),
+        )
+        if (Files.getFileStore(directory).supportsFileAttributeView("posix")) {
+            Files.setPosixFilePermissions(firstFile, setOf(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE))
+            assertEquals(secondFile.toString(), AdmissionProcess.pythonExecutable(searchPath))
+        }
+    }
+
+    @Test
+    fun `missing relative malformed and directory-only Python candidates refuse without path disclosure`() {
+        val installed = Path.of(AdmissionProcess.pythonExecutable(System.getenv("PATH")))
+        Files.createDirectory(directory.resolve(installed.fileName))
+        for (searchPath in listOf(
+            null,
+            "",
+            ".",
+            "relative",
+            directory.resolve("missing-sensitive-marker").toString(),
+            directory.toString(),
+            "sensitive-marker\u0000",
+        )) {
+            val error = assertThrows(AdmissionRefused::class.java) { AdmissionProcess.pythonExecutable(searchPath) }
+            assertEquals("PROCESS_START", error.code)
+            assertFalse(error.toString().contains("sensitive-marker"))
+        }
     }
 
     @Test

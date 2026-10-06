@@ -16,7 +16,7 @@ SPEC.loader.exec_module(quality)
 
 
 class GateSelfTestAdmissionCopyTest(unittest.TestCase):
-    def test_real_temp_copy_verifies_admission_offline_before_the_first_gradle_call(self):
+    def test_real_temp_copy_preserves_inventory_and_verifies_admission_before_the_first_gradle_call(self):
         class CopyVerified(Exception):
             pass
 
@@ -29,12 +29,17 @@ class GateSelfTestAdmissionCopyTest(unittest.TestCase):
             for name in (
                 "scripts/prepare_database_admission.py", "scripts/materialize_money_sources.py",
                 "src/main/resources/database-admission-installation.json",
+                "database/admission-inventory.json",
             ):
                 self.assertEqual(
                     hashlib.sha256((quality.ROOT / name).read_bytes()).hexdigest(),
                     hashlib.sha256((root / name).read_bytes()).hexdigest(),
-                    "the self-test copy changed its pinned executable or resource",
+                    "the self-test copy changed a required inventory or pinned installation file",
                 )
+            inventory = json.loads((root / "database/admission-inventory.json").read_text(encoding="utf-8"))
+            columns = [column for script in inventory["scripts"] for column in script["columns"]]
+            self.assertEqual(70, len(columns))
+            self.assertEqual(70, len({column["name"]: column["sql_type"] for column in columns}))
 
             def snapshot(directory):
                 return {

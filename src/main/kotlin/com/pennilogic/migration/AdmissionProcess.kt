@@ -1,7 +1,10 @@
 package com.pennilogic.migration
 
+import java.io.File
 import java.io.IOException
 import java.io.InputStream
+import java.nio.file.Files
+import java.nio.file.InvalidPathException
 import java.nio.file.Path
 import java.time.Duration
 import java.util.concurrent.ExecutionException
@@ -23,7 +26,13 @@ internal class AdmissionProcess(
             input.size <= DatabaseAdmission.REQUEST_LIMIT && prefix.size <= DatabaseAdmission.REQUEST_LIMIT,
             AdmissionReason.INPUT_INVALID,
         )
-        val builder = ProcessBuilder(command).directory(directory.toFile())
+        val executableCommand =
+            if (command.firstOrNull() == "python") {
+                listOf(pythonExecutable(System.getenv("PATH"))) + command.drop(1)
+            } else {
+                command
+            }
+        val builder = ProcessBuilder(executableCommand).directory(directory.toFile())
         builder.environment().keys.retainAll(sortedSetOf(String.CASE_INSENSITIVE_ORDER, "SystemRoot"))
         val process =
             try {
@@ -118,5 +127,23 @@ internal class AdmissionProcess(
         val remaining = deadline - System.nanoTime()
         admissionRequire(remaining > 0, AdmissionReason.PROCESS_TIMEOUT)
         return remaining
+    }
+
+    companion object {
+        // POSIX CPython needs an absolute argv[0] to retain sys.executable when its PATH is cleared.
+        internal fun pythonExecutable(searchPath: String?): String {
+            val name = if (File.separatorChar == '\\') "python.exe" else "python"
+            try {
+                for (directory in searchPath.orEmpty().split(File.pathSeparator)) {
+                    val parent = Path.of(directory)
+                    if (!parent.isAbsolute) continue
+                    val candidate = parent.resolve(name)
+                    if (Files.isRegularFile(candidate) && Files.isExecutable(candidate)) return candidate.toString()
+                }
+            } catch (_: InvalidPathException) {
+                throw AdmissionRefused(AdmissionReason.PROCESS_START)
+            }
+            throw AdmissionRefused(AdmissionReason.PROCESS_START)
+        }
     }
 }

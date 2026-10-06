@@ -37,6 +37,15 @@ environment; the provider never executes SQL. There is no caller command,
 policy path, accepted flag, or missing-adapter fallback. The fixed protocol
 runtime identifies the source admission target, not evidence of a deployment.
 
+The API resolves the fixed managed `python` executable from absolute directories
+in the host's existing `PATH` before clearing the child environment. It starts
+Python with an absolute program name so isolated POSIX Python retains
+`sys.executable` for the canonical provider subprocess. Empty or relative search
+directories are not a fallback. Neither `PATH` nor dynamic-loader or Python
+environment overrides are forwarded; missing or invalid runtime discovery
+refuses with `PROCESS_START`. The interpreter remains part of the managed-host
+setup, not an attested executable or a caller-selectable admission option.
+
 **Source-only boundary:** absent, unaccepted (`binding: null`), changed or
 invalid installation inputs refuse with `migration_admission_refused` and
 exit 1. This includes `validate` and `status`, because they also load the
