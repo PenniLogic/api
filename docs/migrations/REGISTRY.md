@@ -2,11 +2,13 @@
 
 The registry is two tables in the runner-owned schema `migration_runner` —
 `migration_runner.migration_registry` and `migration_runner.migration_lock` — bootstrapped
-idempotently (`CREATE SCHEMA IF NOT EXISTS`, `CREATE TABLE IF NOT EXISTS`) at the
-start of every writing command. They are infrastructure, like a schema-history
+idempotently (`CREATE SCHEMA IF NOT EXISTS`, `CREATE TABLE IF NOT EXISTS`) after
+successful admission and planning for every writing command. They are infrastructure, like a schema-history
 table, not migrations: they must exist before the first migration so that even
 V001 is applied under the lock and recorded with its checksum. `--dry-run` never
-bootstraps them.
+bootstraps them. A refused admission cannot create either table, repair its lock
+singleton, acquire/release a lock, or append an attempt. No-op and all-held writes
+must admit an empty selection before the existing bootstrap repair is allowed.
 
 Every statement the runner issues names the schema explicitly, including the
 `to_regclass('migration_runner.migration_registry')` existence probe, so the registry
@@ -128,6 +130,7 @@ Every line the runner prints is one JSON object with an `event` field:
 | --- | --- |
 | `migration_set` | `validate` succeeded; carries every record. |
 | `migration_validation_failed` | A convention rule failed; `file`, `rule`. |
+| `migration_admission_refused` | Missing/changed source, policy denial, invalid protocol or failed bounded process; static `code` only, exit 1. No provider output or SQL is included. |
 | `migration_plan` | Before any write: `command`, `dryRun`, `currentVersion`, `targetVersion`, `steps[]` with `action` `apply`, `hold` or `reverse`. |
 | `migration_lock_claimed`, `migration_lock_released`, `migration_lock_refused` | Lock lifecycle; payload above. |
 | `migration_lock_release_mismatch` | The runner's own claim was gone at release time (someone force-released it while it ran); the run exits 1. |
@@ -141,6 +144,11 @@ Every line the runner prints is one JSON object with an `event` field:
 | `database_error` | A database error outside a migration (connection, bootstrap); codes only. |
 | `runner_error` | An internal invariant failed (a missing lock row, a script that ended its own transaction) or a file could not be written (`--status-file`). |
 | `usage_error` | Bad arguments or missing environment; exit 2. |
+
+`migration_plan` is a description, not a reusable authorization token or a
+claim that SQL ran. Source changes after plan emission still stop execution.
+Public `validate` and `status` also require an admitted set; an unavailable
+installation does not produce a success-shaped status file.
 
 ## Observability
 

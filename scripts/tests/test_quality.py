@@ -1,6 +1,8 @@
 import importlib.util
+import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -11,6 +13,63 @@ from unittest.mock import Mock, call, patch
 SPEC = importlib.util.spec_from_file_location("quality", Path(__file__).resolve().parents[1] / "quality.py")
 quality = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(quality)
+
+
+class GateSelfTestAdmissionCopyTest(unittest.TestCase):
+    def test_real_temp_copy_preserves_inventory_and_verifies_admission_before_the_first_gradle_call(self):
+        class CopyVerified(Exception):
+            pass
+
+        calls = []
+
+        def inspect_copy(*tasks, root, **_kwargs):
+            calls.append(tasks)
+            self.assertEqual(("test", "spotlessCheck"), tasks)
+            self.assertNotEqual(quality.ROOT, root)
+            for name in (
+                "scripts/prepare_database_admission.py", "scripts/materialize_money_sources.py",
+                "src/main/resources/database-admission-installation.json",
+                "database/admission-inventory.json",
+            ):
+                self.assertEqual(
+                    hashlib.sha256((quality.ROOT / name).read_bytes()).hexdigest(),
+                    hashlib.sha256((root / name).read_bytes()).hexdigest(),
+                    "the self-test copy changed a required inventory or pinned installation file",
+                )
+            inventory = json.loads((root / "database/admission-inventory.json").read_text(encoding="utf-8"))
+            columns = [column for script in inventory["scripts"] for column in script["columns"]]
+            self.assertEqual(70, len(columns))
+            self.assertEqual(70, len({column["name"]: column["sql_type"] for column in columns}))
+
+            def snapshot(directory):
+                return {
+                    path.relative_to(directory).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in directory.rglob("*") if path.is_file()
+                }
+
+            self.assertEqual(snapshot(quality.ROOT / "build/database-admission"), snapshot(root / "build/database-admission"))
+            before = snapshot(root)
+            environment = {
+                key: value for key, value in os.environ.items() if key.upper() in {"SYSTEMROOT", "WINDIR"}
+            }
+            result = subprocess.run(
+                [sys.executable, "-I", "-S", "-B", str(root / "scripts/prepare_database_admission.py"), "verify"],
+                cwd=root, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False,
+            )
+            self.assertEqual(0, result.returncode, "the real copied installation must verify without a fetch")
+            self.assertFalse(result.stderr, "offline verification emitted diagnostics")
+            self.assertEqual(
+                {"event": "database_admission_installation", "status": "verified", "payloads": 5},
+                json.loads(result.stdout),
+            )
+            self.assertEqual(before, snapshot(root), "offline verification mutated the self-test copy")
+            raise CopyVerified
+
+        with tempfile.TemporaryDirectory(prefix="api-admission-copy-test-") as temporary:
+            with patch.object(quality, "gradle", side_effect=inspect_copy), self.assertRaises(CopyVerified):
+                quality.gate_self_test(Path(temporary))
+            self.assertEqual([], list(Path(temporary).iterdir()))
+        self.assertEqual([("test", "spotlessCheck")], calls)
 
 
 class CoverageGateTest(unittest.TestCase):
@@ -116,6 +175,108 @@ class CoverageGateTest(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "inventory"),
             ):
                 quality.check_coverage("a" * 40)
+
+
+class CoverageRefusalDiagnosticsTest(unittest.TestCase):
+    base = "a" * 40
+
+    def fixture(self, root, counters, baseline):
+        source = root / "src/main/kotlin/example/App.kt"
+        source.parent.mkdir(parents=True)
+        source.write_text("package example\nclass App\n", encoding="utf-8")
+        report = root / quality.REPORT
+        report.parent.mkdir(parents=True)
+        lines = "".join(
+            f'<line nr="{number + 1}" mi="{int(number >= counters["LINE"]["covered"])}" '
+            f'ci="{int(number < counters["LINE"]["covered"])}"/>'
+            for number in range(counters["LINE"]["total"])
+        )
+        totals = "".join(
+            f'<counter type="{kind}" covered="{value["covered"]}" missed="{value["total"] - value["covered"]}"/>'
+            for kind, value in counters.items()
+        )
+        report.write_text(
+            f'<report><package name="example"><sourcefile name="App.kt">{lines}</sourcefile></package>{totals}</report>',
+            encoding="utf-8",
+        )
+        baseline_file = root / quality.BASELINE
+        baseline_file.parent.mkdir(parents=True)
+        baseline_file.write_text(json.dumps(baseline) + "\n", encoding="utf-8")
+        return baseline_file
+
+    def git(self, baseline):
+        def run(command, **_kwargs):
+            if command == ["git", "cat-file", "-e", f"{self.base}^{{commit}}"]:
+                return ""
+            if command == ["git", "ls-tree", "-r", "--name-only", self.base]:
+                return quality.BASELINE
+            if command == ["git", "show", f"{self.base}:{quality.BASELINE}"]:
+                return json.dumps(baseline)
+            raise AssertionError("Unexpected Git operation in synthetic coverage fixture")
+        return run
+
+    def test_each_refused_guard_emits_actual_fixture_counters_without_success_or_baseline_write(self):
+        for line, branch, reviewed, reason in [
+            (7, 10, 8, "LINE coverage is below 80 percent"),
+            (10, 7, 8, "BRANCH coverage is below 80 percent"),
+            (9, 10, 10, "LINE coverage decreased from reviewed base"),
+            (10, 9, 10, "BRANCH coverage decreased from reviewed base"),
+            (8, 10, 8, "Changed executable line coverage is below 90 percent"),
+        ]:
+            counters = {"LINE": {"covered": line, "total": 10}, "BRANCH": {"covered": branch, "total": 10}}
+            baseline = {kind: {"covered": reviewed, "total": 10} for kind in counters}
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                target = self.fixture(root, counters, baseline)
+                original = target.read_bytes()
+                with (
+                    patch.object(quality, "ROOT", root),
+                    patch.object(quality, "run", side_effect=self.git(baseline)),
+                    patch("sys.stdout", new_callable=io.StringIO) as output,
+                    self.assertRaisesRegex(ValueError, reason),
+                ):
+                    quality.check_coverage(self.base, write_baseline=True)
+                self.assertEqual(original, target.read_bytes())
+                self.assertEqual([{
+                    "event": "coverage_refused", "reason": reason,
+                    "counters": counters, "reviewed_counters": baseline,
+                    "changed_covered": line, "changed_total": 10, "base": self.base,
+                }], [json.loads(record) for record in output.getvalue().splitlines()])
+
+    def test_passing_ratchets_keep_the_existing_event_before_baseline_equality_refusal(self):
+        counters = {kind: {"covered": 10, "total": 10} for kind in ("LINE", "BRANCH")}
+        baseline = {kind: {"covered": 9, "total": 10} for kind in counters}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = self.fixture(root, counters, baseline)
+            original = target.read_bytes()
+            with (
+                patch.object(quality, "ROOT", root),
+                patch.object(quality, "run", side_effect=self.git(baseline)),
+                patch("sys.stdout", new_callable=io.StringIO) as output,
+                self.assertRaisesRegex(ValueError, "baseline does not match"),
+            ):
+                quality.check_coverage(self.base)
+            self.assertEqual(original, target.read_bytes())
+            self.assertEqual([{
+                "event": "coverage", "counters": counters, "changed_covered": 10,
+                "changed_total": 10, "base": self.base,
+            }], [json.loads(record) for record in output.getvalue().splitlines()])
+
+    def test_matching_baseline_keeps_success_event_and_does_not_emit_a_refusal(self):
+        counters = {kind: {"covered": 10, "total": 10} for kind in ("LINE", "BRANCH")}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = self.fixture(root, counters, counters)
+            original = target.read_bytes()
+            with (
+                patch.object(quality, "ROOT", root),
+                patch.object(quality, "run", side_effect=self.git(counters)),
+                patch("sys.stdout", new_callable=io.StringIO) as output,
+            ):
+                quality.check_coverage(self.base)
+            self.assertEqual(original, target.read_bytes())
+            self.assertEqual(["coverage"], [json.loads(record)["event"] for record in output.getvalue().splitlines()])
 
 
 class MoneyCoverageQualificationTest(unittest.TestCase):

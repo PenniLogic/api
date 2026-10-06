@@ -88,7 +88,7 @@ class MigrationCliTest {
     @Test
     fun `usage errors exit with code 2 and print the synopsis`() {
         val output = Output()
-        assertEquals(2, MigrationCli(output.stream, emptyMap()).run(listOf("migrate")))
+        assertEquals(2, MigrationCli(output.stream, emptyMap(), AdmissionFixtures::create).run(listOf("migrate")))
         val event = output.require("usage_error")
         assertTrue(event.contains("--holder is required"))
         assertTrue(event.contains(MigrationCli.USAGE))
@@ -98,13 +98,27 @@ class MigrationCliTest {
     fun `validate reports the machine readable set and names convention failures`() {
         Fixtures.threePhaseSet(directory)
         val output = Output()
-        assertEquals(0, MigrationCli(output.stream, emptyMap()).run(listOf("validate", "--migrations", directory.toString())))
+        assertEquals(
+            0,
+            MigrationCli(
+                output.stream,
+                emptyMap(),
+                AdmissionFixtures::create,
+            ).run(listOf("validate", "--migrations", directory.toString())),
+        )
         val set = output.require("migration_set")
         assertTrue(set.contains("\"count\":3"))
         assertTrue(set.contains("\"id\":\"V003__drop_legacy\""))
         Fixtures.write(directory, "V004__broken", Fixtures.header(phase = "later") + "SELECT 1;\n")
         val failing = Output()
-        assertEquals(1, MigrationCli(failing.stream, emptyMap()).run(listOf("validate", "--migrations", directory.toString())))
+        assertEquals(
+            1,
+            MigrationCli(
+                failing.stream,
+                emptyMap(),
+                AdmissionFixtures::create,
+            ).run(listOf("validate", "--migrations", directory.toString())),
+        )
         assertEquals(
             """{"event":"migration_validation_failed","file":"V004__broken.up.sql","rule":"phase must be expand, migrate or contract"}""",
             failing.event("migration_validation_failed"),
@@ -116,17 +130,27 @@ class MigrationCliTest {
         Fixtures.threePhaseSet(directory)
         val args = listOf("status", "--migrations", directory.toString())
         val missingUrl = Output()
-        assertEquals(2, MigrationCli(missingUrl.stream, emptyMap()).run(args))
+        assertEquals(2, MigrationCli(missingUrl.stream, emptyMap(), AdmissionFixtures::create).run(args))
         assertTrue(missingUrl.event("usage_error")!!.contains("MIGRATION_JDBC_URL is required"))
         val wrongDriver = Output()
-        assertEquals(2, MigrationCli(wrongDriver.stream, mapOf("MIGRATION_JDBC_URL" to "jdbc:h2:mem:x")).run(args))
+        assertEquals(
+            2,
+            MigrationCli(wrongDriver.stream, mapOf("MIGRATION_JDBC_URL" to "jdbc:h2:mem:x"), AdmissionFixtures::create).run(args),
+        )
         assertTrue(wrongDriver.event("usage_error")!!.contains("must be a jdbc:postgresql: URL"))
         val missingUser = Output()
-        assertEquals(2, MigrationCli(missingUser.stream, mapOf("MIGRATION_JDBC_URL" to "jdbc:postgresql://127.0.0.1:1/x")).run(args))
+        assertEquals(
+            2,
+            MigrationCli(
+                missingUser.stream,
+                mapOf("MIGRATION_JDBC_URL" to "jdbc:postgresql://127.0.0.1:1/x"),
+                AdmissionFixtures::create,
+            ).run(args),
+        )
         assertTrue(missingUser.event("usage_error")!!.contains("MIGRATION_DB_USER is required"))
         val missingPassword = Output()
         val environment = mapOf("MIGRATION_JDBC_URL" to "jdbc:postgresql://127.0.0.1:1/x", "MIGRATION_DB_USER" to "migration")
-        assertEquals(2, MigrationCli(missingPassword.stream, environment).run(args))
+        assertEquals(2, MigrationCli(missingPassword.stream, environment, AdmissionFixtures::create).run(args))
         assertTrue(missingPassword.event("usage_error")!!.contains("MIGRATION_DB_PASSWORD is required"))
     }
 
@@ -140,7 +164,10 @@ class MigrationCliTest {
                 "MIGRATION_DB_USER" to "migration",
                 "MIGRATION_DB_PASSWORD" to "not-a-real-secret",
             )
-        assertEquals(1, MigrationCli(output.stream, environment).run(listOf("status", "--migrations", directory.toString())))
+        assertEquals(
+            1,
+            MigrationCli(output.stream, environment, AdmissionFixtures::create).run(listOf("status", "--migrations", directory.toString())),
+        )
         val event = output.require("database_error")
         assertTrue(event.contains("\"type\":\"org.postgresql.util.PSQLException\""))
         assertTrue(event.contains("\"sqlState\":\"08001\""))

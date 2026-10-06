@@ -48,10 +48,13 @@ data class Options(
  * (MIGRATION_JDBC_URL, MIGRATION_DB_USER, MIGRATION_DB_PASSWORD) and are never printed.
  * Exit codes: 0 success, 1 refused, failed or ended without its own lock (an event names why), 2 usage error.
  */
-class MigrationCli(
+class MigrationCli internal constructor(
     private val out: PrintStream,
     private val environment: Map<String, String>,
+    private val admission: () -> DatabaseAdmission,
 ) {
+    constructor(out: PrintStream, environment: Map<String, String>) : this(out, environment, AdmissionInstallation::load)
+
     fun run(args: List<String>): Int {
         val options =
             try {
@@ -77,6 +80,9 @@ class MigrationCli(
             1
         } catch (error: LockRefused) {
             emit(Json.encode(linkedMapOf("event" to "migration_lock_refused") + error.claim.payload()))
+            1
+        } catch (error: AdmissionRefused) {
+            emit(Json.event("migration_admission_refused", "code" to error.code))
             1
         } catch (error: IllegalStateException) {
             emit(Json.event("runner_error", "type" to error.javaClass.name, "message" to error.message))
@@ -106,7 +112,7 @@ class MigrationCli(
     }
 
     private fun validate(options: Options): Int {
-        val set = MigrationSet.load(options.migrations)
+        val set = MigrationSet.load(options.migrations, admission)
         emit(
             Json.event(
                 "migration_set",
@@ -122,7 +128,7 @@ class MigrationCli(
         options: Options,
         block: (MigrationRunner) -> Int,
     ): Int {
-        val set = MigrationSet.load(options.migrations)
+        val set = MigrationSet.load(options.migrations, admission)
         val url = required("MIGRATION_JDBC_URL")
         if (!url.startsWith("jdbc:postgresql:")) {
             throw UsageError("MIGRATION_JDBC_URL must be a jdbc:postgresql: URL")
@@ -135,8 +141,6 @@ class MigrationCli(
             }
         val identity = Identity(options.holder, InetAddress.getLocalHost().hostName, ProcessHandle.current().pid())
         DriverManager.getConnection(url, properties).use { connection ->
-            // The convention lint parses literals under the Postgres default; pin it so a role or database setting cannot change it.
-            connection.createStatement().use { statement -> statement.execute("SET standard_conforming_strings = on") }
             return block(MigrationRunner(connection, set, identity, options.slowThreshold, ::emit))
         }
     }

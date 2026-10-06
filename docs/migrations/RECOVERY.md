@@ -8,6 +8,13 @@ registry rows from a backup (§4). All commands take the connection from
 `MIGRATION_JDBC_URL`, `MIGRATION_DB_USER` and `MIGRATION_DB_PASSWORD`, and
 `--migrations` names the directory of the reviewed commit being deployed.
 
+The mandatory source-admission boundary in [CONVENTION.md](CONVENTION.md)
+applies before these commands. The existing synthetic recovery tests use an
+explicit protocol double to retain their SQL/error assertions;
+`MigrationAdmissionPostgresTest` separately checks the before-bootstrap refusal
+and unchanged connection/registry/lock state. Neither is a substitute for
+accepted-provider qualification of the packaged entry point.
+
 ## 1. A migration failed part-way
 
 Symptom: exit 1 with `migration_failed` naming `version`, `id`, `direction`,
@@ -121,7 +128,7 @@ VALUES
 
 (`reversal_reason` is added for a compensating reversal.) `status` reports the
 expected `currentVersion` again once the applied prefix is contiguous. The lock
-row is recreated by the next writing command's bootstrap
+row is recreated by the next admitted writing command's bootstrap
 (`INSERT ... ON CONFLICT DO NOTHING`); a `migrate` with nothing pending is a safe
 way to trigger it and plans `"steps":[]`. [`status can be written to a file and
 reports registry corruption` — detection of the gap and of the missing lock
@@ -138,7 +145,9 @@ consumers have migrated`, `shipped migrations round trip ...`]
 ## 6. Nothing to do
 
 `migrate` when every migration is applied, or `migrate-down` at V000, prints a
-`migration_plan` with `"steps":[]`, takes no lock and exits 0.
+`migration_plan` with `"steps":[]`, takes no lock and exits 0 after complete-set
+and empty-selection admission. Missing or denied source cannot repair the
+singleton as a side effect of this path.
 
 ## 7. A script ended its own transaction
 
@@ -162,3 +171,22 @@ runner finished between this runner's plan and its claim; nothing was written
 by this run and the lock was released. Run the command again to plan against
 the new current version. [`a registry that changed between planning and
 claiming is refused under the lock`]
+
+## 9. Database admission refused
+
+Symptom: exit 1 with `migration_admission_refused` and a static `code`.
+`SOURCE_UNAVAILABLE` includes a missing installation or an explicit unaccepted
+binding. `SOURCE_CHANGED`, `SOURCE_INVALID` and `MIGRATIONS_CHANGED` require
+restoring the exact reviewed inputs, not editing hashes or trusting a writable
+receipt. `PROVIDER_DENIED` is a refusal, not a migration SQL failure.
+`INPUT_INVALID`, `JSON_*`, `OUTPUT_*` and `PROCESS_*` likewise block execution;
+they do not expose raw provider diagnostics.
+
+No bootstrap, failed attempt, lock change or session-setting change is made
+for a denied plan. Restore the genuinely reviewed source distribution and
+policy/inventory bindings through their owners, then rerun the ordinary
+command. All directions must remain covered, even when the intended selection
+is empty or excludes the changed reversal. Do not bypass the gate, invent
+acceptance, delete financial history or use manual migration SQL as a recovery
+shortcut. `release-lock` also requires admission and will not clear a foreign
+claim when it is unavailable.

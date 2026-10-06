@@ -1,10 +1,10 @@
 package com.pennilogic.ledger
 
 import com.pennilogic.contracts.money.Money
+import com.pennilogic.migration.AdmissionFixtures
 import com.pennilogic.migration.Identity
 import com.pennilogic.migration.MigrationFailed
 import com.pennilogic.migration.MigrationRunner
-import com.pennilogic.migration.MigrationSet
 import com.pennilogic.migration.TestDatabase
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.postgresql.util.PSQLException
@@ -210,7 +210,7 @@ internal class LedgerFixture {
         directory: Path = shippedLedger,
         holder: String = "ledger-test@junit",
     ): MigrationRunner =
-        MigrationRunner(connection, MigrationSet.load(directory), Identity(holder, "fixture", 1), Duration.ofSeconds(60), events::add)
+        MigrationRunner(connection, AdmissionFixtures.load(directory), Identity(holder, "fixture", 1), Duration.ofSeconds(60), events::add)
 
     fun <T> restricted(action: (Connection, String) -> T): T {
         val role = "ledger_test_" + UUID.randomUUID().toString().replace("-", "")

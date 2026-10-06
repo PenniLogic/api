@@ -13,7 +13,7 @@ class MigrationSetTest {
     @TempDir
     lateinit var directory: Path
 
-    private fun violation(): ConventionViolation = assertThrows(ConventionViolation::class.java) { MigrationSet.load(directory) }
+    private fun violation(): ConventionViolation = assertThrows(ConventionViolation::class.java) { AdmissionFixtures.load(directory) }
 
     private fun assertViolation(
         file: String,
@@ -27,7 +27,7 @@ class MigrationSetTest {
 
     @Test
     fun `loads the shipped migrations with checksums over the whole script`() {
-        val set = MigrationSet.load(Path.of("src", "main", "resources", "db", "migrations"))
+        val set = AdmissionFixtures.load(Path.of("src", "main", "resources", "db", "migrations"))
         assertEquals(2, set.latestVersion)
         assertEquals(listOf("V001__create_pennilogic_schema", "V002__create_ledger"), set.migrations.map { it.id })
         val baseline = set.migrations.first()
@@ -56,7 +56,7 @@ class MigrationSetTest {
     @Test
     fun `three phase set resolves expand references and compensating evidence`() {
         Fixtures.threePhaseSet(directory)
-        val set = MigrationSet.load(directory)
+        val set = AdmissionFixtures.load(directory)
         assertEquals(listOf(1, 2, 3), set.migrations.map { it.version })
         assertEquals(listOf(null, 1, 1), set.migrations.map { it.expandVersion })
         val contract = set.byVersion(3)!!
@@ -77,13 +77,13 @@ class MigrationSetTest {
     @Test
     fun `missing directory is a violation naming the directory`() {
         val missing = directory.resolve("absent")
-        val error = assertThrows(ConventionViolation::class.java) { MigrationSet.load(missing) }
+        val error = assertThrows(ConventionViolation::class.java) { AdmissionFixtures.load(missing) }
         assertEquals(missing.toString(), error.file)
     }
 
     @Test
     fun `empty directory is an empty set`() {
-        assertEquals(0, MigrationSet.load(directory).latestVersion)
+        assertEquals(0, AdmissionFixtures.load(directory).latestVersion)
     }
 
     @Test
@@ -203,9 +203,9 @@ class MigrationSetTest {
             Fixtures.header() + "/* create */ CREATE TABLE t (id integer); -- done\n",
             down = "/* drop */\nDROP TABLE t;\n",
         )
-        assertEquals(1, MigrationSet.load(directory).latestVersion)
+        assertEquals(1, AdmissionFixtures.load(directory).latestVersion)
         Fixtures.write(directory, "V001__x", Fixtures.header() + "SELECT 1;\n", down = "SELECT '/* not a comment */';\n")
-        assertEquals(1, MigrationSet.load(directory).latestVersion)
+        assertEquals(1, AdmissionFixtures.load(directory).latestVersion)
     }
 
     @Test
@@ -242,14 +242,14 @@ class MigrationSetTest {
                 "-- never DROP ... CASCADE here\n" +
                     "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (id) REFERENCES p (id) ON DELETE CASCADE;\nDROP TABLE t;\n",
         )
-        assertEquals(1, MigrationSet.load(directory).latestVersion)
+        assertEquals(1, AdmissionFixtures.load(directory).latestVersion)
         Fixtures.write(directory, "V001__x", Fixtures.header() + "DROP TABLE old CASCADE;\n", down = "SELECT 1;\n")
-        assertEquals(1, MigrationSet.load(directory).latestVersion)
+        assertEquals(1, AdmissionFixtures.load(directory).latestVersion)
         // An E'…' escape string cannot hide the cascade: Postgres closes E'\'' after one character, and so does the lint.
         Fixtures.write(directory, "V001__x", Fixtures.header() + "SELECT 1;\n", down = "SELECT E'\\'';\nDROP TABLE t CASCADE;\n")
         assertViolation("V001__x.down.sql", "must not DROP or TRUNCATE with CASCADE")
         Fixtures.write(directory, "V001__x", Fixtures.header() + "SELECT 1;\n", down = "DROP TABLE t;\nSELECT E'it\\'s fine';\n")
-        assertEquals(1, MigrationSet.load(directory).latestVersion)
+        assertEquals(1, AdmissionFixtures.load(directory).latestVersion)
     }
 
     @Test
@@ -270,6 +270,6 @@ class MigrationSetTest {
         Fixtures.write(directory, "V001__x", Fixtures.header() + "SELECT 1;\n")
         Fixtures.write(directory, "V002__y", Fixtures.header() + "SELECT 1;\n")
         Fixtures.write(directory, "V003__z", Fixtures.header(phase = "contract", expand = "V002") + "SELECT 1;\n")
-        assertEquals(listOf(null, null, 2), MigrationSet.load(directory).migrations.map { it.expandVersion })
+        assertEquals(listOf(null, null, 2), AdmissionFixtures.load(directory).migrations.map { it.expandVersion })
     }
 }

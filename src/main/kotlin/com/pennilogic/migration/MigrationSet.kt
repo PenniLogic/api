@@ -1,22 +1,58 @@
 package com.pennilogic.migration
 
+import java.io.IOException
 import java.nio.file.Files
+import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
+import java.util.Collections
 
 /**
  * The ordered, validated migrations of one directory. Loading enforces the naming, ordering,
- * header and reversal-evidence convention published in docs/migrations/CONVENTION.md and
- * fails by naming the offending file.
+ * header and reversal-evidence convention published in docs/migrations/CONVENTION.md, then
+ * requires real complete-set admission before exposing immutable execution buffers.
  */
 class MigrationSet private constructor(
     val directory: Path,
-    val migrations: List<Migration>,
+    migrations: List<Migration>,
+    private val admission: DatabaseAdmission,
 ) {
+    val migrations: List<Migration> = Collections.unmodifiableList(migrations.toList())
     val latestVersion: Int get() = migrations.lastOrNull()?.version ?: 0
 
     fun byVersion(version: Int): Migration? = migrations.firstOrNull { it.version == version }
 
     fun records(): List<Map<String, Any?>> = migrations.map { it.record() }
+
+    internal fun validateAdmission() {
+        verifyFiles()
+        admission.validate(migrations)
+        verifyFiles()
+    }
+
+    internal fun authorize(selection: List<AdmissionSelection>) {
+        verifyFiles()
+        admission.authorize(migrations, selection)
+        verifyFiles()
+    }
+
+    internal fun verifyFiles() {
+        try {
+            val expected = migrations.flatMap { listOf(it.file, it.reversal.file) }.sorted()
+            val actual = names(directory)
+            admissionRequire(actual == expected, AdmissionReason.MIGRATIONS_CHANGED)
+            for (migration in migrations) {
+                admissionRequire(
+                    readScript(directory.resolve(migration.file)) == migration.sql &&
+                        readScript(directory.resolve(migration.reversal.file)) == migration.reversal.sql,
+                    AdmissionReason.MIGRATIONS_CHANGED,
+                )
+            }
+        } catch (_: IOException) {
+            throw AdmissionRefused(AdmissionReason.MIGRATIONS_CHANGED)
+        } catch (_: AdmissionRefused) {
+            throw AdmissionRefused(AdmissionReason.MIGRATIONS_CHANGED)
+        }
+    }
 
     companion object {
         private val FILE_NAME = Regex("""^(V(\d{3,})__([a-z][a-z0-9]*(?:_[a-z0-9]+)*))\.(up|down|compensating)\.sql$""")
@@ -30,11 +66,16 @@ class MigrationSet private constructor(
 
         fun label(version: Int): String = "V" + version.toString().padStart(3, '0')
 
-        fun load(directory: Path): MigrationSet {
+        fun load(directory: Path): MigrationSet = load(directory, AdmissionInstallation::load)
+
+        internal fun load(
+            directory: Path,
+            admission: () -> DatabaseAdmission,
+        ): MigrationSet {
             if (!Files.isDirectory(directory)) {
                 throw ConventionViolation(directory.toString(), "migrations directory does not exist")
             }
-            val names = Files.list(directory).use { stream -> stream.map { it.fileName.toString() }.sorted().toList() }
+            val names = names(directory)
             val files = sortedMapOf<Int, MutableMap<String, String>>()
             val ids = mutableMapOf<Int, String>()
             for (name in names) {
@@ -54,6 +95,7 @@ class MigrationSet private constructor(
             }
             val migrations = mutableListOf<Migration>()
             var expected = 1
+            var sqlBytes = 0
             for (entry in files.entries) {
                 val version = entry.key
                 if (version != expected) {
@@ -62,10 +104,47 @@ class MigrationSet private constructor(
                         "versions must be contiguous from ${label(1)}; ${label(version)} follows ${label(expected - 1)}",
                     )
                 }
-                migrations += build(directory, version, ids.getValue(version), entry.value, migrations)
+                val migration = build(directory, version, ids.getValue(version), entry.value, migrations)
+                sqlBytes += migration.sql.toByteArray(Charsets.UTF_8).size +
+                    migration.reversal.sql
+                        .toByteArray(Charsets.UTF_8)
+                        .size
+                admissionRequire(sqlBytes <= DatabaseAdmission.REQUEST_LIMIT, AdmissionReason.INPUT_INVALID)
+                migrations += migration
                 expected++
             }
-            return MigrationSet(directory, migrations)
+            return MigrationSet(directory, migrations, admission()).also { it.validateAdmission() }
+        }
+
+        private fun names(directory: Path): List<String> =
+            Files.list(directory).use { stream ->
+                val names =
+                    stream
+                        .limit(257)
+                        .map { it.fileName.toString() }
+                        .sorted()
+                        .toList()
+                admissionRequire(names.size <= 256, AdmissionReason.INPUT_INVALID)
+                names
+            }
+
+        private fun readScript(path: Path): String {
+            admissionRequire(Files.isRegularFile(path, NOFOLLOW_LINKS), AdmissionReason.INPUT_INVALID)
+            val bytes =
+                Files.newInputStream(path, NOFOLLOW_LINKS).use { it.readNBytes(DatabaseAdmission.SQL_LIMIT * 2 + 1) }
+            admissionRequire(bytes.size <= DatabaseAdmission.SQL_LIMIT * 2, AdmissionReason.INPUT_INVALID)
+            val script =
+                try {
+                    Charsets.UTF_8
+                        .newDecoder()
+                        .decode(java.nio.ByteBuffer.wrap(bytes))
+                        .toString()
+                        .replace("\r\n", "\n")
+                } catch (_: java.nio.charset.CharacterCodingException) {
+                    throw AdmissionRefused(AdmissionReason.INPUT_INVALID)
+                }
+            admissionRequire(script.toByteArray(Charsets.UTF_8).size <= DatabaseAdmission.SQL_LIMIT, AdmissionReason.INPUT_INVALID)
+            return script
         }
 
         private fun build(
@@ -87,7 +166,7 @@ class MigrationSet private constructor(
                         upName,
                         "reversal evidence is required: add $id.down.sql or $id.compensating.sql with a reason directive",
                     )
-            val upSql = Files.readString(directory.resolve(upName))
+            val upSql = readScript(directory.resolve(upName))
             val header = parseHeader(upName, upSql)
             val phase =
                 Phase.entries.firstOrNull { it.directive == header["phase"] }
@@ -110,7 +189,7 @@ class MigrationSet private constructor(
             if (statements(upSql).isEmpty()) {
                 throw ConventionViolation(upName, "script has no SQL statements")
             }
-            val reversalSql = Files.readString(directory.resolve(reversalName))
+            val reversalSql = readScript(directory.resolve(reversalName))
             val reversalStatements = statements(reversalSql)
             if (reversalStatements.isEmpty()) {
                 throw ConventionViolation(reversalName, "reversal script has no SQL statements")
