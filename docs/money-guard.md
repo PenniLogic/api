@@ -40,6 +40,7 @@ python scripts/check_money.py
 python scripts/quality.py money-guard
 python -m unittest discover -s scripts/tests
 python scripts/quality.py build
+python scripts/quality.py coverage --base <full-trusted-base-commit-SHA>
 python scripts/quality.py money-coverage
 python scripts/quality.py money-mutation
 python scripts/quality.py money-mutation-report
@@ -87,6 +88,13 @@ exception or a generated-workflow edit.
 The existing test/lint checks, coverage floors and integration-test requirements are unchanged.
 The additional `moneyMutation` task is mandatory in `check`; it cannot be silently skipped by
 the normal build. Missing materialization or a red mutation score still prevents qualification.
+Build, full `coverage` and focused `money-mutation` verify the latest mutation record against
+the final input/output bytes before success. Full coverage refreshes mutation through the
+existing Gradle dependency graph after its forced Money tests: build followed by coverage
+performs two real PIT runs, within each command's remaining at-most-600-second budget.
+The coverage-only commands do not qualify mutation and can stale an earlier result;
+`money-mutation-report` only reads and verifies, never repairs it. See the
+[terminal-freshness correction](money-mutation.md#terminal-freshness-after-full-coverage).
 
 ## Actual Money-package qualification
 

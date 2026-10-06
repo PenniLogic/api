@@ -40,6 +40,16 @@ def file_record(path):
     return {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
 
+def runtime_executable(value):
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError("Mutation runtime executable must have an absolute path")
+    resolved = path.resolve(strict=True)
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise ValueError("Mutation runtime must resolve to an executable regular file")
+    return resolved
+
+
 def write_record(path, value):
     quality.money_provider_module().owned_target(ROOT, path.relative_to(ROOT))
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
@@ -59,8 +69,8 @@ def input_snapshot(config):
     files.extend(provider.verify_outputs())
     files.extend(ROOT / provider.BUNDLE / "source" / name for name in provider.SOURCE_FILES)
     files.append(ROOT / provider.BUNDLE / provider.STRATEGY_FILE)
-    files.append(Path(config["java"]))
-    files.append(Path(sys.executable))
+    files.append(runtime_executable(config["java"]))
+    files.append(runtime_executable(sys.executable))
     files.extend(path for path in (ROOT / "src").rglob("*") if path.suffix in (".kt", ".java"))
     files.extend((ROOT / "build/test-results/moneyTest").glob("TEST-*.xml"))
     files.extend(quality.money_class_inventory(provider).values())

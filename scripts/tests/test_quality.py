@@ -2,9 +2,11 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 SPEC = importlib.util.spec_from_file_location("quality", Path(__file__).resolve().parents[1] / "quality.py")
 quality = importlib.util.module_from_spec(SPEC)
@@ -206,6 +208,163 @@ class MoneyCoverageQualificationTest(unittest.TestCase):
             declined = {**unchanged, kind: {"covered": baseline[kind]["covered"] - 1, "total": 100}}
             with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "decreased"):
                 quality.enforce_money_coverage(declined, floors, baseline)
+
+
+class FullMoneyCommandTest(unittest.TestCase):
+    base = "37fc85503994fd03f2f41ab5bfd87191db6d9b56"
+    tasks = {
+        "build": ("build", "installDist"),
+        "coverage": ("jacocoTestReport", "jacocoTestCoverageVerification", "moneyCoverageReport", "moneyMutation"),
+        "money-mutation": ("moneyMutation",),
+    }
+
+    def setUp(self):
+        self.clock = 1000
+        self.calls = Mock()
+        for name in ("gradle", "test_metrics", "check_coverage", "check_money_coverage"):
+            self.enterContext(patch.object(quality, name, getattr(self.calls, name)))
+        self.loader = self.enterContext(patch.object(
+            quality, "script_module", return_value=Mock(check_latest=self.calls.check_latest),
+        ))
+        self.provider = self.enterContext(patch.object(quality, "money_provider_module"))
+        self.budget = self.enterContext(patch.object(quality, "money_budget", return_value={"enforced_seconds": 600}))
+        self.enterContext(patch.object(quality.time, "monotonic", side_effect=lambda: self.clock))
+        self.output = self.enterContext(patch("sys.stdout", new_callable=io.StringIO))
+        self.errors = self.enterContext(patch("sys.stderr", new_callable=io.StringIO))
+
+    def invoke(self, command, *extra):
+        with patch.object(sys, "argv", ["quality.py", command, "--base", self.base, *extra]):
+            return quality.main()
+
+    def expected_calls(self, command, write_baseline=False):
+        checks = {
+            "build": [call.test_metrics()],
+            "coverage": [
+                call.check_coverage(self.base, write_baseline),
+                call.check_money_coverage(self.base, write_baseline),
+            ],
+            "money-mutation": [],
+        }
+        return [call.gradle(*self.tasks[command], budget=600), *checks[command], call.check_latest()]
+
+    def test_full_commands_verify_freshness_after_their_required_graph_and_checks(self):
+        for command in self.tasks:
+            with self.subTest(command=command):
+                self.calls.reset_mock()
+                self.loader.reset_mock()
+                self.assertEqual(0, self.invoke(command))
+                self.assertEqual(self.expected_calls(command), self.calls.mock_calls)
+                self.loader.assert_called_once_with("money_mutation")
+
+    def test_missing_or_stale_final_evidence_blocks_each_full_command_and_restores(self):
+        for command in self.tasks:
+            for error in (
+                FileNotFoundError("Synthetic missing mutation record"),
+                ValueError("Synthetic stale mutation inputs"),
+            ):
+                with self.subTest(command=command, error=type(error).__name__):
+                    self.calls.reset_mock()
+                    self.calls.check_latest.side_effect = error
+                    self.assertEqual(1, self.invoke(command))
+                    self.assertEqual(self.expected_calls(command), self.calls.mock_calls)
+                    self.assertIn(str(error), self.errors.getvalue())
+                    self.calls.check_latest.side_effect = None
+                    self.calls.reset_mock()
+                    self.assertEqual(0, self.invoke(command))
+                    self.assertEqual(self.expected_calls(command), self.calls.mock_calls)
+
+    def test_native_refresh_failure_or_timeout_never_falls_back_to_an_old_report(self):
+        for command in self.tasks:
+            for error in (
+                subprocess.CalledProcessError(7, ["synthetic-gradle", "moneyMutation"]),
+                TimeoutError("Synthetic native refresh exhausted the remaining budget"),
+            ):
+                with self.subTest(command=command, error=type(error).__name__):
+                    self.calls.reset_mock()
+                    self.calls.gradle.side_effect = error
+                    self.assertEqual(1, self.invoke(command))
+                    self.assertEqual([call.gradle(*self.tasks[command], budget=600)], self.calls.mock_calls)
+
+    def test_failed_test_or_coverage_checks_prevent_full_command_success(self):
+        for command, failed_check in (
+            ("build", "test_metrics"), ("coverage", "check_coverage"), ("coverage", "check_money_coverage"),
+        ):
+            with self.subTest(command=command, failed_check=failed_check):
+                self.calls.reset_mock()
+                check = getattr(self.calls, failed_check)
+                check.side_effect = ValueError("Synthetic qualification failure")
+                self.assertEqual(1, self.invoke(command))
+                self.calls.check_latest.assert_not_called()
+                self.calls.gradle.assert_called_once_with(*self.tasks[command], budget=600)
+                check.side_effect = None
+
+    def test_each_full_command_passes_only_its_remaining_budget_to_gradle(self):
+        def read_budget(_):
+            self.clock += 17
+            return {"enforced_seconds": 600}
+
+        self.budget.side_effect = read_budget
+        for command in self.tasks:
+            with self.subTest(command=command):
+                self.calls.reset_mock()
+                self.assertEqual(0, self.invoke(command))
+                self.calls.gradle.assert_called_once_with(*self.tasks[command], budget=583)
+                self.calls.check_latest.assert_called_once_with()
+
+    def test_final_freshness_readback_is_inside_the_full_command_deadline(self):
+        def finish_native_work(*_, **__):
+            self.clock += 599
+
+        def read_latest():
+            self.clock += 2
+
+        self.calls.gradle.side_effect = finish_native_work
+        self.calls.check_latest.side_effect = read_latest
+        for command in self.tasks:
+            with self.subTest(command=command):
+                self.calls.reset_mock()
+                self.assertEqual(1, self.invoke(command))
+                self.assertEqual(self.expected_calls(command), self.calls.mock_calls)
+                self.assertIn("exceeded its enforced elapsed budget", self.errors.getvalue())
+
+    def test_missing_numeric_budget_refuses_before_any_native_work(self):
+        self.budget.side_effect = ValueError("Synthetic missing numeric Money budget")
+        for command in self.tasks:
+            with self.subTest(command=command):
+                self.calls.reset_mock()
+                self.assertEqual(1, self.invoke(command))
+                self.assertEqual([], self.calls.mock_calls)
+
+    def test_coverage_requires_its_base_before_reading_policy_or_starting_work(self):
+        with patch.object(sys, "argv", ["quality.py", "coverage"]), self.assertRaises(SystemExit) as error:
+            quality.main()
+        self.assertEqual(2, error.exception.code)
+        self.budget.assert_not_called()
+        self.provider.assert_not_called()
+        self.assertEqual([], self.calls.mock_calls)
+
+    def test_writing_coverage_baselines_still_refreshes_and_verifies_mutation(self):
+        self.assertEqual(0, self.invoke("coverage", "--write-baseline"))
+        self.assertEqual(self.expected_calls("coverage", True), self.calls.mock_calls)
+
+    def test_standalone_mutation_report_remains_readonly(self):
+        self.assertEqual(0, self.invoke("money-mutation-report"))
+        self.assertEqual([call.check_latest()], self.calls.mock_calls)
+        self.loader.assert_called_once_with("money_mutation")
+        self.budget.assert_not_called()
+        self.provider.assert_not_called()
+
+    def test_focused_coverage_does_not_claim_full_mutation_qualification(self):
+        for command, expected in (
+            ("money-coverage", [call.gradle("moneyCoverageReport"), call.check_money_coverage(self.base, False)]),
+            ("money-coverage-report", [call.check_money_coverage(self.base, False)]),
+        ):
+            with self.subTest(command=command):
+                self.calls.reset_mock()
+                self.assertEqual(0, self.invoke(command))
+                self.assertEqual(expected, self.calls.mock_calls)
+                self.loader.assert_not_called()
+                self.budget.assert_not_called()
 
 
 if __name__ == "__main__":

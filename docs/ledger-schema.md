@@ -10,6 +10,14 @@ in this unit.
 
 ## Binding inputs
 
+The local composition includes the protected accepted Money verification
+source from [#94](https://github.com/PenniLogic/api/pull/94), commit
+`bdf1b9397b6eefa627e2291767ebf20857a39525`. That bounded source acceptance
+does not complete [#1](https://github.com/PenniLogic/api/issues/1),
+[#22](https://github.com/PenniLogic/api/issues/22), the independent oracle,
+runtime consumers or this ledger issue. The fixed provider inputs and strict
+Money gates remain unchanged.
+
 The schema consumes the accepted decisions at Docs commit
 `47986ef6bef986a3ba9214ccf652609347d73c66`, not the historical issue numbers
 inside the original migrated specification:
@@ -268,9 +276,10 @@ correction chains, real restricted connections, invisible-row refusal,
 three isolation levels, table/runner locking, exact source/catalog contracts,
 checksum drift, failed-forward restoration and populated reverse preservation.
 
-Root still owns publication, reconciliation with the accepted Money base,
-separate non-author Core/Money/Security plus QA review, real native CI and
-integration. [#1](https://github.com/PenniLogic/api/issues/1) and
+Root still owns publication, affected separate non-author Core/Money/Security
+plus QA review, real native CI and integration. Prior ledger/F01 reviews remain
+dated evidence for their original commits, not approval of the composed source.
+[#1](https://github.com/PenniLogic/api/issues/1) and
 [PenniLogic/infra#28](https://github.com/PenniLogic/infra/issues/28) remain
 open prerequisites. Passing this finite unit does not close
 [#2](https://github.com/PenniLogic/api/issues/2),
