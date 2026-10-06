@@ -2,9 +2,14 @@ package com.pennilogic.ledger
 
 import com.pennilogic.contracts.money.CurrencyRegistry
 import com.pennilogic.contracts.money.Money
+import com.pennilogic.migration.Json
+import com.pennilogic.migration.MigrationCli
 import com.pennilogic.migration.MigrationFailed
 import com.pennilogic.migration.MigrationSet
+import com.pennilogic.migration.Output
+import com.pennilogic.migration.Registry
 import com.pennilogic.migration.RegistryProblem
+import com.pennilogic.migration.RowState
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -762,10 +767,20 @@ class LedgerSchemaPostgresTest {
                 connection.commit()
                 connection.autoCommit = true
                 val before = fingerprint(connection)
+                val currenciesBefore =
+                    connection.scalar("SELECT json_agg(c ORDER BY code)::text FROM pennilogic.ledger_currencies c")
                 val runner = fixture.runner(connection)
+                val beforeStatus = runner.status()
+                val priorRows = Registry(connection).rows()
+                same(listOf(1, 2), priorRows.map { it.version }, "prior-shipped-versions")
+                same(listOf(RowState.APPLIED, RowState.APPLIED), priorRows.map { it.state }, "prior-applied-transitions")
+                val priorBytes =
+                    connection.scalar("SELECT json_agg(r ORDER BY id)::text FROM migration_runner.migration_registry r")
                 same(0, runner.migrateDown(0, dryRun = true), "populated-down-dry-run")
+                same(priorRows, Registry(connection).rows(), "dry-run-preserves-registry")
                 val failure = assertThrows(MigrationFailed::class.java) { runner.migrateDown(0, dryRun = false) }
                 same("P0001", failure.failure.sqlState, "reverse-refusal-state")
+                same("ledger_history_preserved", failure.failure.constraint, "reverse-refusal-constraint")
                 same(2, failure.knownVersion, "reverse-known-version")
                 same(2, runner.snapshot().currentVersion, "reverse-version-retained")
                 same(null, runner.snapshot().lock, "reverse-lock-released")
@@ -776,8 +791,35 @@ class LedgerSchemaPostgresTest {
                     connection.scalar("SELECT state FROM migration_runner.migration_registry ORDER BY id DESC LIMIT 1"),
                     "failed-direction-retained",
                 )
+                val history = Registry(connection).rows()
+                same(priorRows, history.take(2), "prior-attempts-retained")
+                same(
+                    priorBytes,
+                    connection.scalar(
+                        "SELECT json_agg(r ORDER BY id)::text FROM" +
+                            " (SELECT * FROM migration_runner.migration_registry ORDER BY id LIMIT 2) r",
+                    ),
+                    "all-prior-registry-columns-retained",
+                )
+                same("down", history.last().direction, "failed-down-direction")
+                same(failure.failure, history.last().failure, "failed-summary-retained")
+                same(
+                    priorRows.last(),
+                    runner
+                        .snapshot()
+                        .states
+                        .getValue(2)
+                        .appliedRow,
+                    "applied-row-retained",
+                )
                 same(0, runner.migrate(null, includeContract = false, dryRun = false), "restore-and-noop")
                 same(before, fingerprint(connection), "no-data-cleanup-in-recovery")
+                same(
+                    currenciesBefore,
+                    connection.scalar("SELECT json_agg(c ORDER BY code)::text FROM pennilogic.ledger_currencies c"),
+                    "currency-reference-retained",
+                )
+                same(history, Registry(connection).rows(), "no-op-preserves-failed-attempt")
                 val set = MigrationSet.load(shippedLedger)
                 for (migration in set.migrations) {
                     same(
@@ -797,6 +839,57 @@ class LedgerSchemaPostgresTest {
                         "registry-down-checksum-${migration.version}",
                     )
                 }
+                val status = runner.status()
+                same(2, status["currentVersion"], "status-effective-version")
+                same(beforeStatus["lastApplied"], status["lastApplied"], "status-last-applied-retained")
+                same(null, status["lock"], "status-lock-released")
+                val record =
+                    (status.getValue("migrations") as List<*>)
+                        .map { it as Map<*, *> }
+                        .single { it["version"] == 2 }
+                same(history.last().attempt(), record["lastAttempt"], "status-failed-attempt")
+                val output = Output()
+                val statusFile = directory.resolve("refused-status.json")
+                same(
+                    0,
+                    MigrationCli(output.stream, fixture.database.environment()).run(
+                        listOf("status", "--migrations", shippedLedger.toString(), "--status-file", statusFile.toString()),
+                    ),
+                    "native-cli-status",
+                )
+                same(Json.encode(status) + "\n", Files.readString(statusFile), "status-file-matches-library")
+                same(
+                    Json.encode(linkedMapOf("event" to "migration_status") + status),
+                    output.require("migration_status"),
+                    "native-cli-matches-library",
+                )
+                println(
+                    Json.event(
+                        "ledger_failed_down_status",
+                        "currentVersion" to status["currentVersion"],
+                        "state" to record["state"],
+                        "lastAttempt" to history.last().attempt(),
+                        "dataPreserved" to (before == fingerprint(connection)),
+                        "priorRowsPreserved" to (priorRows == history.take(2)),
+                        "checksumsPreserved" to
+                            history.all {
+                                val migration = requireNotNull(set.byVersion(it.version))
+                                it.checksum == migration.checksum && it.reversalChecksum == migration.reversal.checksum
+                            },
+                        "lockReleased" to (status["lock"] == null),
+                        "cliAndStatusFileAgree" to true,
+                    ),
+                )
+                same("failed", record["state"], "latest-failure-operator-label")
+                same(
+                    "failed",
+                    runner
+                        .snapshot()
+                        .states
+                        .getValue(2)
+                        .label,
+                    "snapshot-failure-label",
+                )
             }
         }
 

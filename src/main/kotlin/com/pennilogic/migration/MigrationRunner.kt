@@ -38,8 +38,8 @@ data class VersionState(
     val label: String
         get() =
             when {
-                appliedRow != null -> "applied"
                 lastAttempt.state == RowState.FAILED -> "failed"
+                appliedRow != null -> "applied"
                 else -> "reversed"
             }
 }

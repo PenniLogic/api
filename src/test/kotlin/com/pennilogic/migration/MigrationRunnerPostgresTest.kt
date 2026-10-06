@@ -382,6 +382,107 @@ class MigrationRunnerPostgresTest {
     }
 
     @Test
+    fun `status labels failed attempts independently of effective versions and successful retries`() {
+        val database = TestDatabase.fresh()
+        val migrations = directory.resolve("migrations")
+        Fixtures.write(
+            migrations,
+            "V001__status_target",
+            Fixtures.header() + "CREATE TABLE public.status_target (id integer PRIMARY KEY);\n",
+            "DROP TABLE public.status_target RESTRICT;\n",
+        )
+        val set = MigrationSet.load(migrations)
+        val migration = set.migrations.single()
+        val statusFile = directory.resolve("status.json")
+        database.connect().use { connection ->
+            val runner = MigrationRunner(connection, set, Identity("status@junit", "fixture", 1), Duration.ofSeconds(60)) {}
+            val registry = Registry(connection)
+
+            fun assertStatus(
+                label: String,
+                version: Int,
+                applied: RegistryRow?,
+                attempt: RegistryRow,
+            ) {
+                val snapshot = runner.snapshot()
+                assertEquals(version, snapshot.currentVersion)
+                assertEquals(applied, snapshot.states.getValue(1).appliedRow)
+                assertEquals(attempt, snapshot.states.getValue(1).lastAttempt)
+                assertNull(snapshot.lock)
+                val report = runner.status()
+                assertEquals(version, report["currentVersion"])
+                assertEquals(
+                    applied?.let { linkedMapOf("version" to it.version, "id" to it.id) + it.attempt() },
+                    report["lastApplied"],
+                )
+                val record = (report.getValue("migrations") as List<*>).single() as Map<*, *>
+                assertEquals(attempt.attempt(), record["lastAttempt"])
+                val output = Output()
+                assertEquals(
+                    0,
+                    cli(database, output, "status", "--migrations", migrations.toString(), "--status-file", statusFile.toString()),
+                )
+                assertEquals(Json.encode(report) + "\n", Files.readString(statusFile))
+                assertEquals(Json.encode(linkedMapOf("event" to "migration_status") + report), output.require("migration_status"))
+                println(
+                    Json.event(
+                        "migration_status_case",
+                        "expectedState" to label,
+                        "state" to record["state"],
+                        "currentVersion" to version,
+                        "lastAttempt" to attempt.attempt(),
+                    ),
+                )
+                assertEquals(label, record["state"])
+                assertEquals(label, snapshot.states.getValue(1).label)
+            }
+
+            migrate(database, migrations)
+            val applied = registry.rows().single()
+            assertStatus("applied", 1, applied, applied)
+            database.execute("CREATE VIEW public.status_dependency AS SELECT id FROM public.status_target")
+            val down = Output()
+            assertEquals(1, cli(database, down, "migrate-down", "--holder", "status@junit", "--migrations", migrations.toString()))
+            val failedDown = registry.rows().last()
+            assertEquals(RowState.FAILED, failedDown.state)
+            assertEquals("down", failedDown.direction)
+            assertEquals("2BP01", failedDown.failure?.sqlState)
+            down.require("migration_lock_released")
+            assertStatus("failed", 1, applied, failedDown)
+            assertTrue(migrate(database, migrations).require("migration_plan").contains("\"steps\":[]"))
+            assertEquals(listOf(applied, failedDown), registry.rows())
+            assertStatus("failed", 1, applied, failedDown)
+
+            database.execute("DROP VIEW public.status_dependency")
+            val retryDown = Output()
+            assertEquals(0, cli(database, retryDown, "migrate-down", "--holder", "status@junit", "--migrations", migrations.toString()))
+            val reversed = registry.rows().last()
+            assertEquals(RowState.REVERSED, reversed.state)
+            assertStatus("reversed", 0, null, reversed)
+
+            database.execute("CREATE TABLE public.status_target (id integer PRIMARY KEY)")
+            val up = Output()
+            assertEquals(1, cli(database, up, "migrate", "--holder", "status@junit", "--migrations", migrations.toString()))
+            val failedUp = registry.rows().last()
+            assertEquals(RowState.FAILED, failedUp.state)
+            assertEquals("up", failedUp.direction)
+            assertEquals("42P07", failedUp.failure?.sqlState)
+            up.require("migration_lock_released")
+            assertStatus("failed", 0, null, failedUp)
+
+            database.execute("DROP TABLE public.status_target RESTRICT")
+            migrate(database, migrations)
+            val reapplied = registry.rows().last()
+            assertEquals(RowState.APPLIED, reapplied.state)
+            assertStatus("applied", 1, reapplied, reapplied)
+            val history = registry.rows()
+            assertEquals(listOf(applied, failedDown, reversed, failedUp, reapplied), history)
+            assertEquals(listOf("up", "down", "down", "up", "up"), history.map { it.direction })
+            assertTrue(history.all { it.checksum == migration.checksum && it.reversalChecksum == migration.reversal.checksum })
+        }
+    }
+
+    @Test
     fun `syntax errors report the position and a dead holder can be released by name`() {
         val database = TestDatabase.fresh()
         Fixtures.write(directory, "V001__typo", Fixtures.header() + "CREAT TABLE t1 (id integer);\n", "DROP TABLE t1;\n")

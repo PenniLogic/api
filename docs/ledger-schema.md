@@ -81,10 +81,18 @@ logging and uses terse server errors; this is not production log configuration.
 ## Database invariants and serialization
 
 `transaction_zero_sum` and `transaction_sealed` are deferred constraint
-triggers. At commit, every entry-bearing transaction balances by currency
-using PostgreSQL's exact NUMERIC result for `SUM(BIGINT)`, and its visible
-entry count equals its sealed count. Composite foreign keys enforce
-transaction/account owner and currency equality and prohibit orphan entries.
+triggers. With complete writer SELECT visibility into the transaction, every
+entry-bearing transaction balances by currency at commit using PostgreSQL's
+exact NUMERIC result for `SUM(BIGINT)`, and its entry count equals its sealed
+count. Composite foreign keys enforce transaction/account owner and currency
+equality and prohibit orphan entries.
+
+These invoker checks are not a universal guarantee under arbitrary RLS
+policies. An incompatible partial SELECT policy plus a forged count matching
+only the visible entries can admit an imbalanced physical entry set. Complete
+same-transaction writer visibility is therefore a mandatory T-SEC-01
+integration precondition, not an optional optimization or something proved by
+the current default-deny fixture. No runtime writer is admitted here.
 
 Empty STANDARD candidates/suppressed rows have count 0 and no posting instant.
 A single guarded update posts a candidate, writes count and `booked_at`, and
@@ -115,6 +123,12 @@ and a value date when the target has one; active reposts from a new correction
 group cannot coexist with unreversed earlier reposts. Historical, already
 reversed reposts do not invalidate their replacements. Application orchestration
 of correction operations remains [#7](https://github.com/PenniLogic/api/issues/7).
+
+`correction_id` links transactions but does not seal group membership: an
+otherwise valid later repost with the same correction ID can commit. A fresh
+ID per correction operation, atomic membership and replay enforcement require
+the actual [#7](https://github.com/PenniLogic/api/issues/7) operation/replay
+provider. Per-transaction entry sealing does not supply that missing boundary.
 
 Snapshots have real account/owner/currency foreign keys; reconciliation
 transactions have a unique same-owner/currency snapshot link. Computing the
@@ -222,6 +236,19 @@ causes `P0001` / `ledger_history_preserved`; a protected non-bypass owner gets
 retains version 2 and releases the lock. Empty teardown uses RESTRICT only.
 A concurrent account insertion is allowed to finish before the guard examines
 the locked table; if it commits, reversal refuses and preserves it.
+
+After a refused down, status reports `currentVersion: 2`, operator
+`state: "failed"`, the recorded `lastAttempt.failure` and a released lock.
+`lastApplied` still names V002: effective version derives from the latest
+non-failed transition, independently of the latest-attempt label. A forward
+no-op leaves the failure visible; it neither retries down nor erases history.
+The library, native CLI and status file share this status contract.
+
+The original ledger coverage comprises six Kotlin test/helper files: five
+PostgreSQL suites plus `LedgerFixture`, not seven source files. Focused status
+regressions additionally exercise failed up/down, reversed state and successful
+retry using a separate controlled test migration, never by deleting committed
+V002 history.
 
 The existing owned integration fixture starts digest-pinned PostgreSQL 17.11
 on a fresh loopback-only container and finalizes that container even on test

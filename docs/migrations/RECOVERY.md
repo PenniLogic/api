@@ -37,6 +37,19 @@ was applied; remove or reverse the dependent object through its own migration
 and run `migrate-down` again. [`a reversal that would destroy dependent objects
 fails and keeps the version`]
 
+The latest failed attempt takes precedence in the operator-facing `state`,
+not in the effective applied transition. After a failed down, `lastApplied`
+can still name that version and `currentVersion` remains unchanged. A no-op
+`migrate` does not clear the failure or append history; a successful retry
+records a new transition and changes the label. CLI output and `--status-file`
+report the same distinction. [`status labels failed attempts independently of
+effective versions and successful retries`]
+
+For a populated ledger's `ledger_history_preserved` refusal, do not delete
+history to force down to succeed. Preserve the applied version and failed
+attempt; any subsequent schema change needs its own forward/compensating
+migration.
+
 ## 2. The lock is held by a process that no longer exists
 
 Symptom: exit 1 with `migration_lock_refused` naming `holder`, `host`, `pid`,
