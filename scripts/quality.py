@@ -128,7 +128,19 @@ def check_coverage(base, write_baseline=False):
             )
             numbers = changed_line_numbers(diff)
         changed.extend(covered for number, covered in lines.items() if number in numbers)
-    enforce(counters, changed, baseline)
+    try:
+        enforce(counters, changed, baseline)
+    except ValueError as error:
+        print(json.dumps({
+            "event": "coverage_refused",
+            "reason": str(error),
+            "counters": counters,
+            "reviewed_counters": baseline,
+            "changed_covered": sum(changed),
+            "changed_total": len(changed),
+            "base": base,
+        }))
+        raise
     record = {
         "event": "coverage",
         "counters": counters,

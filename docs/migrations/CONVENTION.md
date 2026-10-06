@@ -98,6 +98,11 @@ output, or exception text. Internal protocol doubles in test sources exercise
 runner/recovery behavior; they are not real provider acceptance. Packaged
 admission tests use the actual application JAR and installed canonical provider
 without those doubles for forward, reverse, no-op, dry-run and refusal paths.
+Cleanup fault tests use synthetic process acknowledgements with real futures
+and interruptible waits to exercise failed observations, exhausted budgets and
+each incomplete final guard. They complement, not replace, real-process tests
+of termination, inherited pipes, environment isolation and unrelated-process
+survival; no synthetic acknowledgement is operating-system cleanup evidence.
 
 `migrationConventionCheck` always executes, including when compilation is
 up to date. Its real CLI execution is instrumented with the same pinned JaCoCo
@@ -106,6 +111,11 @@ existing execution-data aggregation. This does not add or exclude shipped
 classes, replace the packaged assertions, or relax the explicit-base coverage
 ratchet or zero-skip quality check. An unavailable filesystem fixture remains a
 reported capability gap, not a passing check or an invented coverage baseline.
+If a coverage floor, reviewed-base ratchet or changed-line guard refuses,
+`quality.py coverage --base <full SHA>` emits `coverage_refused` with the actual
+report and reviewed counters, then still fails. The existing `coverage` event
+remains after those guards and before baseline-equality checking; neither event
+authorizes a baseline update or implies that the full command passed.
 
 ## Files
 

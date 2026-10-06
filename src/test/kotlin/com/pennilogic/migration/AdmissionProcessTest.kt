@@ -9,6 +9,10 @@ import org.junit.jupiter.api.io.TempDir
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.attribute.AclEntry
+import java.nio.file.attribute.AclEntryPermission
+import java.nio.file.attribute.AclEntryType
+import java.nio.file.attribute.AclFileAttributeView
 import java.nio.file.attribute.PosixFilePermission
 import java.time.Duration
 import java.util.concurrent.TimeUnit
@@ -82,9 +86,33 @@ class AdmissionProcessTest {
             AdmissionProcess.pythonExecutable(listOf(second, first).joinToString(File.pathSeparator)),
         )
         if (Files.getFileStore(directory).supportsFileAttributeView("posix")) {
-            Files.setPosixFilePermissions(firstFile, setOf(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE))
-            assertEquals(secondFile.toString(), AdmissionProcess.pythonExecutable(searchPath))
+            val permissions = Files.getPosixFilePermissions(firstFile)
+            try {
+                Files.setPosixFilePermissions(firstFile, setOf(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE))
+                assertFalse(Files.isExecutable(firstFile))
+                assertEquals(secondFile.toString(), AdmissionProcess.pythonExecutable(searchPath))
+            } finally {
+                Files.setPosixFilePermissions(firstFile, permissions)
+            }
+        } else {
+            val view = requireNotNull(Files.getFileAttributeView(firstFile, AclFileAttributeView::class.java))
+            val permissions = view.acl
+            val denyExecution =
+                AclEntry
+                    .newBuilder()
+                    .setType(AclEntryType.DENY)
+                    .setPrincipal(view.owner)
+                    .setPermissions(AclEntryPermission.EXECUTE)
+                    .build()
+            try {
+                view.acl = listOf(denyExecution) + permissions
+                assertFalse(Files.isExecutable(firstFile))
+                assertEquals(secondFile.toString(), AdmissionProcess.pythonExecutable(searchPath))
+            } finally {
+                view.acl = permissions
+            }
         }
+        assertEquals(firstFile.toString(), AdmissionProcess.pythonExecutable(searchPath))
     }
 
     @Test

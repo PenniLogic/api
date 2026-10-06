@@ -177,6 +177,108 @@ class CoverageGateTest(unittest.TestCase):
                 quality.check_coverage("a" * 40)
 
 
+class CoverageRefusalDiagnosticsTest(unittest.TestCase):
+    base = "a" * 40
+
+    def fixture(self, root, counters, baseline):
+        source = root / "src/main/kotlin/example/App.kt"
+        source.parent.mkdir(parents=True)
+        source.write_text("package example\nclass App\n", encoding="utf-8")
+        report = root / quality.REPORT
+        report.parent.mkdir(parents=True)
+        lines = "".join(
+            f'<line nr="{number + 1}" mi="{int(number >= counters["LINE"]["covered"])}" '
+            f'ci="{int(number < counters["LINE"]["covered"])}"/>'
+            for number in range(counters["LINE"]["total"])
+        )
+        totals = "".join(
+            f'<counter type="{kind}" covered="{value["covered"]}" missed="{value["total"] - value["covered"]}"/>'
+            for kind, value in counters.items()
+        )
+        report.write_text(
+            f'<report><package name="example"><sourcefile name="App.kt">{lines}</sourcefile></package>{totals}</report>',
+            encoding="utf-8",
+        )
+        baseline_file = root / quality.BASELINE
+        baseline_file.parent.mkdir(parents=True)
+        baseline_file.write_text(json.dumps(baseline) + "\n", encoding="utf-8")
+        return baseline_file
+
+    def git(self, baseline):
+        def run(command, **_kwargs):
+            if command == ["git", "cat-file", "-e", f"{self.base}^{{commit}}"]:
+                return ""
+            if command == ["git", "ls-tree", "-r", "--name-only", self.base]:
+                return quality.BASELINE
+            if command == ["git", "show", f"{self.base}:{quality.BASELINE}"]:
+                return json.dumps(baseline)
+            raise AssertionError("Unexpected Git operation in synthetic coverage fixture")
+        return run
+
+    def test_each_refused_guard_emits_actual_fixture_counters_without_success_or_baseline_write(self):
+        for line, branch, reviewed, reason in [
+            (7, 10, 8, "LINE coverage is below 80 percent"),
+            (10, 7, 8, "BRANCH coverage is below 80 percent"),
+            (9, 10, 10, "LINE coverage decreased from reviewed base"),
+            (10, 9, 10, "BRANCH coverage decreased from reviewed base"),
+            (8, 10, 8, "Changed executable line coverage is below 90 percent"),
+        ]:
+            counters = {"LINE": {"covered": line, "total": 10}, "BRANCH": {"covered": branch, "total": 10}}
+            baseline = {kind: {"covered": reviewed, "total": 10} for kind in counters}
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                target = self.fixture(root, counters, baseline)
+                original = target.read_bytes()
+                with (
+                    patch.object(quality, "ROOT", root),
+                    patch.object(quality, "run", side_effect=self.git(baseline)),
+                    patch("sys.stdout", new_callable=io.StringIO) as output,
+                    self.assertRaisesRegex(ValueError, reason),
+                ):
+                    quality.check_coverage(self.base, write_baseline=True)
+                self.assertEqual(original, target.read_bytes())
+                self.assertEqual([{
+                    "event": "coverage_refused", "reason": reason,
+                    "counters": counters, "reviewed_counters": baseline,
+                    "changed_covered": line, "changed_total": 10, "base": self.base,
+                }], [json.loads(record) for record in output.getvalue().splitlines()])
+
+    def test_passing_ratchets_keep_the_existing_event_before_baseline_equality_refusal(self):
+        counters = {kind: {"covered": 10, "total": 10} for kind in ("LINE", "BRANCH")}
+        baseline = {kind: {"covered": 9, "total": 10} for kind in counters}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = self.fixture(root, counters, baseline)
+            original = target.read_bytes()
+            with (
+                patch.object(quality, "ROOT", root),
+                patch.object(quality, "run", side_effect=self.git(baseline)),
+                patch("sys.stdout", new_callable=io.StringIO) as output,
+                self.assertRaisesRegex(ValueError, "baseline does not match"),
+            ):
+                quality.check_coverage(self.base)
+            self.assertEqual(original, target.read_bytes())
+            self.assertEqual([{
+                "event": "coverage", "counters": counters, "changed_covered": 10,
+                "changed_total": 10, "base": self.base,
+            }], [json.loads(record) for record in output.getvalue().splitlines()])
+
+    def test_matching_baseline_keeps_success_event_and_does_not_emit_a_refusal(self):
+        counters = {kind: {"covered": 10, "total": 10} for kind in ("LINE", "BRANCH")}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = self.fixture(root, counters, counters)
+            original = target.read_bytes()
+            with (
+                patch.object(quality, "ROOT", root),
+                patch.object(quality, "run", side_effect=self.git(counters)),
+                patch("sys.stdout", new_callable=io.StringIO) as output,
+            ):
+                quality.check_coverage(self.base)
+            self.assertEqual(original, target.read_bytes())
+            self.assertEqual(["coverage"], [json.loads(record)["event"] for record in output.getvalue().splitlines()])
+
+
 class MoneyCoverageQualificationTest(unittest.TestCase):
     def report(self, directory, classes=("Money", "CurrencyRegistry"), sources=("Money.kt", "CurrencyRegistry.kt")):
         class_nodes = "".join(f'<class name="{quality.MONEY_PACKAGE}/{name}"/>' for name in classes)
