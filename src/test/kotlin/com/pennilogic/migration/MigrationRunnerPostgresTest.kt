@@ -34,7 +34,7 @@ class MigrationRunnerPostgresTest {
         database: TestDatabase,
         output: Output,
         vararg args: String,
-    ): Int = MigrationCli(output.stream, database.environment()).run(args.toList())
+    ): Int = MigrationCli(output.stream, database.environment(), AdmissionFixtures::create).run(args.toList())
 
     private fun migrate(
         database: TestDatabase,
@@ -391,7 +391,7 @@ class MigrationRunnerPostgresTest {
             Fixtures.header() + "CREATE TABLE public.status_target (id integer PRIMARY KEY);\n",
             "DROP TABLE public.status_target RESTRICT;\n",
         )
-        val set = MigrationSet.load(migrations)
+        val set = AdmissionFixtures.load(migrations)
         val migration = set.migrations.single()
         val statusFile = directory.resolve("status.json")
         database.connect().use { connection ->
@@ -548,7 +548,7 @@ class MigrationRunnerPostgresTest {
     @Test
     fun `a registry that changed between planning and claiming is refused under the lock`() {
         val database = TestDatabase.fresh()
-        val set = MigrationSet.load(basicSet())
+        val set = AdmissionFixtures.load(basicSet())
         database.connect().use { connection ->
             val events = mutableListOf<String>()
             val runner =
@@ -798,7 +798,7 @@ class MigrationRunnerPostgresTest {
         assertEquals(1, cli(database, gap, "status", "--migrations", migrations.toString()))
         assertTrue(gap.require("migration_registry_problem").contains("\"kind\":\"registry_not_contiguous\""))
         // RECOVERY.md §4: reinsert the applied row with the checksums that validate prints.
-        val lost = MigrationSet.load(migrations).byVersion(1)!!
+        val lost = AdmissionFixtures.load(migrations).byVersion(1)!!
         database.execute(
             "INSERT INTO migration_runner.migration_registry (version, migration_id, phase, checksum, reversal_kind, reversal_file," +
                 " reversal_checksum, state, direction, applied_by, host, pid, duration_ms) VALUES" +
@@ -866,7 +866,7 @@ class MigrationRunnerPostgresTest {
             val runner =
                 MigrationRunner(
                     connection,
-                    MigrationSet.load(shipped),
+                    AdmissionFixtures.load(shipped),
                     Identity("library@junit", "host", 1),
                     Duration.ofSeconds(60),
                     events::add,

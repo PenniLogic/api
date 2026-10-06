@@ -65,7 +65,9 @@ class MigrationRunner(
     private val registry = Registry(connection)
 
     /** Reads the registry without writing and verifies it agrees with the files on disk. */
-    fun snapshot(): Snapshot {
+    fun snapshot(): Snapshot = snapshot(includeLock = true)
+
+    private fun snapshot(includeLock: Boolean): Snapshot {
         if (!registry.exists()) {
             return Snapshot(false, 0, emptyMap(), null)
         }
@@ -114,7 +116,7 @@ class MigrationRunner(
                 )
             }
         }
-        return Snapshot(true, applied.size, states, registry.currentLock())
+        return Snapshot(true, applied.size, states, if (includeLock) registry.currentLock() else null)
     }
 
     fun status(): Map<String, Any?> {
@@ -142,10 +144,10 @@ class MigrationRunner(
         includeContract: Boolean,
         dryRun: Boolean,
     ): Int {
-        if (!dryRun) {
-            registry.bootstrap()
-        }
-        val snapshot = snapshot()
+        set.validateAdmission()
+        requireAutoCommit()
+        // A missing singleton remains visible to status, but an admitted write may repair it through bootstrap.
+        val snapshot = snapshot(includeLock = false)
         val goal = target ?: set.latestVersion
         if (goal !in snapshot.currentVersion..set.latestVersion) {
             throw UsageError(
@@ -161,10 +163,13 @@ class MigrationRunner(
                 }
                 migration to if (held) "hold" else "apply"
             }
+        set.authorize(steps.filter { it.second == "apply" }.map { AdmissionSelection(it.first, "up") })
         emit(plan("migrate", dryRun, snapshot.currentVersion, goal, steps))
+        set.verifyFiles()
         if (dryRun) {
             return 0
         }
+        bootstrapAdmitted()
         if (steps.none { it.second == "apply" }) {
             // Nothing is written, so no lock is needed; the hold is still reported.
             steps.forEach { (migration, _) -> emitHeld(migration) }
@@ -192,10 +197,9 @@ class MigrationRunner(
         target: Int?,
         dryRun: Boolean,
     ): Int {
-        if (!dryRun) {
-            registry.bootstrap()
-        }
-        val snapshot = snapshot()
+        set.validateAdmission()
+        requireAutoCommit()
+        val snapshot = snapshot(includeLock = false)
         val current = snapshot.currentVersion
         val goal = target ?: (current - 1).coerceAtLeast(0)
         if (goal !in 0..current) {
@@ -206,8 +210,14 @@ class MigrationRunner(
             )
         }
         val steps = (current downTo goal + 1).map { set.migrations[it - 1] to "reverse" }
+        set.authorize(steps.map { AdmissionSelection(it.first, it.first.reversal.kind.directive) })
         emit(plan("migrate-down", dryRun, current, goal, steps))
-        if (dryRun || steps.isEmpty()) {
+        set.verifyFiles()
+        if (dryRun) {
+            return 0
+        }
+        bootstrapAdmitted()
+        if (steps.isEmpty()) {
             return 0
         }
         val claim = registry.claim(identity, "migrate-down", goal)
@@ -226,8 +236,22 @@ class MigrationRunner(
 
     /** Operator release of a lock whose holder process has died; the exact claim (holder, host, pid) must be named. */
     fun releaseLock(claim: Identity): Boolean {
-        registry.bootstrap()
+        set.authorize(emptyList())
+        requireAutoCommit()
+        bootstrapAdmitted()
         return registry.release(claim)
+    }
+
+    private fun requireAutoCommit() {
+        if (!connection.autoCommit || connection.unwrap(BaseConnection::class.java).transactionState != TransactionState.IDLE) {
+            throw UsageError("migration runner requires an auto-commit connection with no caller transaction")
+        }
+    }
+
+    private fun bootstrapAdmitted() {
+        requireAutoCommit()
+        connection.createStatement().use { it.execute("SET standard_conforming_strings = on") }
+        registry.bootstrap()
     }
 
     /** The plan was computed before the claim; another runner finishing in between makes it stale. */

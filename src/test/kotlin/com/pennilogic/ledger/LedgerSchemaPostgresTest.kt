@@ -2,10 +2,10 @@ package com.pennilogic.ledger
 
 import com.pennilogic.contracts.money.CurrencyRegistry
 import com.pennilogic.contracts.money.Money
+import com.pennilogic.migration.AdmissionFixtures
 import com.pennilogic.migration.Json
 import com.pennilogic.migration.MigrationCli
 import com.pennilogic.migration.MigrationFailed
-import com.pennilogic.migration.MigrationSet
 import com.pennilogic.migration.Output
 import com.pennilogic.migration.Registry
 import com.pennilogic.migration.RegistryProblem
@@ -820,7 +820,7 @@ class LedgerSchemaPostgresTest {
                     "currency-reference-retained",
                 )
                 same(history, Registry(connection).rows(), "no-op-preserves-failed-attempt")
-                val set = MigrationSet.load(shippedLedger)
+                val set = AdmissionFixtures.load(shippedLedger)
                 for (migration in set.migrations) {
                     same(
                         migration.checksum,
@@ -852,7 +852,7 @@ class LedgerSchemaPostgresTest {
                 val statusFile = directory.resolve("refused-status.json")
                 same(
                     0,
-                    MigrationCli(output.stream, fixture.database.environment()).run(
+                    MigrationCli(output.stream, fixture.database.environment(), AdmissionFixtures::create).run(
                         listOf("status", "--migrations", shippedLedger.toString(), "--status-file", statusFile.toString()),
                     ),
                     "native-cli-status",
@@ -897,7 +897,7 @@ class LedgerSchemaPostgresTest {
     fun `ledger checksums cannot drift and a failed forward apply rolls back only its own migration`() =
         checked("ledger-runner-contract") {
             val fixture = LedgerFixture()
-            for (migration in MigrationSet.load(shippedLedger).migrations) {
+            for (migration in AdmissionFixtures.load(shippedLedger).migrations) {
                 Files.copy(shippedLedger.resolve(migration.file), directory.resolve(migration.file))
                 Files.copy(shippedLedger.resolve(migration.reversal.file), directory.resolve(migration.reversal.file))
             }
