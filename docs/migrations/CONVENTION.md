@@ -8,6 +8,10 @@ references, starting with the ledger schema in api#2. The registry tables and
 the lock payload are described in [REGISTRY.md](REGISTRY.md); what to do when a
 run fails is in [RECOVERY.md](RECOVERY.md).
 
+The exact V001/V002 column/provenance source for the Infra-owned database
+admission integration is described in [ADMISSION-INVENTORY.md](ADMISSION-INVENTORY.md).
+Publishing that inventory alone does not install or activate an admission gate.
+
 The protocol this implements is the published parallel development protocol
 (PenniLogic/docs `product/04-execution-readiness-review.md`, section 8, rules 4
 and 5) and `governance/DELIVERY.md`: contract-first expand-migrate-contract,

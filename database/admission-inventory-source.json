@@ -1,0 +1,51 @@
+{
+  "schema": "pennilogic.api-database-admission-source/1",
+  "repository_id": 1394134582,
+  "commit": "d39f4692c13413040439c5e87fed81728e0577f1",
+  "tree": "8da895cc998e5ec43105cfb6fa41a82ea2194f8c",
+  "inventory": "database/admission-inventory.json",
+  "files": [
+    {
+      "path": "src/main/resources/db/migrations/V001__create_pennilogic_schema.up.sql",
+      "bytes": 413,
+      "sha256": "2655508299a325f56469fd8236014e0765321933ae76c0eed616c46331705cee",
+      "git_blob": "87e0a3e37c95b1ec2c567f40a2b6bccce74f5e72"
+    },
+    {
+      "path": "src/main/resources/db/migrations/V001__create_pennilogic_schema.down.sql",
+      "bytes": 210,
+      "sha256": "3b02e971aad8478c132e21a03009c7ffd5ea8a68c827f361c4e4fb1d2bad9556",
+      "git_blob": "7cee97b77fb396a5d39ffc22e8c2eac2c4fa9476"
+    },
+    {
+      "path": "src/main/resources/db/migrations/V002__create_ledger.up.sql",
+      "bytes": 30275,
+      "sha256": "4c5fc158d50fe7676a0518fbb0463955b1460a57f5f83c5e906a6b88b14844b5",
+      "git_blob": "6cdf06d546121630fc11c36892e04fa58c3eb73c"
+    },
+    {
+      "path": "src/main/resources/db/migrations/V002__create_ledger.down.sql",
+      "bytes": 1776,
+      "sha256": "a7c101892b51c67f85ae5d2d5a7abfd9a8c63ae7d595755aff338011f98a2f18",
+      "git_blob": "9016fffd81e7a9544bf4bcc0b73feaa043633df4"
+    },
+    {
+      "path": "docs/ledger-schema.md",
+      "bytes": 19185,
+      "sha256": "a21c42629332add92c2062cdfa2eb087d84c6ff2cfce1b8da70acb704bf88a2f",
+      "git_blob": "6b5e55a2f3c0453bd092d66001629b39eb61cf08"
+    },
+    {
+      "path": "src/test/resources/ledger/adr-017-parameters.json",
+      "bytes": 21221,
+      "sha256": "f82aa3d76108825f6b7015af496447d9b069bebba1db9a0c4bf351f135a1cef6",
+      "git_blob": "ce128c7ebad197fd16a0310ba4d1a06b714059a4"
+    },
+    {
+      "path": "src/test/resources/ledger/adr-018-inventory.json",
+      "bytes": 20606,
+      "sha256": "86056ca2e2c5c5eeb5faad10a65ef99111ed92de5e60b66f7f3ebbcccea3d7d6",
+      "git_blob": "46a55b7ce7cec24046ca6b326184635c678dc6f2"
+    }
+  ]
+}

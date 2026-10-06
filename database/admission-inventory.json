@@ -1,0 +1,177 @@
+{
+  "schema": "pennilogic.database-admission.inventory/1",
+  "nodes": [
+    {
+      "id": "identifier",
+      "kind": "SOURCE",
+      "source_kind": "IDENTIFIER",
+      "evidence": ["src/main/resources/db/migrations/V002__create_ledger.up.sql", "docs/ledger-schema.md"]
+    },
+    {
+      "id": "minor_units",
+      "kind": "SOURCE",
+      "source_kind": "INTEGER_MINOR_UNITS",
+      "evidence": ["src/main/resources/db/migrations/V002__create_ledger.up.sql", "src/test/resources/ledger/adr-017-parameters.json"]
+    },
+    {
+      "id": "fixed_scale_rate",
+      "kind": "SOURCE",
+      "source_kind": "FIXED_SCALE_INTEGER",
+      "evidence": ["src/main/resources/db/migrations/V002__create_ledger.up.sql", "src/test/resources/ledger/adr-017-parameters.json"]
+    },
+    {
+      "id": "currency",
+      "kind": "SOURCE",
+      "source_kind": "CURRENCY_CODE",
+      "evidence": ["src/main/resources/db/migrations/V002__create_ledger.up.sql", "src/test/resources/ledger/adr-017-parameters.json"]
+    },
+    {
+      "id": "instant_or_date",
+      "kind": "SOURCE",
+      "source_kind": "DATE_TIME",
+      "evidence": ["src/main/resources/db/migrations/V002__create_ledger.up.sql", "docs/ledger-schema.md"]
+    },
+    {
+      "id": "archive_flag",
+      "kind": "SOURCE",
+      "source_kind": "BOOLEAN",
+      "evidence": ["src/main/resources/db/migrations/V002__create_ledger.up.sql"]
+    },
+    {
+      "id": "bounded_count",
+      "kind": "SOURCE",
+      "source_kind": "NUMERIC_MEASUREMENT",
+      "evidence": ["src/main/resources/db/migrations/V002__create_ledger.up.sql", "src/test/resources/ledger/adr-017-parameters.json"]
+    },
+    {
+      "id": "reference_domain",
+      "kind": "SOURCE",
+      "source_kind": "NON_USER_REFERENCE",
+      "evidence": ["src/main/resources/db/migrations/V002__create_ledger.up.sql", "docs/ledger-schema.md"]
+    },
+    {
+      "id": "transaction_description",
+      "kind": "SOURCE",
+      "source_kind": "TRANSACTION",
+      "evidence": ["src/main/resources/db/migrations/V002__create_ledger.up.sql", "src/test/resources/ledger/adr-018-inventory.json", "docs/ledger-schema.md"]
+    },
+    {
+      "id": "merchant_description",
+      "kind": "SOURCE",
+      "source_kind": "MERCHANT",
+      "evidence": ["src/main/resources/db/migrations/V002__create_ledger.up.sql", "src/test/resources/ledger/adr-017-parameters.json", "src/test/resources/ledger/adr-018-inventory.json", "docs/ledger-schema.md"]
+    },
+    {
+      "id": "memo",
+      "kind": "SOURCE",
+      "source_kind": "MEMO",
+      "evidence": ["src/main/resources/db/migrations/V002__create_ledger.up.sql", "src/test/resources/ledger/adr-018-inventory.json", "docs/ledger-schema.md"]
+    },
+    {"id": "transaction_ciphertext", "kind": "ENCRYPT", "inputs": ["transaction_description"]},
+    {"id": "transaction_blind_index", "kind": "HASH", "inputs": ["transaction_description"]},
+    {"id": "merchant_ciphertext", "kind": "ENCRYPT", "inputs": ["merchant_description"]},
+    {"id": "merchant_blind_index", "kind": "HASH", "inputs": ["merchant_description"]},
+    {"id": "memo_ciphertext", "kind": "ENCRYPT", "inputs": ["memo"]}
+  ],
+  "scripts": [
+    {
+      "migration": "V001__create_pennilogic_schema",
+      "direction": "up",
+      "sha256": "2655508299a325f56469fd8236014e0765321933ae76c0eed616c46331705cee",
+      "grammar": "api-ledger-v2-exact",
+      "columns": []
+    },
+    {
+      "migration": "V001__create_pennilogic_schema",
+      "direction": "down",
+      "sha256": "3b02e971aad8478c132e21a03009c7ffd5ea8a68c827f361c4e4fb1d2bad9556",
+      "grammar": "api-ledger-v2-exact",
+      "columns": []
+    },
+    {
+      "migration": "V002__create_ledger",
+      "direction": "up",
+      "sha256": "4c5fc158d50fe7676a0518fbb0463955b1460a57f5f83c5e906a6b88b14844b5",
+      "grammar": "api-ledger-v2-exact",
+      "columns": [
+        {"name": "pennilogic.ledger_currencies.code", "sql_type": "char(3)", "provenance": "currency"},
+        {"name": "pennilogic.ledger_currencies.exponent", "sql_type": "smallint", "provenance": "bounded_count"},
+        {"name": "pennilogic.ledger_currencies.admitted_at", "sql_type": "timestamptz(3)", "provenance": "instant_or_date"},
+        {"name": "pennilogic.accounts.id", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.accounts.owner_id", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.accounts.type", "sql_type": "text", "provenance": "reference_domain"},
+        {"name": "pennilogic.accounts.currency", "sql_type": "char(3)", "provenance": "currency"},
+        {"name": "pennilogic.accounts.system_role", "sql_type": "text", "provenance": "reference_domain"},
+        {"name": "pennilogic.accounts.is_archived", "sql_type": "boolean", "provenance": "archive_flag"},
+        {"name": "pennilogic.accounts.created_at", "sql_type": "timestamptz(3)", "provenance": "instant_or_date"},
+        {"name": "pennilogic.accounts.name", "sql_type": "bytea", "provenance": "transaction_ciphertext"},
+        {"name": "pennilogic.accounts.institution", "sql_type": "bytea", "provenance": "transaction_ciphertext"},
+        {"name": "pennilogic.accounts.mask", "sql_type": "bytea", "provenance": "transaction_ciphertext"},
+        {"name": "pennilogic.accounts.mask_bidx", "sql_type": "bytea", "provenance": "transaction_blind_index"},
+        {"name": "pennilogic.statement_snapshots.id", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.statement_snapshots.owner_id", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.statement_snapshots.account_id", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.statement_snapshots.currency", "sql_type": "char(3)", "provenance": "currency"},
+        {"name": "pennilogic.statement_snapshots.statement_date", "sql_type": "date", "provenance": "instant_or_date"},
+        {"name": "pennilogic.statement_snapshots.statement_balance_minor", "sql_type": "bigint", "provenance": "minor_units"},
+        {"name": "pennilogic.statement_snapshots.source", "sql_type": "text", "provenance": "reference_domain"},
+        {"name": "pennilogic.statement_snapshots.evidence_ref", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.statement_snapshots.captured_at", "sql_type": "timestamptz(3)", "provenance": "instant_or_date"},
+        {"name": "pennilogic.statement_snapshots.booked_at", "sql_type": "timestamptz(3)", "provenance": "instant_or_date"},
+        {"name": "pennilogic.exchange_groups.id", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.exchange_groups.owner_id", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.exchange_groups.base_currency", "sql_type": "char(3)", "provenance": "currency"},
+        {"name": "pennilogic.exchange_groups.quote_currency", "sql_type": "char(3)", "provenance": "currency"},
+        {"name": "pennilogic.exchange_groups.quoted_rate_e10", "sql_type": "bigint", "provenance": "fixed_scale_rate"},
+        {"name": "pennilogic.exchange_groups.rate_source", "sql_type": "text", "provenance": "reference_domain"},
+        {"name": "pennilogic.exchange_groups.rate_feed", "sql_type": "text", "provenance": "reference_domain"},
+        {"name": "pennilogic.exchange_groups.rate_instant", "sql_type": "timestamptz(3)", "provenance": "instant_or_date"},
+        {"name": "pennilogic.exchange_groups.rounding_side", "sql_type": "text", "provenance": "reference_domain"},
+        {"name": "pennilogic.exchange_groups.occurred_at", "sql_type": "timestamptz(3)", "provenance": "instant_or_date"},
+        {"name": "pennilogic.exchange_groups.booked_at", "sql_type": "timestamptz(3)", "provenance": "instant_or_date"},
+        {"name": "pennilogic.exchange_groups.evidence_ref", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.exchange_groups.reverses_group_id", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.transactions.id", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.transactions.owner_id", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.transactions.currency", "sql_type": "char(3)", "provenance": "currency"},
+        {"name": "pennilogic.transactions.kind", "sql_type": "text", "provenance": "reference_domain"},
+        {"name": "pennilogic.transactions.status", "sql_type": "text", "provenance": "reference_domain"},
+        {"name": "pennilogic.transactions.occurred_at", "sql_type": "timestamptz(3)", "provenance": "instant_or_date"},
+        {"name": "pennilogic.transactions.booked_at", "sql_type": "timestamptz(3)", "provenance": "instant_or_date"},
+        {"name": "pennilogic.transactions.created_at", "sql_type": "timestamptz(3)", "provenance": "instant_or_date"},
+        {"name": "pennilogic.transactions.value_date", "sql_type": "date", "provenance": "instant_or_date"},
+        {"name": "pennilogic.transactions.entry_count", "sql_type": "smallint", "provenance": "bounded_count"},
+        {"name": "pennilogic.transactions.reverses", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.transactions.replaces", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.transactions.correction_id", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.transactions.reason_code", "sql_type": "text", "provenance": "reference_domain"},
+        {"name": "pennilogic.transactions.reason_ref", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.transactions.reason_note", "sql_type": "bytea", "provenance": "memo_ciphertext"},
+        {"name": "pennilogic.transactions.reconciles_snapshot_id", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.transactions.exchange_group_id", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.transactions.description", "sql_type": "bytea", "provenance": "transaction_ciphertext"},
+        {"name": "pennilogic.transactions.merchant_display", "sql_type": "bytea", "provenance": "merchant_ciphertext"},
+        {"name": "pennilogic.transactions.merchant_bidx", "sql_type": "bytea", "provenance": "merchant_blind_index"},
+        {"name": "pennilogic.transactions.merchant_raw", "sql_type": "bytea", "provenance": "merchant_ciphertext"},
+        {"name": "pennilogic.transactions.merchant_amount_minor", "sql_type": "bytea", "provenance": "merchant_ciphertext"},
+        {"name": "pennilogic.transactions.merchant_currency", "sql_type": "char(3)", "provenance": "currency"},
+        {"name": "pennilogic.transactions.note", "sql_type": "bytea", "provenance": "memo_ciphertext"},
+        {"name": "pennilogic.transactions.external_ref", "sql_type": "bytea", "provenance": "transaction_ciphertext"},
+        {"name": "pennilogic.transactions.external_ref_bidx", "sql_type": "bytea", "provenance": "transaction_blind_index"},
+        {"name": "pennilogic.entries.id", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.entries.transaction_id", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.entries.owner_id", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.entries.account_id", "sql_type": "uuid", "provenance": "identifier"},
+        {"name": "pennilogic.entries.currency", "sql_type": "char(3)", "provenance": "currency"},
+        {"name": "pennilogic.entries.amount_minor", "sql_type": "bigint", "provenance": "minor_units"}
+      ]
+    },
+    {
+      "migration": "V002__create_ledger",
+      "direction": "down",
+      "sha256": "a7c101892b51c67f85ae5d2d5a7abfd9a8c63ae7d595755aff338011f98a2f18",
+      "grammar": "api-ledger-v2-exact",
+      "columns": []
+    }
+  ]
+}
