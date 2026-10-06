@@ -60,14 +60,16 @@ internal class AdmissionInstallation(
                     paths.limit(9).map { bundle.relativize(it).joinToString("/") }.toList()
                 }
             admissionRequire(actual.toSet() == PAYLOAD_PATHS + setOf("", "scripts", "database"), AdmissionReason.SOURCE_INVALID)
-            var inputs: ByteArray? = null
-            for ((name, pin) in pins.payloads) {
-                val content = read(bundle, name, pin.bytes)
-                admissionRequire(content.size == pin.bytes && digest(content) == pin.sha256, AdmissionReason.SOURCE_CHANGED)
-                if (name == "inputs.json") inputs = content
-            }
+            val contents =
+                pins.payloads.mapValues { (name, pin) ->
+                    val content = read(bundle, name, pin.bytes)
+                    admissionRequire(content.size == pin.bytes && digest(content) == pin.sha256, AdmissionReason.SOURCE_CHANGED)
+                    content
+                }
             return Verified(
-                AdmissionJson.parse(requireNotNull(inputs), DatabaseAdmission.REQUEST_LIMIT).admissionObject(setOf("policy", "inventory")),
+                AdmissionJson
+                    .parse(contents.getValue("inputs.json"), DatabaseAdmission.REQUEST_LIMIT)
+                    .admissionObject(setOf("policy", "inventory")),
                 launcher,
             )
         } catch (_: IOException) {
@@ -118,7 +120,7 @@ internal class AdmissionInstallation(
                 size != null && size in 1..DatabaseAdmission.REQUEST_LIMIT && DatabaseAdmission.SHA256.matches(hash),
             AdmissionReason.SOURCE_INVALID,
         )
-        return Pin(name, requireNotNull(size), hash)
+        return Pin(name, size, hash)
     }
 
     private data class Pin(
@@ -194,7 +196,7 @@ internal class AdmissionInstallation(
             var current = root
             val parts = relative.split("/")
             var attributes = Files.readAttributes(current, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
-            admissionRequire(attributes.isDirectory && !attributes.isOther && !attributes.isSymbolicLink, AdmissionReason.SOURCE_INVALID)
+            admissionRequire(!attributes.isSymbolicLink && !attributes.isOther && attributes.isDirectory, AdmissionReason.SOURCE_INVALID)
             for ((index, part) in parts.withIndex()) {
                 current = current.resolve(part)
                 attributes = Files.readAttributes(current, BasicFileAttributes::class.java, NOFOLLOW_LINKS)

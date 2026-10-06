@@ -82,7 +82,7 @@ class MigrationAdmissionPostgresTest {
     }
 
     @Test
-    fun `missing policy refuses a binary column before even creating the registry`() {
+    fun `an unapproved binary column is refused before even creating the registry`() {
         val database = TestDatabase.fresh()
         Fixtures.write(
             directory,

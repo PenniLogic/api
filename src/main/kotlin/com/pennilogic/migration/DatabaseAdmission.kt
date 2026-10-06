@@ -7,6 +7,8 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import kotlin.contracts.ExperimentalContracts
+import kotlin.contracts.contract
 
 /** Only static codes cross the CLI boundary; no provider output, SQL, source payload or exception text. */
 class AdmissionRefused internal constructor(
@@ -33,10 +35,12 @@ internal enum class AdmissionReason {
     PROVIDER_DENIED,
 }
 
+@OptIn(ExperimentalContracts::class)
 internal fun admissionRequire(
     condition: Boolean,
     reason: AdmissionReason = AdmissionReason.JSON_INVALID,
 ) {
+    contract { returns() implies condition }
     if (!condition) throw AdmissionRefused(reason)
 }
 
@@ -100,8 +104,7 @@ internal class DatabaseAdmission(
         admissionRequire(selection.map { it.migration.id }.distinct().size == selection.size, AdmissionReason.INPUT_INVALID)
         for (item in selection) {
             admissionRequire(
-                migrations.any { it === item.migration } &&
-                    (item.direction == "up" || item.direction == item.migration.reversal.kind.directive),
+                item.direction == "up" || item.direction == item.migration.reversal.kind.directive,
                 AdmissionReason.INPUT_INVALID,
             )
         }
@@ -189,8 +192,8 @@ internal class DatabaseAdmission(
                 val policySource = policy as? JsonObject
                 val inventorySource = (inventory as? JsonObject)?.get("source") as? JsonObject
                 admissionRequire(policySource != null && inventorySource != null, AdmissionReason.OUTPUT_INVALID)
-                val policyCommit = requireNotNull(policySource).admissionString("commit")
-                val inventoryCommit = requireNotNull(inventorySource).admissionString("commit")
+                val policyCommit = policySource.admissionString("commit")
+                val inventoryCommit = inventorySource.admissionString("commit")
                 admissionRequire(
                     output.exitCode == 0 && result["reason"] == JsonNull &&
                         COMMIT.matches(policyCommit) && COMMIT.matches(inventoryCommit) &&

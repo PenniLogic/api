@@ -90,6 +90,23 @@ class AdmissionProcessTest {
     }
 
     @Test
+    fun `provider exit does not leave an inherited output pipe or its observed child alive`() {
+        assertEquals(
+            "PROCESS_TIMEOUT",
+            assertThrows(AdmissionRefused::class.java) {
+                run(
+                    "import subprocess,sys,time,pathlib; " +
+                        "child=subprocess.Popen([sys.executable,'-I','-S','-B','-c','import time; time.sleep(60)']); " +
+                        "pathlib.Path('child.pid').write_text(str(child.pid)); time.sleep(0.25)",
+                    timeout = Duration.ofSeconds(1),
+                )
+            }.code,
+        )
+        val child = Files.readString(directory.resolve("child.pid")).trim().toLong()
+        assertFalse(ProcessHandle.of(child).map { it.isAlive }.orElse(false))
+    }
+
+    @Test
     fun `missing executable and over-limit requests fail with static codes`() {
         val error =
             assertThrows(AdmissionRefused::class.java) {
@@ -105,6 +122,27 @@ class AdmissionProcessTest {
             "INPUT_INVALID",
             assertThrows(AdmissionRefused::class.java) {
                 run("raise AssertionError('must not run')", ByteArray(DatabaseAdmission.REQUEST_LIMIT + 1))
+            }.code,
+        )
+        assertEquals(
+            "INPUT_INVALID",
+            assertThrows(AdmissionRefused::class.java) {
+                AdmissionProcess().run(
+                    listOf(directory.resolve("must-not-execute").toString()),
+                    directory,
+                    byteArrayOf(),
+                    ByteArray(DatabaseAdmission.REQUEST_LIMIT + 1),
+                )
+            }.code,
+        )
+    }
+
+    @Test
+    fun `closed provider input is an explicit IO refusal rather than partial request success`() {
+        assertEquals(
+            "PROCESS_IO",
+            assertThrows(AdmissionRefused::class.java) {
+                run("import os,time; os.close(0); time.sleep(0.1)", ByteArray(DatabaseAdmission.REQUEST_LIMIT))
             }.code,
         )
     }

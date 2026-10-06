@@ -96,7 +96,7 @@ internal object AdmissionJson {
                 else -> {
                     val token = NUMBER.find(text, at)
                     admissionRequire(token != null && token.range.first == at)
-                    at += requireNotNull(token).value.length
+                    at += token.value.length
                     primitive(token.value)
                 }
             }
@@ -118,8 +118,7 @@ internal object AdmissionJson {
 
         private fun primitive(token: String): JsonPrimitive =
             try {
-                ProtocolJson.parseToJsonElement(token) as? JsonPrimitive
-                    ?: throw AdmissionRefused(AdmissionReason.JSON_INVALID)
+                ProtocolJson.decodeFromString(JsonPrimitive.serializer(), token)
             } catch (_: SerializationException) {
                 throw AdmissionRefused(AdmissionReason.JSON_INVALID)
             }
@@ -161,5 +160,5 @@ internal fun JsonElement.admissionObject(fields: Set<String>): JsonObject {
 internal fun JsonObject.admissionString(key: String): String {
     val value = get(key) as? JsonPrimitive
     admissionRequire(value != null && value.isString)
-    return requireNotNull(value).content
+    return value.content
 }

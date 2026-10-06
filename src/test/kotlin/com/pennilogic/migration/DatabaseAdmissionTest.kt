@@ -166,6 +166,51 @@ class DatabaseAdmissionTest {
     }
 
     @Test
+    fun `denials cannot carry execution authority or sensitive free-text reasons`() {
+        val migrations = set().migrations
+        for ((key, value) in mapOf(
+            "plan_sha256" to JsonPrimitive("a".repeat(64)),
+            "scripts" to JsonArray(listOf(JsonNull)),
+            "policy_commit" to JsonPrimitive("a".repeat(40)),
+            "inventory_commit" to JsonPrimitive("b".repeat(40)),
+            "reason" to JsonPrimitive("sensitive-marker with provider details"),
+        )) {
+            val admission =
+                adapter { command, request ->
+                    val denied =
+                        AdmissionJson
+                            .parse(
+                                AdmissionFixtures.deny(command, request).stdout,
+                                DatabaseAdmission.OUTPUT_LIMIT,
+                            ).jsonObject
+                    output(JsonObject(denied + (key to value)), exit = 1)
+                }
+            val refused = assertThrows(AdmissionRefused::class.java) { admission.validate(migrations) }
+            assertEquals("OUTPUT_INVALID", refused.code)
+            assertFalse(refused.toString().contains("sensitive-marker"))
+        }
+    }
+
+    @Test
+    fun `admit cannot validate absent malformed or nonimmutable source identities`() {
+        val migrations = set().migrations
+        val invalidSources =
+            listOf(
+                JsonNull to AdmissionFixtures.inventory,
+                AdmissionFixtures.policy to JsonNull,
+                AdmissionFixtures.policy to JsonObject(emptyMap()),
+                AdmissionFixtures.policy to JsonObject(mapOf("source" to JsonArray(emptyList()))),
+                JsonObject(mapOf("commit" to JsonPrimitive("a".repeat(39)))) to AdmissionFixtures.inventory,
+                AdmissionFixtures.policy to
+                    JsonObject(mapOf("source" to JsonObject(mapOf("commit" to JsonPrimitive("main"))))),
+            )
+        for ((policy, inventory) in invalidSources) {
+            val admission = DatabaseAdmission(policy, inventory, AdmissionFixtures::accept)
+            assertEquals("OUTPUT_INVALID", assertThrows(AdmissionRefused::class.java) { admission.validate(migrations) }.code)
+        }
+    }
+
+    @Test
     fun `malformed duplicate multiple oversized and invalid UTF8 results all block`() {
         val set = set()
         val invalid: List<(String) -> ByteArray> =
@@ -218,6 +263,15 @@ class DatabaseAdmissionTest {
         val oversized = original.copy(sql = "x".repeat(DatabaseAdmission.SQL_LIMIT + 1))
         assertThrows(AdmissionRefused::class.java) { admission.validate(listOf(oversized)) }
         assertThrows(AdmissionRefused::class.java) { admission.validate(List(129) { original }) }
+        assertThrows(AdmissionRefused::class.java) { admission.authorize(set.migrations, List(129) { AdmissionSelection(original, "up") }) }
+        for (invalid in listOf(
+            original.copy(sql = ""),
+            original.copy(reversal = original.reversal.copy(sql = "")),
+            original.copy(checksum = "f".repeat(64)),
+            original.copy(reversal = original.reversal.copy(checksum = "f".repeat(64))),
+        )) {
+            assertEquals("INPUT_INVALID", assertThrows(AdmissionRefused::class.java) { admission.validate(listOf(invalid)) }.code)
+        }
     }
 
     @Test
@@ -261,6 +315,23 @@ class DatabaseAdmissionTest {
     }
 
     @Test
+    fun `JSON container limits and token syntax reject malformed transport without rejecting exact bounds`() {
+        val atLimit = "[" + List(4096) { "0" }.joinToString(",") + "]"
+        assertEquals(4096, AdmissionJson.parse(atLimit.toByteArray(), DatabaseAdmission.OUTPUT_LIMIT).jsonArray.size)
+        val tooMany = "[" + List(4097) { "0" }.joinToString(",") + "]"
+        for (json in listOf(tooMany, "{", "{true:1}", """{"key":tru}""", """{"key":fals}""", """{"key":nul}""", "@0", "@", "\"")) {
+            assertThrows(AdmissionRefused::class.java) { AdmissionJson.parse(json.toByteArray(), DatabaseAdmission.OUTPUT_LIMIT) }
+        }
+        val valid = """ [ {}, [], true, false, null, -1.25e+2, "quote:\" slash:\\ tab:\t" ] """
+        assertEquals(7, AdmissionJson.parse(valid.toByteArray(), DatabaseAdmission.OUTPUT_LIMIT).jsonArray.size)
+        for (value in listOf(JsonArray(emptyList()), JsonObject(emptyMap()), JsonNull, JsonPrimitive(1))) {
+            val objectWithField = JsonObject(mapOf("field" to value))
+            assertThrows(AdmissionRefused::class.java) { objectWithField.admissionString("field") }
+        }
+        assertThrows(AdmissionRefused::class.java) { JsonObject(emptyMap()).admissionString("absent") }
+    }
+
+    @Test
     fun `normalization happens once before immutable buffers are admitted`() {
         Fixtures.write(directory, "V001__line_endings", Fixtures.header().replace("\n", "\r\n") + "SELECT 1;\r\n", "SELECT 2;\r\n")
         val set = AdmissionFixtures.load(directory)
@@ -276,6 +347,46 @@ class DatabaseAdmissionTest {
             "MIGRATIONS_CHANGED",
             assertThrows(AdmissionRefused::class.java) { set.authorize(listOf(AdmissionSelection(migration, "up"))) }.code,
         )
+    }
+
+    @Test
+    fun `removed migration directory and invalid UTF8 cannot change previously admitted buffers`() {
+        val set = set()
+        val forward = directory.resolve(set.migrations.first().file)
+        Files.write(forward, byteArrayOf(0xc3.toByte(), 0x28))
+        assertEquals("INPUT_INVALID", assertThrows(AdmissionRefused::class.java) { AdmissionFixtures.load(directory) }.code)
+        assertEquals("MIGRATIONS_CHANGED", assertThrows(AdmissionRefused::class.java) { set.authorize(emptyList()) }.code)
+        Files.list(directory).use { files -> files.forEach { Files.delete(it) } }
+        Files.delete(directory)
+        assertEquals("MIGRATIONS_CHANGED", assertThrows(AdmissionRefused::class.java) { set.authorize(emptyList()) }.code)
+    }
+
+    @Test
+    fun `file count byte count and complete-set size caps apply before provider invocation`() {
+        for (length in listOf(DatabaseAdmission.SQL_LIMIT + 1, DatabaseAdmission.SQL_LIMIT * 2 + 1)) {
+            val path = directory.resolve("bytes-$length")
+            Fixtures.write(path, "V001__bounded", Fixtures.header() + "SELECT 1;", "SELECT 1;")
+            Files.write(path.resolve("V001__bounded.up.sql"), ByteArray(length) { ' '.code.toByte() })
+            assertEquals("INPUT_INVALID", assertThrows(AdmissionRefused::class.java) { AdmissionFixtures.load(path) }.code)
+        }
+        val nonfile = directory.resolve("nonfile")
+        Fixtures.write(nonfile, "V001__bounded", Fixtures.header() + "SELECT 1;", "SELECT 1;")
+        Files.delete(nonfile.resolve("V001__bounded.up.sql"))
+        Files.createDirectory(nonfile.resolve("V001__bounded.up.sql"))
+        assertEquals("INPUT_INVALID", assertThrows(AdmissionRefused::class.java) { AdmissionFixtures.load(nonfile) }.code)
+        val many = Files.createDirectory(directory.resolve("many"))
+        repeat(257) { Files.writeString(many.resolve("entry-$it"), "") }
+        assertEquals("INPUT_INVALID", assertThrows(AdmissionRefused::class.java) { AdmissionFixtures.load(many) }.code)
+        val aggregate = directory.resolve("aggregate")
+        for (version in 1..5) {
+            val sql = "SELECT 1; --" + " ".repeat(235000)
+            Fixtures.write(aggregate, "${MigrationSet.label(version)}__bounded", Fixtures.header() + sql, sql)
+        }
+        val failure =
+            assertThrows(AdmissionRefused::class.java) {
+                MigrationSet.load(aggregate) { throw AssertionError("over-limit set reached provider construction") }
+            }
+        assertEquals("INPUT_INVALID", failure.code)
     }
 
     @Test

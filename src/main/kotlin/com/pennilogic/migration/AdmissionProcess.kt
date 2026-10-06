@@ -8,7 +8,6 @@ import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.TimeoutException
 
 /** Internal transport primitive; only the installation builds production commands from fixed, reviewed source. */
 internal class AdmissionProcess(
@@ -25,9 +24,7 @@ internal class AdmissionProcess(
             AdmissionReason.INPUT_INVALID,
         )
         val builder = ProcessBuilder(command).directory(directory.toFile())
-        val systemRoot = builder.environment()["SystemRoot"]
-        builder.environment().clear()
-        if (systemRoot != null) builder.environment()["SystemRoot"] = systemRoot
+        builder.environment().keys.retainAll(sortedSetOf(String.CASE_INSENSITIVE_ORDER, "SystemRoot"))
         val process =
             try {
                 builder.start()
@@ -50,22 +47,28 @@ internal class AdmissionProcess(
                         it.write(input)
                     }
                 }
-            val streams = listOf(stdout, stderr, stdin)
-            while (process.isAlive || streams.any { !it.isDone }) {
+            val pending = linkedSetOf(stdout, stderr, stdin)
+            while (process.isAlive || pending.isNotEmpty()) {
                 process.descendants().use { children -> children.forEach { descendants[it.pid()] = it } }
                 remaining(deadline)
-                streams.filter { it.isDone }.forEach { await(it, deadline) }
+                pending.removeIf {
+                    if (it.isDone) {
+                        completed(it)
+                        true
+                    } else {
+                        false
+                    }
+                }
                 Thread.sleep(10)
             }
-            await(stdin, deadline)
-            val output = await(stdout, deadline)
-            val errors = await(stderr, deadline)
-            admissionRequire(process.waitFor(remaining(deadline), TimeUnit.NANOSECONDS), AdmissionReason.PROCESS_TIMEOUT)
+            completed(stdin)
+            val output = completed(stdout)
+            val errors = completed(stderr)
+            remaining(deadline)
             admissionRequire(errors.isEmpty(), AdmissionReason.OUTPUT_INVALID)
             return AdmissionOutput(process.exitValue(), output)
         } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-            throw AdmissionRefused(AdmissionReason.PROCESS_INTERRUPTED)
+            throw interruptedRefusal()
         } finally {
             // Kill only this invocation's descendants and process, never other interpreters on the host.
             process.descendants().use { children -> children.forEach { descendants[it.pid()] = it } }
@@ -81,12 +84,16 @@ internal class AdmissionProcess(
                 val finished = executor.awaitTermination(2, TimeUnit.SECONDS)
                 admissionRequire(stopped && finished && descendants.values.none { it.isAlive }, AdmissionReason.PROCESS_CLEANUP)
             } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                throw AdmissionRefused(AdmissionReason.PROCESS_INTERRUPTED)
+                throw interruptedRefusal()
             } finally {
                 if (interrupted) Thread.currentThread().interrupt()
             }
         }
+    }
+
+    private fun interruptedRefusal(): AdmissionRefused {
+        Thread.currentThread().interrupt()
+        return AdmissionRefused(AdmissionReason.PROCESS_INTERRUPTED)
     }
 
     private fun boundedRead(
@@ -99,14 +106,10 @@ internal class AdmissionProcess(
             bytes
         }
 
-    private fun <T> await(
-        future: Future<T>,
-        deadline: Long,
-    ): T =
+    // The polling loop checks completion before every call and owns the single process deadline.
+    private fun <T> completed(future: Future<T>): T =
         try {
-            future.get(remaining(deadline), TimeUnit.NANOSECONDS)
-        } catch (_: TimeoutException) {
-            throw AdmissionRefused(AdmissionReason.PROCESS_TIMEOUT)
+            future.get()
         } catch (error: ExecutionException) {
             throw (error.cause as? AdmissionRefused ?: AdmissionRefused(AdmissionReason.PROCESS_IO))
         }

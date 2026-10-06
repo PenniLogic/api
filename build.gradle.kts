@@ -23,6 +23,33 @@ application {
     mainClass.set("com.pennilogic.bootstrap.ApplicationKt")
 }
 
+val prepareDatabaseAdmission =
+    tasks.register<Exec>("prepareDatabaseAdmission") {
+        description = "Explicitly fetches or verifies the exact accepted database-admission source bundle."
+        group = "verification"
+        workingDir(rootDir)
+        commandLine("python", "-I", "-S", "-B", "scripts/prepare_database_admission.py", "prepare", "--fetch")
+        mustRunAfter(tasks.clean)
+    }
+
+val verifyDatabaseAdmission =
+    tasks.register<Exec>("verifyDatabaseAdmission") {
+        description = "Verifies the complete pinned database-admission installation offline before migration entrypoints."
+        group = "verification"
+        workingDir(rootDir)
+        commandLine("python", "-I", "-S", "-B", "scripts/prepare_database_admission.py", "verify")
+        mustRunAfter(tasks.clean, prepareDatabaseAdmission)
+    }
+
+val verifyPreparedDatabaseAdmission =
+    tasks.register<Exec>("verifyPreparedDatabaseAdmission") {
+        description = "Verifies build-time admission inputs after explicit bounded source preparation."
+        group = "verification"
+        dependsOn(prepareDatabaseAdmission)
+        workingDir(rootDir)
+        commandLine("python", "-I", "-S", "-B", "scripts/prepare_database_admission.py", "verify")
+    }
+
 val prepareAcceptedSource =
     tasks.register<Exec>("prepareMoneyProvider") {
         description = "Verifies and prepares the immutable accepted Contracts Money source, not a release."
@@ -252,6 +279,7 @@ val integrationTest =
     tasks.register<Test>("integrationTest") {
         description = "Runs the Postgres-backed migration tests against a disposable, digest-pinned postgres:17 container."
         group = "verification"
+        dependsOn(tasks.jar, verifyPreparedDatabaseAdmission)
         testClassesDirs =
             sourceSets.test
                 .get()
@@ -263,9 +291,7 @@ val integrationTest =
         shouldRunAfter(tasks.test)
         systemProperty(
             "app.test.classpath",
-            sourceSets.main
-                .get()
-                .runtimeClasspath.asPath,
+            (files(tasks.jar) + configurations.runtimeClasspath.get()).asPath,
         )
         systemProperty("user.timezone", "UTC")
         testLogging {
@@ -384,11 +410,18 @@ val migrationConventionCheck =
     tasks.register<JavaExec>("migrationConventionCheck") {
         description = "Fails on any migration file that breaks the naming, ordering, header or reversal-evidence convention."
         group = "verification"
+        dependsOn(verifyPreparedDatabaseAdmission)
         classpath = sourceSets.main.get().runtimeClasspath
         mainClass.set("com.pennilogic.migration.MigrationCliKt")
+        outputs.upToDateWhen { false }
+        outputs.cacheIf { false }
         inputs.dir(migrationsDirectory)
         args("validate", "--migrations", migrationsDirectory.asFile.path)
     }
+
+jacoco {
+    applyTo(migrationConventionCheck.get())
+}
 
 val migrationHolder: Provider<String> =
     providers.gradleProperty("migrationHolder").orElse(providers.systemProperty("user.name").map { "$it@gradle" })
@@ -400,6 +433,7 @@ fun registerMigrationTask(
 ) = tasks.register<JavaExec>(name) {
     description = taskDescription
     group = "migration"
+    dependsOn(verifyDatabaseAdmission)
     classpath = sourceSets.main.get().runtimeClasspath
     mainClass.set("com.pennilogic.migration.MigrationCliKt")
     jvmArgs("-Duser.timezone=UTC")
@@ -424,7 +458,8 @@ tasks.jacocoTestReport {
     dependsOn(tasks.test)
     mustRunAfter(integrationTest)
     mustRunAfter(targetedMoneyTest)
-    // Merge every test task's execution data that exists; a skipped integrationTest leaves none behind.
+    mustRunAfter(migrationConventionCheck)
+    // Include the real convention-check CLI alongside test JVMs; a skipped integrationTest leaves no new data.
     executionData.setFrom(fileTree(layout.buildDirectory.dir("jacoco")) { include("*.exec") })
     reports {
         xml.required.set(true)

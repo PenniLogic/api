@@ -1,6 +1,8 @@
 import importlib.util
+import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -11,6 +13,58 @@ from unittest.mock import Mock, call, patch
 SPEC = importlib.util.spec_from_file_location("quality", Path(__file__).resolve().parents[1] / "quality.py")
 quality = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(quality)
+
+
+class GateSelfTestAdmissionCopyTest(unittest.TestCase):
+    def test_real_temp_copy_verifies_admission_offline_before_the_first_gradle_call(self):
+        class CopyVerified(Exception):
+            pass
+
+        calls = []
+
+        def inspect_copy(*tasks, root, **_kwargs):
+            calls.append(tasks)
+            self.assertEqual(("test", "spotlessCheck"), tasks)
+            self.assertNotEqual(quality.ROOT, root)
+            for name in (
+                "scripts/prepare_database_admission.py", "scripts/materialize_money_sources.py",
+                "src/main/resources/database-admission-installation.json",
+            ):
+                self.assertEqual(
+                    hashlib.sha256((quality.ROOT / name).read_bytes()).hexdigest(),
+                    hashlib.sha256((root / name).read_bytes()).hexdigest(),
+                    "the self-test copy changed its pinned executable or resource",
+                )
+
+            def snapshot(directory):
+                return {
+                    path.relative_to(directory).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in directory.rglob("*") if path.is_file()
+                }
+
+            self.assertEqual(snapshot(quality.ROOT / "build/database-admission"), snapshot(root / "build/database-admission"))
+            before = snapshot(root)
+            environment = {
+                key: value for key, value in os.environ.items() if key.upper() in {"SYSTEMROOT", "WINDIR"}
+            }
+            result = subprocess.run(
+                [sys.executable, "-I", "-S", "-B", str(root / "scripts/prepare_database_admission.py"), "verify"],
+                cwd=root, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False,
+            )
+            self.assertEqual(0, result.returncode, "the real copied installation must verify without a fetch")
+            self.assertFalse(result.stderr, "offline verification emitted diagnostics")
+            self.assertEqual(
+                {"event": "database_admission_installation", "status": "verified", "payloads": 5},
+                json.loads(result.stdout),
+            )
+            self.assertEqual(before, snapshot(root), "offline verification mutated the self-test copy")
+            raise CopyVerified
+
+        with tempfile.TemporaryDirectory(prefix="api-admission-copy-test-") as temporary:
+            with patch.object(quality, "gradle", side_effect=inspect_copy), self.assertRaises(CopyVerified):
+                quality.gate_self_test(Path(temporary))
+            self.assertEqual([], list(Path(temporary).iterdir()))
+        self.assertEqual([("test", "spotlessCheck")], calls)
 
 
 class CoverageGateTest(unittest.TestCase):

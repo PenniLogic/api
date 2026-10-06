@@ -1,6 +1,7 @@
 package com.pennilogic.migration
 
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -15,10 +16,21 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Assumptions.abort
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import java.io.File
+import java.io.IOException
+import java.lang.reflect.InvocationTargetException
+import java.net.URI
+import java.net.URL
+import java.net.URLClassLoader
+import java.net.URLConnection
+import java.net.URLStreamHandler
 import java.nio.file.FileSystemException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.MessageDigest
+import java.util.Collections
+import java.util.Enumeration
+import java.util.concurrent.TimeUnit
 
 /** Synthetic installation authority is confined to these unit tests; no real provider acceptance is asserted. */
 class AdmissionInstallationTest {
@@ -195,6 +207,83 @@ class AdmissionInstallationTest {
     }
 
     @Test
+    fun `same-length launcher and payload substitutions still require their exact hashes`() {
+        for (path in listOf(
+            launcherPath,
+            "build/database-admission/scripts/database_admission.py",
+            "build/database-admission/scripts/database_sql.py",
+            "build/database-admission/scripts/database_baseline.py",
+            "build/database-admission/database/admission-trust.json",
+            "build/database-admission/inputs.json",
+        )) {
+            val definition = fixture()
+            val bytes = Files.readAllBytes(directory.resolve(path))
+            bytes[0] = (bytes[0].toInt() xor 1).toByte()
+            write(path, bytes)
+            assertEquals("SOURCE_CHANGED", assertThrows(AdmissionRefused::class.java) { installation(definition).verify() }.code)
+        }
+        assertFalse(Files.exists(directory.resolve("synthetic-launcher-ran")))
+    }
+
+    @Test
+    fun `nonregular roots intermediate paths and special payloads cannot redirect or block reads`() {
+        val definition = fixture()
+        val alias = directory.resolve("special")
+        val target = Files.createDirectory(directory.resolve("target"))
+        val builder =
+            if (System.getProperty("os.name").startsWith("Windows")) {
+                ProcessBuilder(
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "New-Item -ItemType Junction -Path \$env:ADMISSION_TEST_LINK -Target \$env:ADMISSION_TEST_TARGET -ErrorAction Stop | Out-Null",
+                ).apply {
+                    environment()["ADMISSION_TEST_LINK"] = alias.toString()
+                    environment()["ADMISSION_TEST_TARGET"] = target.toString()
+                }
+            } else {
+                ProcessBuilder("mkfifo", alias.toString())
+            }
+        val process = builder.redirectErrorStream(true).start()
+        try {
+            assertTrue(process.waitFor(10, TimeUnit.SECONDS), "special-file fixture did not finish")
+            assertEquals(0, process.exitValue(), "special-file fixture was not created")
+        } finally {
+            if (process.isAlive) {
+                process.destroyForcibly()
+                assertTrue(process.waitFor(5, TimeUnit.SECONDS))
+            }
+        }
+        val payload = directory.resolve("build/database-admission/scripts/database_sql.py")
+        try {
+            assertEquals(
+                "SOURCE_INVALID",
+                assertThrows(
+                    AdmissionRefused::class.java,
+                ) { AdmissionInstallation(alias, definition.toString().toByteArray()).verify() }.code,
+            )
+            Files.delete(payload)
+            Files.move(alias, payload)
+            assertEquals("SOURCE_INVALID", assertThrows(AdmissionRefused::class.java) { installation(definition).verify() }.code)
+        } finally {
+            Files.deleteIfExists(alias)
+            Files.deleteIfExists(payload)
+        }
+        assertEquals(
+            "SOURCE_INVALID",
+            assertThrows(AdmissionRefused::class.java) {
+                AdmissionInstallation(directory.resolve(launcherPath), definition.toString().toByteArray()).verify()
+            }.code,
+        )
+        Files.delete(directory.resolve(launcherPath))
+        Files.delete(directory.resolve("scripts"))
+        Files.writeString(directory.resolve("scripts"), "not a directory")
+        assertEquals("SOURCE_INVALID", assertThrows(AdmissionRefused::class.java) { installation(definition).verify() }.code)
+        assertFalse(Files.exists(directory.resolve("synthetic-launcher-ran")))
+    }
+
+    @Test
     fun `resource consumer launcher path mode and duplicate payloads are closed`() {
         val definition = fixture()
         val launcher = definition.getValue("launcher").jsonObject
@@ -218,6 +307,50 @@ class AdmissionInstallationTest {
     }
 
     @Test
+    fun `installation identities payload collections and byte bounds are never coerced`() {
+        val definition = fixture()
+        val consumer = definition.getValue("consumer").jsonObject
+        val launcher = definition.getValue("launcher").jsonObject
+        val binding = definition.getValue("binding").jsonObject
+        val invalid = mutableListOf<JsonObject>()
+        for (key in listOf("schema", "gate", "runtime")) {
+            invalid += JsonObject(definition + (key to JsonPrimitive("unrecognized")))
+        }
+        for ((key, value) in mapOf(
+            "repository" to JsonPrimitive("unrecognized/api"),
+            "organization_id" to JsonPrimitive(1),
+        )) {
+            invalid += JsonObject(definition + ("consumer" to JsonObject(consumer + (key to value))))
+        }
+        for (size: JsonElement in listOf(
+            JsonNull,
+            JsonArray(emptyList()),
+            JsonPrimitive("1"),
+            JsonPrimitive(1.5),
+            JsonPrimitive(2097153),
+        )) {
+            invalid += JsonObject(definition + ("launcher" to JsonObject(launcher + ("bytes" to size))))
+        }
+        for (payloads in listOf(JsonNull, JsonArray(emptyList()), JsonArray(binding.getValue("payloads").jsonArray.dropLast(1)))) {
+            invalid += JsonObject(definition + ("binding" to JsonObject(binding + ("payloads" to payloads))))
+        }
+        for (item in invalid) {
+            assertThrows(AdmissionRefused::class.java) { installation(item) }
+        }
+        assertFalse(Files.exists(directory.resolve("synthetic-launcher-ran")))
+    }
+
+    @Test
+    fun `missing and nonfile launchers never reach execution`() {
+        val definition = fixture()
+        Files.delete(directory.resolve(launcherPath))
+        assertEquals("SOURCE_UNAVAILABLE", assertThrows(AdmissionRefused::class.java) { installation(definition).verify() }.code)
+        Files.createDirectory(directory.resolve(launcherPath))
+        assertEquals("SOURCE_INVALID", assertThrows(AdmissionRefused::class.java) { installation(definition).verify() }.code)
+        assertFalse(Files.exists(directory.resolve("synthetic-launcher-ran")))
+    }
+
+    @Test
     fun `null acceptance binding is an explicit unavailable-source refusal`() {
         val definition = JsonObject(fixture() + ("binding" to JsonNull))
         assertEquals("SOURCE_UNAVAILABLE", assertThrows(AdmissionRefused::class.java) { installation(definition) }.code)
@@ -231,6 +364,48 @@ class AdmissionInstallationTest {
         val installation = AdmissionInstallation(directory, bytes)
         bytes.fill(0)
         assertTrue(installation.verify().inputs.containsKey("policy"))
+    }
+
+    @Test
+    fun `public load rejects missing duplicate and unreadable classpath resources with static diagnostics`() {
+        Fixtures.threePhaseSet(directory)
+        val urls =
+            System
+                .getProperty("app.test.classpath")
+                .split(File.pathSeparator)
+                .map { Path.of(it).toUri().toURL() }
+                .toTypedArray()
+        val broken =
+            URL.of(
+                URI.create("admission-test:unavailable"),
+                object : URLStreamHandler() {
+                    override fun openConnection(url: URL): URLConnection = throw IOException("sensitive-resource-location")
+                },
+            )
+        for (mode in listOf("missing", "duplicate", "listing-io", "reading-io")) {
+            val loader =
+                object : URLClassLoader(urls, ClassLoader.getPlatformClassLoader()) {
+                    override fun getResources(name: String): Enumeration<URL> {
+                        if (name != "database-admission-installation.json") return super.getResources(name)
+                        if (mode == "listing-io") throw IOException("sensitive-classpath-location")
+                        return Collections.enumeration(
+                            when (mode) {
+                                "missing" -> emptyList()
+                                "duplicate" -> listOf(broken, broken)
+                                else -> listOf(broken)
+                            },
+                        )
+                    }
+                }
+            loader.use {
+                val companion = it.loadClass(MigrationSet::class.java.name).getField("Companion").get(null)
+                val load = companion.javaClass.getMethod("load", Path::class.java)
+                val error = assertThrows(InvocationTargetException::class.java) { load.invoke(companion, directory) }.targetException
+                assertEquals(AdmissionRefused::class.java.name, error.javaClass.name)
+                assertEquals("SOURCE_UNAVAILABLE", error.message)
+                assertFalse(error.toString().contains("sensitive-"))
+            }
+        }
     }
 
     @Test
@@ -248,6 +423,14 @@ class AdmissionInstallationTest {
             throw error
         }
         assertEquals("SOURCE_INVALID", assertThrows(AdmissionRefused::class.java) { installation(definition).verify() }.code)
+        val rootAlias = directory.resolve("root-alias")
+        Files.createSymbolicLink(rootAlias, target)
+        assertEquals(
+            "SOURCE_INVALID",
+            assertThrows(
+                AdmissionRefused::class.java,
+            ) { AdmissionInstallation(rootAlias, definition.toString().toByteArray()).verify() }.code,
+        )
         assertFalse(Files.exists(directory.resolve("synthetic-launcher-ran")))
     }
 }

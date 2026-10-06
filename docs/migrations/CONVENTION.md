@@ -45,6 +45,27 @@ do not create a local acceptance record or substitute test authority to make
 the packaged command succeed. Inventory publication alone is not installation,
 provider acceptance, native CI evidence, or permission to deploy.
 
+The normal `python scripts/quality.py build` command runs Gradle `build` and
+`installDist`. Its `check` graph requires `migrationConventionCheck` and
+`integrationTest`; both depend on `verifyPreparedDatabaseAdmission`, which
+depends on `prepareDatabaseAdmission`. The preparation task invokes
+`python -I -S -B scripts/prepare_database_admission.py prepare --fetch`.
+The canonical CI command list also prepares the bundle explicitly before the
+quality command. This is bounded public source preparation, not SQL execution
+or provider activation; an existing bundle is verified rather than refreshed
+or overwritten.
+
+Both verification tasks run the same fixed launcher with `verify`, offline.
+Build verification has an actual preparation dependency, including under
+parallel Gradle execution. Direct migration, dry-run and status tasks instead
+depend only on `verifyDatabaseAdmission` and never schedule a download.
+`./gradlew migrationConventionCheck integrationTest` prepares a new build
+explicitly; `./gradlew prepareDatabaseAdmission migrateDryRun` explicitly
+prepares before an otherwise offline migration command.
+The packaged CLI, `MigrationSet.load`, `plan` and `admit-apply` remain offline
+and revalidate the compiled installation binding and exact SQL buffers. A
+missing or changed bundle is an explicit refusal, not an implicit fetch.
+
 Admission precedes session configuration, registry bootstrap, lock changes and
 migration execution. A denied plan writes none of these. A dry run still
 requires admission but never changes connection settings or bootstraps the
@@ -60,7 +81,17 @@ unknown fields, changed hashes/order/directions and any stderr block the run.
 Each provider invocation has a ten-second outer deadline and bounded cleanup.
 Diagnostics contain static codes, never SQL, policy content, complete process
 output, or exception text. Internal protocol doubles in test sources exercise
-runner/recovery behavior; they are not real provider acceptance.
+runner/recovery behavior; they are not real provider acceptance. Packaged
+admission tests use the actual application JAR and installed canonical provider
+without those doubles for forward, reverse, no-op, dry-run and refusal paths.
+
+`migrationConventionCheck` always executes, including when compilation is
+up to date. Its real CLI execution is instrumented with the same pinned JaCoCo
+agent as the tests and contributes `migrationConventionCheck.exec` through the
+existing execution-data aggregation. This does not add or exclude shipped
+classes, replace the packaged assertions, or relax the explicit-base coverage
+ratchet or zero-skip quality check. An unavailable filesystem fixture remains a
+reported capability gap, not a passing check or an invented coverage baseline.
 
 ## Files
 
