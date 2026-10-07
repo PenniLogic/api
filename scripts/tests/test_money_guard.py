@@ -213,6 +213,118 @@ class MoneySourceGuardTest(unittest.TestCase):
                         self.assertIn("Long", declared["balance"])
                         self.assertNotIn("Double", declared["balance"])
 
+    def test_java_local_var_preserves_inferred_money(self):
+        for modifier_index, modifier in enumerate(("", "final ")):
+            for form, declaration in enumerate((
+                "{modifier}var amount = incoming;",
+                "{modifier}var balance = incoming;",
+                "{modifier}var value = incoming; {modifier}var amount = value;",
+                "{modifier}var var = incoming; {modifier}var amount = var;",
+                "{modifier}var first = incoming; {modifier}var amount = first;",
+            )):
+                name = f"InferredMoney{modifier_index}_{form}"
+                declaration = declaration.format(modifier=modifier)
+                source = (
+                    "import com.pennilogic.contracts.money.Money; "
+                    f"final class {name} {{ void copy(Money incoming) {{ {declaration} }} }}"
+                )
+                with self.subTest(modifier=modifier, declaration=declaration):
+                    self.assertEqual([], guard.analyze(f"{name}.java", source))
+                    self.assertEqual({}, guard.java_declaration_types(guard.tokenize(source)))
+
+    def test_java_local_var_keeps_numeric_and_unknown_money_refusals(self):
+        for modifier_index, modifier in enumerate(("", "final ")):
+            for form, (expression, rule) in enumerate((
+                ("0.5", "MG001"),
+                ("1.5f", "MG001"),
+                ('new java.math.BigDecimal("1.0")', "MG001"),
+                ("1L", "MG005"),
+                ("unknown()", "MG005"),
+                ("incoming.getMinorUnits()", "MG005"),
+                ('Double.valueOf("0.5")', "MG001"),
+            )):
+                name = f"InferredRefusal{modifier_index}_{form}"
+                source = (
+                    "import com.pennilogic.contracts.money.Money; "
+                    f"final class {name} {{ void copy(Money incoming) {{ "
+                    f"{modifier}var amount = {expression}; }} "
+                    "private static Object unknown() { return null; } }"
+                )
+                with self.subTest(modifier=modifier, expression=expression):
+                    self.assertEqual([(rule, "amount")], [
+                        (finding.rule, finding.field) for finding in guard.analyze(f"{name}.java", source)
+                    ])
+                    self.assertEqual({}, guard.java_declaration_types(guard.tokenize(source)))
+        source = "final class InferredOrdinary { void read() { var temperature = 0.5; final var count = 1L; } }"
+        self.assertEqual([], guard.analyze("InferredOrdinary.java", source))
+
+    def test_java_local_var_preserves_raw_alias_refusal_rules(self):
+        for modifier_index, modifier in enumerate(("", "final ")):
+            for chained in (False, True):
+                for form, (method, operation, extra, rule) in enumerate((
+                    ("long increment", "return {alias} + 1L;", "", "MG002"),
+                    ("double temperature", "return ((Long) {alias}).doubleValue();", "", "MG003"),
+                    ("void emit", "writeNumber({alias});", "void writeNumber(long value) {}", "MG004"),
+                )):
+                    for parameter in ("minorUnits", "size"):
+                        name = f"VarFlow{modifier_index}_{int(chained)}_{form}_{parameter}"
+                        alias = "value" if chained else "raw"
+                        declarations = f"{modifier}var raw = {parameter}; "
+                        if chained:
+                            declarations += f"{modifier}var value = raw; "
+                        source = (
+                            f"final class {name} {{ {method}(long {parameter}) {{ "
+                            f"{declarations}{operation.format(alias=alias)} }} {extra} }}"
+                        )
+                        with self.subTest(modifier=modifier, chained=chained, rule=rule, parameter=parameter):
+                            # Name-based tracking also reaches the serializer's value parameter.
+                            count = 2 if chained and rule == "MG004" else 1
+                            self.assertEqual([(rule, "")] * count if parameter == "minorUnits" else [], [
+                                (finding.rule, finding.field) for finding in guard.analyze(f"{name}.java", source)
+                            ])
+
+    def test_java_var_variable_and_package_names_keep_explicit_shared_types(self):
+        for index, (kind, initializer, unsafe) in enumerate((
+            ("double", "0.0", True), ("long", "0L", False),
+            ("com.pennilogic.contracts.money.Money", "null", False),
+            ("java.util.List<Double>", "null", True),
+        )):
+            name = f"ExplicitVar{index}"
+            source = (
+                f"final class {name} {{ private {kind} var = {initializer}, "
+                f"amount = {initializer}, balance = {initializer}; }}"
+            )
+            with self.subTest(kind=kind):
+                self.assertEqual([("MG001", "amount"), ("MG001", "balance")] if unsafe else [], [
+                    (finding.rule, finding.field) for finding in guard.analyze(f"{name}.java", source)
+                ])
+                tokens = guard.tokenize(source)
+                types = {token.text for token in guard.tokenize(kind)}
+                self.assertEqual([(field, types) for field in ("var", "amount", "balance")], [
+                    (tokens[position].text, value)
+                    for position, value in guard.java_declaration_types(tokens).items()
+                ])
+        for position, prefix in enumerate(("var", "fixture.var")):
+            for form, kind in enumerate(("Double", "Long", "Money")):
+                package = f"{prefix}.inference{form}"
+                name = f"QualifiedVar{position}_{form}"
+                kind = f"{package}.Holder<{kind}>"
+                source = (
+                    f"package {package}; import com.pennilogic.contracts.money.Money; "
+                    f"final class Holder<T> {{}} final class {name} {{ "
+                    f"private {kind} temperature = null, amount = null; }}"
+                )
+                with self.subTest(package=package, kind=kind):
+                    self.assertEqual([("MG001", "amount")] if form == 0 else [], [
+                        (finding.rule, finding.field) for finding in guard.analyze(f"{name}.java", source)
+                    ])
+                    tokens = guard.tokenize(source)
+                    types = {token.text for token in guard.tokenize(kind)}
+                    self.assertEqual([(field, types) for field in ("temperature", "amount")], [
+                        (tokens[index].text, value)
+                        for index, value in guard.java_declaration_types(tokens).items()
+                    ])
+
     def test_java_later_declarators_survive_nested_initializers_and_array_dimensions(self):
         for declaration in (
             "double temperature = choose(1.0, choose(2.0, 3.0)), amount;",

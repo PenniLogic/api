@@ -27,7 +27,7 @@ JAVA_RESERVED_WORDS = {
 }
 JAVA_NON_TYPES = (JAVA_RESERVED_WORDS - {
     "boolean", "byte", "char", "double", "float", "int", "long", "short",
-}) | {"record", "sealed", "permits", "yield"}
+}) | {"record", "sealed", "permits", "var", "yield"}
 MONEY_WORDS = {
     "money", "amount", "balance", "price", "cost", "fee", "salary", "income", "expense",
     "payment", "refund", "budget", "tax", "principal", "debit", "credit", "total", "cash",
