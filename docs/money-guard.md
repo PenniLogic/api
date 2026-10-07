@@ -191,6 +191,10 @@ name, never an initializer, amount, account value or source line.
 | `MG005` | A money-named declaration whose type cannot be established, including unresolved cross-file aliases and inferred factory results |
 | `MG000` | An incomplete/unreadable source inventory or tokenization |
 
+The shared Java declaration type applies to each comma-separated declarator, including names
+after initialized variables. Commas nested in calls, arrays, generic arguments or initializer
+bodies do not start another declarator, and a later typed declaration establishes its own type.
+
 Money value-type operator dispatch is allowed: `left + right` when both values are Money is not
 raw integer arithmetic. The authoritative wrapper's own implementation remains the exact
 upstream source dependency, not a locally invented exception or duplicate type.

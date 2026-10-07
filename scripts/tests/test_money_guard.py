@@ -41,6 +41,131 @@ class MoneySourceGuardTest(unittest.TestCase):
                 with self.subTest(kind=kind, declaration=declaration):
                     self.assertIn("MG001", self.rules(declaration, "java"))
 
+    def test_java_later_declarators_reject_every_unsafe_type(self):
+        for kind in (
+            "double", "float", "Double", "Float", "java.lang.Double", "java.lang.Float",
+            "BigDecimal", "java.math.BigDecimal", "double[]", "float[][]",
+            "List<Double>", "Map<String, List<java.math.BigDecimal>>",
+        ):
+            for declaration, fields in (
+                (f"private {kind} temperature, amount;", ["amount"]),
+                (f"private static {kind} temperature, distance, amount, balance, fee;", ["amount", "balance", "fee"]),
+                (
+                    f"private final {kind} temperature = sample(), amount = sample(), balance = sample();",
+                    ["amount", "balance"],
+                ),
+                (f"private /* type */ {kind}\n temperature /* gap */,\n /* later */ amount,\n balance;", ["amount", "balance"]),
+            ):
+                with self.subTest(kind=kind, declaration=declaration):
+                    findings = guard.analyze("Synthetic.java", f"class Entry {{ {declaration} }}")
+                    self.assertEqual([("MG001", field) for field in fields], [
+                        (finding.rule, finding.field) for finding in findings
+                    ])
+
+    def test_java_later_declarators_survive_nested_initializers_and_array_dimensions(self):
+        for declaration in (
+            "double temperature = choose(1.0, choose(2.0, 3.0)), amount;",
+            "double temperature = new double[]{1.0, 2.0}[0], amount;",
+            "double temperature[] = {1.0, 2.0}, amount[];",
+            "double temperature[][] = {{1.0, 2.0}, {3.0, 4.0}}, amount[][];",
+            "double temperature @Marker [] = {}, amount @Marker [] = {};",
+            "double temperature @Marker(values = {1, 2}) [] = {}, amount @Marker [] = {};",
+            "Double temperature = Factory.<String, Double>read(), amount;",
+            "Double temperature = new Box<String, Map<Integer, Double>>().read(), amount;",
+            "Double temperature = new Box<@Marker(values = {1, 2}) String, Double>().read(), amount;",
+            "Double temperature = new Supplier<Double>() { public Double get() { return null; } }.get(), amount;",
+            "Double temperature = ((Supplier<Double>) () -> { double x = 1.0, y = 2.0; return x; }).get(), amount;",
+        ):
+            with self.subTest(declaration=declaration):
+                findings = guard.analyze("Synthetic.java", f"class Entry {{ {declaration} }}")
+                self.assertEqual([("MG001", "amount")], [
+                    (finding.rule, finding.field) for finding in findings
+                ])
+
+    def test_java_comparisons_and_shifts_do_not_hide_later_declarators(self):
+        for expression in (
+            "left < right ? 1.0 : 2.0", "left > right ? 1.0 : 2.0",
+            "left <= right ? 1.0 : 2.0", "left >= right ? 1.0 : 2.0",
+            "1 << 2", "8 >> 2", "8 >>> 2",
+            "value instanceof Map<?, ?> ? 1.0 : 2.0",
+        ):
+            with self.subTest(expression=expression):
+                findings = guard.analyze(
+                    "Synthetic.java", f"class Entry {{ double temperature = {expression}, amount; }}",
+                )
+                self.assertEqual([("MG001", "amount")], [
+                    (finding.rule, finding.field) for finding in findings
+                ])
+
+    def test_java_initializer_commas_are_not_declarations(self):
+        for declaration in (
+            "double temperature = sample(null, amount), distance;",
+            "double temperature = sample(new Money[]{amount, amount}), distance;",
+            "double temperature = values[sample(0, amount)], distance;",
+            "Double temperature = Factory.<String, amount, Double>read(), distance;",
+            "Double temperature = new Box<String, amount, Double>().read(), distance;",
+            "Map<String, Double> temperature = new HashMap<String, Double>(), distance;",
+        ):
+            with self.subTest(declaration=declaration):
+                self.assertEqual([], guard.analyze("Synthetic.java", f"class Entry {{ {declaration} }}"))
+
+    def test_java_declarator_types_do_not_leak_between_declarations_or_parameters(self):
+        for source in (
+            "class Entry { double temperature, distance; Money amount; }",
+            "class Entry { double temperature, distance; Money price, amount; }",
+            "class Entry { double temperature, distance; long amount; }",
+            "class Entry { double temperature, distance; void post(Money amount) {} }",
+            "class Entry { Double temperature() { return null; } Money amount; }",
+            "void post(double temperature, Money amount) {}",
+            "void post(double temperature, Money[] amount) {}",
+            "void post(double temperature, List<Money> amount) {}",
+            "void post(double temperature, @Marker com.pennilogic.contracts.money.Money amount) {}",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual([], guard.analyze("Synthetic.java", source))
+        for source, fields in (
+            ("class Entry { Money value, amount; double temperature, balance; }", ["balance"]),
+            ("class Entry { double temperature, amount; Money value, balance; }", ["amount"]),
+            ("void post(double temperature, java.lang.Float amount) {}", ["amount"]),
+            ("class Entry { void post() { double temperature, amount; } float distance, fee; }", ["amount", "fee"]),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual([("MG001", field) for field in fields], [
+                    (finding.rule, finding.field) for finding in guard.analyze("Synthetic.java", source)
+                ])
+
+    def test_java_nonfinancial_declarators_and_money_wrappers_are_allowed(self):
+        for source in (
+            "class Entry { private double temperature, distance; }",
+            "class Entry { private float temperature, taxRate; }",
+            "class Entry { private java.math.BigDecimal temperature, interestRate; }",
+            "class Entry { Money value, amount, balance; Money total = amount + balance; }",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual([], guard.analyze("Synthetic.java", source))
+
+    def test_java_later_integer_declarators_keep_raw_arithmetic_tracking(self):
+        self.assertEqual({"MG002"}, self.rules(
+            "class Entry { long size = 1, amount = 2; long result = amount + 1; }", "java",
+        ))
+
+    def test_java_later_declarator_diagnostics_locate_names_without_disclosing_values(self):
+        source = (
+            "class Entry {\n"
+            "    private double temperature = sample(\"synthetic-account-marker\", 1.0),\n"
+            "        amount = 987654321.123;\n"
+            "}\n"
+        )
+        findings = guard.analyze("Synthetic.java", source)
+        self.assertEqual(1, len(findings))
+        finding = findings[0]
+        self.assertEqual(("MG001", "amount", 3, 9), (
+            finding.rule, finding.field, finding.token.line, finding.token.column,
+        ))
+        self.assertNotIn("987654321", finding.diagnostic())
+        self.assertNotIn("synthetic-account-marker", finding.diagnostic())
+        self.assertNotIn(source, finding.diagnostic())
+
     def test_aliases_cannot_hide_unsafe_kotlin_types(self):
         for source in (
             "typealias Exact = BigDecimal\nval amount: Exact",
@@ -255,6 +380,25 @@ class MoneySourceGuardTest(unittest.TestCase):
             self.assertIn("MG001", errors)
             planted.unlink()
             self.assertEqual(0, self.check(root)[0])
+
+    def test_planted_java_later_field_is_rejected_and_removal_restores_success(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "Normal.java").write_text("class Normal {}", encoding="utf-8")
+            self.assertEqual(0, self.check(root)[0])
+            planted = root / "Planted.java"
+            planted.write_text("class Planted { private double temperature, amount; }", encoding="utf-8")
+            result, metric, errors = self.check(root)
+            self.assertEqual(1, result)
+            self.assertEqual(2, metric["source_files_scanned"])
+            self.assertEqual(1, metric["violations"])
+            self.assertIn("Planted.java:1:45 MG001 field=amount", errors)
+            planted.unlink()
+            result, metric, errors = self.check(root)
+            self.assertEqual((0, 1, 0), (
+                result, metric["source_files_scanned"], metric["violations"],
+            ))
+            self.assertEqual("", errors)
 
 
 if __name__ == "__main__":

@@ -251,6 +251,62 @@ def java_type_prefix(tokens, index):
     return set(result)
 
 
+def java_group_end(tokens, index):
+    closing = {"(": ")", "[": "]", "{": "}", "<": ">"}
+    stack = [closing[tokens[index].text]]
+    for end in range(index + 1, len(tokens)):
+        token = tokens[end]
+        if token.text == stack[-1]:
+            stack.pop()
+            if not stack:
+                return end + 1
+        elif token.text in {"(", "[", "{"} or token.text == "<" and stack[-1] == ">":
+            stack.append(closing[token.text])
+        elif stack[-1] == ">" and token.kind != "identifier" and token.text not in {".", ",", "?", "@", "&"}:
+            # Outside annotation arguments, a generic group contains types, not comparisons.
+            return None
+    return None
+
+
+def java_declarators(tokens, index):
+    while index < len(tokens) and tokens[index].kind == "identifier":
+        end = index + 1
+        while end < len(tokens) and tokens[end].text in {"[", "@"}:
+            if tokens[end].text == "[":
+                if end + 1 >= len(tokens) or tokens[end + 1].text != "]":
+                    return
+                end += 2
+            else:
+                end += 1
+                if end >= len(tokens) or tokens[end].kind != "identifier":
+                    return
+                end += 1
+                while end + 1 < len(tokens) and tokens[end].text == "." and tokens[end + 1].kind == "identifier":
+                    end += 2
+                if end < len(tokens) and tokens[end].text == "(":
+                    end = java_group_end(tokens, end)
+                    if end is None:
+                        return
+        if end >= len(tokens) or tokens[end].text not in {"=", ",", ";"}:
+            return
+        yield index
+        if tokens[end].text == "=":
+            end += 1
+            while end < len(tokens) and tokens[end].text not in {",", ";", ")", "}"}:
+                text = tokens[end].text
+                if text in {"(", "[", "{", "<"}:
+                    following = java_group_end(tokens, end)
+                    if following is not None:
+                        end = following
+                        continue
+                    if text != "<":
+                        return
+                end += 1
+        if end >= len(tokens) or tokens[end].text != ",":
+            return
+        index = end + 1
+
+
 def floating_literal(token):
     text = token.text.replace("_", "")
     return token.kind == "number" and (
@@ -280,6 +336,8 @@ def analyze(path, source):
     wrapped = set()
     numeric = set()
     inferred = []
+    java_types = {}
+    is_java = Path(path).suffix.lower() == ".java"
 
     def find(token, rule, field=""):
         findings.add(Finding(path, token, rule, field))
@@ -300,7 +358,9 @@ def analyze(path, source):
         if token.kind != "identifier":
             continue
         types = set()
-        if index + 1 < len(tokens) and tokens[index + 1].text == ":":
+        if index in java_types:
+            types = java_types[index]
+        elif index + 1 < len(tokens) and tokens[index + 1].text == ":":
             types = expanded(declared_type(tokens, index + 2))
         elif index and tokens[index - 1].text in {"val", "var"}:
             if index + 1 < len(tokens) and tokens[index + 1].text == "=":
@@ -321,6 +381,8 @@ def analyze(path, source):
             and tokens[index - 1].text not in {"return", "class", "object", "interface", "typealias", "new", "throw"}
         ):
             types = expanded(java_type_prefix(tokens, index))
+        if is_java and types and index not in java_types:
+            java_types.update((declarator, types) for declarator in java_declarators(tokens, index))
         if types & (UNSAFE_TYPES | INTEGER_TYPES):
             numeric.add(token.text)
         if "Money" in types and not types & (UNSAFE_TYPES | INTEGER_TYPES):
