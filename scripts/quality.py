@@ -22,6 +22,18 @@ MONEY_REPORT = Path("build/reports/jacoco/moneyCoverageReport/moneyCoverageRepor
 MONEY_CLASSES = Path("build/classes/kotlin/contractsMoney")
 MONEY_PACKAGE = "com/pennilogic/contracts/money"
 MONEY_BASELINE = "quality/money-coverage-baseline.json"
+MONEY_PRIMITIVE_TEST_CLASS = "com.pennilogic.money.AcceptedMoneyPrimitiveModelTest"
+MONEY_PRIMITIVE_TESTS = {
+    "construction": "constructionMatchesExactModel()",
+    "parsing": "parsingMatchesExactModel()",
+    "rendering": "renderingMatchesExactModel()",
+    "addition": "additionMatchesExactModel()",
+    "subtraction": "subtractionMatchesExactModel()",
+    "negation": "negationMatchesExactModel()",
+    "ordering": "orderingMatchesExactModel()",
+    "mixed_currency": "mixedCurrenciesMatchExactModel()",
+    "wire": "wireMatchesExactModel()",
+}
 
 
 def run(command, root=ROOT, capture=False, budget=None):
@@ -281,21 +293,78 @@ def money_test_metrics(root=ROOT):
     if not tests or skipped or failed:
         raise ValueError("Money qualification requires executed target tests without failures or skips")
     properties = {}
+    primitive = {}
     for suite in suites:
+        executed = {(case.get("classname"), case.get("name")) for case in suite.findall("testcase")}
         for node in suite.findall("system-out"):
             for line in (node.text or "").splitlines():
-                if line.startswith('{"event":"money_property_cases"'):
-                    event = json.loads(line)
+                if not line.lstrip().startswith(("{", "[", '"')) and "money_primitive_model" not in line:
+                    continue
+                event = money_execution_event(line)
+                if event.get("event") == "money_primitive_model":
+                    validate_primitive_model_event(event)
+                    category = event["category"]
+                    if category in primitive:
+                        raise ValueError("Money primitive model evidence is duplicated")
+                    if (
+                        suite.get("name") != MONEY_PRIMITIVE_TEST_CLASS
+                        or (MONEY_PRIMITIVE_TEST_CLASS, MONEY_PRIMITIVE_TESTS[category]) not in executed
+                    ):
+                        raise ValueError("Money primitive model evidence lacks its executed comparison test")
+                    primitive[category] = event
+                elif "money_primitive_model" in json.dumps(event):
+                    raise ValueError("Money primitive model evidence has an invalid event")
+                if event.get("event") == "money_property_cases":
                     name, count = event.get("property"), event.get("count")
-                    if name in properties or type(count) is not int or count <= 0:
+                    if not isinstance(name, str) or name in properties or type(count) is not int or count <= 0:
                         raise ValueError("Money property case evidence is duplicated or non-numeric")
                     properties[name] = count
     if set(properties) != {"round_trip", "associativity", "collision_keys"}:
         raise ValueError("Money property case evidence is missing or has an unknown category")
+    if set(primitive) != set(MONEY_PRIMITIVE_TESTS):
+        raise ValueError("Money primitive model evidence is missing a required category")
     return {
         "target_tests": tests, "skipped": skipped, "failed": failed, "property_cases": properties,
         "independent_oracle": {"status": "not_implemented", "disagreements": None},
+        "primitive_model": {
+            "status": "passed", "representation": "jdk_big_integer",
+            "comparisons": sum(event["comparisons"] for event in primitive.values()),
+            "disagreements": sum(event["disagreements"] for event in primitive.values()),
+            "categories": {category: event["comparisons"] for category, event in primitive.items()},
+        },
     }
+
+
+def money_execution_event(line):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Money primitive model evidence has duplicate fields")
+            result[key] = value
+        return result
+
+    def invalid_constant(_):
+        raise ValueError("Money primitive model evidence has a non-finite counter")
+
+    try:
+        event = json.loads(line, object_pairs_hook=unique, parse_constant=invalid_constant)
+    except (ValueError, RecursionError):
+        raise ValueError("Money primitive model evidence is malformed") from None
+    if not isinstance(event, dict):
+        raise ValueError("Money primitive model evidence must be an event object")
+    return event
+
+
+def validate_primitive_model_event(event):
+    if (
+        set(event) != {"event", "category", "comparisons", "disagreements"}
+        or event["event"] != "money_primitive_model"
+        or not isinstance(event["category"], str) or event["category"] not in MONEY_PRIMITIVE_TESTS
+        or type(event["comparisons"]) is not int or event["comparisons"] <= 0
+        or type(event["disagreements"]) is not int or event["disagreements"] != 0
+    ):
+        raise ValueError("Money primitive model evidence is incomplete, unexecuted or disagrees")
 
 
 def check_money_coverage(base=None, write_baseline=False):
