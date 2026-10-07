@@ -132,10 +132,17 @@ preservation, absent-marker idempotence and malformed/failed-removal refusals.
 Its additional containers are create-only storage fixtures, not a second
 database harness.
 
-The cleanup test launcher follows `scripts\quality.py`: explicit `ComSpec` on
-Windows and `sh` for the non-executable POSIX wrapper. A native portability
-regression checks argument and exit-code preservation using its own wrapper
-fixture (mode `0644` on POSIX), without changing the tracked wrapper or its mode.
+The cleanup test launcher uses explicit `ComSpec` on Windows and the
+`scripts\quality.py` convention of `sh` for the non-executable POSIX wrapper.
+Windows uses an outer-quoted `/d /v:off /s /c` command and quoted child-local
+substitutions, preserving spaces and literal percent/exclamation expressions
+without enabling AutoRun or delayed expansion. Its fixed-argument interface
+explicitly refuses embedded double quotes, NUL and line breaks rather than
+interpreting them as command syntax. The native regression exercises the shared
+launcher with spaced and special-character wrapper directories, exact argument
+output (including surrounding spaces and an empty value), exits 0 and 7, and
+refused command characters. POSIX fixtures remain `0644`; tracked wrapper
+bytes/modes and the parent environment are unchanged.
 
 Existing `test` and `integrationTest` selections execute all the new tests;
 `build` still invokes both. The existing `moneyTest`/PIT qualification inventory

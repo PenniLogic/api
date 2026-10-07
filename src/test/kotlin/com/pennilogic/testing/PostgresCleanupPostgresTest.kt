@@ -9,6 +9,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
@@ -105,27 +106,57 @@ class PostgresCleanupPostgresTest {
 
     @Test
     fun `wrapper launcher preserves arguments and exit codes without requiring POSIX execute permission`() {
-        val fixture = Files.createDirectory(directory.resolve("wrapper"))
         val windows = System.getProperty("os.name").startsWith("Windows")
-        val wrapper = fixture.resolve(if (windows) "gradlew.bat" else "gradlew")
         val script =
             if (windows) {
-                "@echo off\r\necho %~1\r\nexit /b %~2\r\n"
+                "@echo off\r\nsetlocal DisableDelayedExpansion\r\nset \"value=%~1\"\r\n" +
+                    "setlocal EnableDelayedExpansion\r\necho(!value!\r\nexit /b %~2\r\n"
             } else {
                 "#!/bin/sh\nprintf '%s\\n' \"\$1\"\nexit \"\$2\"\n"
             }
-        Files.writeString(wrapper, script)
-        if (!windows) {
-            Files.setPosixFilePermissions(wrapper, PosixFilePermissions.fromString("rw-r--r--"))
-            assertTrue(!Files.isExecutable(wrapper), "fixture-wrapper-not-executable")
+        val directories =
+            listOf(
+                "wrapper with spaces",
+                "wrapper & (data) ^ %PENNILOGIC_QUOTING_CANARY% !PENNILOGIC_QUOTING_CANARY!",
+            )
+        val arguments =
+            listOf(
+                "argument with spaces",
+                "  leading and trailing spaces  ",
+                "literal & | < > ( ) ^ %PENNILOGIC_QUOTING_CANARY% !PENNILOGIC_QUOTING_CANARY!",
+                "literal ;,=+[]' and trailing\\",
+                "",
+            )
+        var executions = 0
+        for (name in directories) {
+            val fixture = Files.createDirectory(directory.resolve(name))
+            val wrapper = fixture.resolve(if (windows) "gradlew.bat" else "gradlew")
+            Files.writeString(wrapper, script)
+            if (!windows) {
+                Files.setPosixFilePermissions(wrapper, PosixFilePermissions.fromString("rw-r--r--"))
+                assertTrue(!Files.isExecutable(wrapper), "fixture-wrapper-not-executable")
+            }
+            for (argument in arguments) {
+                for (expected in listOf(0, 7)) {
+                    val launcher = wrapperLauncher(fixture, listOf(argument, expected.toString()))
+                    launcher.environment()["PENNILOGIC_QUOTING_CANARY"] = "must-not-expand"
+                    val (exit, output) = run(launcher, 30)
+                    executions++
+                    assertTrue(exit == expected, "wrapper-exit-preserved")
+                    assertTrue(output == argument + System.lineSeparator(), "wrapper-argument-preserved")
+                }
+            }
+            if (windows) {
+                for (argument in listOf("embedded\"quote", "line\rbreak", "line\nbreak", "null\u0000byte")) {
+                    val failure = assertThrows(IllegalArgumentException::class.java) { wrapperLauncher(fixture, listOf(argument)) }
+                    assertTrue(failure.message == "wrapper-command-character", "wrapper-command-refusal")
+                }
+            }
+            assertTrue(Files.readString(wrapper) == script, "fixture-wrapper-unchanged")
+            if (!windows) assertTrue(!Files.isExecutable(wrapper), "fixture-wrapper-still-not-executable")
         }
-        for (expected in listOf(0, 7)) {
-            val (exit, output) = run(wrapperLauncher(fixture) + listOf("argument with spaces", expected.toString()), 30)
-            assertTrue(exit == expected, "wrapper-exit-preserved")
-            assertTrue(output.trim() == "argument with spaces", "wrapper-argument-preserved")
-        }
-        assertTrue(Files.readString(wrapper) == script, "fixture-wrapper-unchanged")
-        if (!windows) assertTrue(!Files.isExecutable(wrapper), "fixture-wrapper-still-not-executable")
+        assertTrue(executions == 20, "wrapper-exact-control-count")
+        println("""{"event":"wrapper_quoting_controls","executions":$executions,"directories":2,"arguments":5,"exit_codes":[0,7]}""")
     }
 
     private fun copyBuild() {
@@ -161,17 +192,26 @@ class PostgresCleanupPostgresTest {
     }
 
     private fun cleanup(expected: Int): String {
-        val command = wrapperLauncher(root) + listOf("--no-daemon", "--offline", "--console=plain", "stopMigrationTestPostgres")
-        val (exit, output) = run(command, 120)
+        val launcher = wrapperLauncher(root, listOf("--no-daemon", "--offline", "--console=plain", "stopMigrationTestPostgres"))
+        val (exit, output) = run(launcher, 120)
         assertTrue(exit == expected, "native-cleanup-exit")
         return output
     }
 
-    private fun wrapperLauncher(directory: Path): List<String> =
+    private fun wrapperLauncher(
+        directory: Path,
+        arguments: List<String>,
+    ): ProcessBuilder =
         if (System.getProperty("os.name").startsWith("Windows")) {
-            listOf(requireNotNull(System.getenv("ComSpec")), "/d", "/c", directory.resolve("gradlew.bat").toString())
+            val tokens = listOf(directory.resolve("gradlew.bat").toString()) + arguments
+            require(tokens.none { token -> token.any { it in "\"\r\n\u0000" } }) { "wrapper-command-character" }
+            val values = tokens.mapIndexed { index, token -> "PENNILOGIC_TEST_WRAPPER_$index" to token }.toMap()
+            // Substitution is single-pass; CMD leaves empty-variable references literal.
+            val command = values.entries.joinToString(" ") { (name, value) -> if (value.isEmpty()) "\"\"" else "\"%$name%\"" }
+            ProcessBuilder(requireNotNull(System.getenv("ComSpec")), "/d", "/v:off", "/s", "/c", "\"$command\"")
+                .apply { environment().putAll(values) }
         } else {
-            listOf("sh", directory.resolve("gradlew").toString())
+            ProcessBuilder(listOf("sh", directory.resolve("gradlew").toString()) + arguments)
         }
 
     private fun docker(vararg arguments: String): String {
@@ -200,11 +240,17 @@ class PostgresCleanupPostgresTest {
     private fun run(
         command: List<String>,
         seconds: Long,
+    ): Pair<Int, String> = run(ProcessBuilder(command), seconds)
+
+    private fun run(
+        builder: ProcessBuilder,
+        seconds: Long,
     ): Pair<Int, String> {
         val started = System.nanoTime()
         val output = directory.resolve("process-${invocation++}.log").toFile()
+        val command = builder.command()
         val process =
-            ProcessBuilder(command)
+            builder
                 .directory(directory.toFile())
                 .redirectErrorStream(true)
                 .redirectOutput(output)
