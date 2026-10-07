@@ -244,6 +244,32 @@ val acceptedMutationCheck =
         commandLine("python", "scripts/money_mutation.py", "run", "--input-file", inputFile.get().asFile.path)
     }
 
+val generatedClientInterop =
+    tasks.register<Exec>("moneyClientInterop") {
+        description = "Round-trips the API Money serializer through actually emitted Kotlin, TypeScript and Python client models."
+        group = "verification"
+        dependsOn(tasks.testClasses)
+        workingDir(rootDir)
+        outputs.upToDateWhen { false }
+        outputs.cacheIf { false }
+        val launcher = javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(21)) }
+        val backendClasspath = sourceSets.test.get().runtimeClasspath
+        doFirst {
+            commandLine(
+                "python",
+                "-B",
+                "scripts/money_client_interop.py",
+                "run",
+                "--java",
+                launcher
+                    .get()
+                    .executablePath.asFile.absolutePath,
+                "--classpath",
+                backendClasspath.filter { it.exists() }.asPath,
+            )
+        }
+    }
+
 // Digest-pinned image for the disposable migration test database (PostgreSQL 17.11).
 val postgresImage = "postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f"
 
@@ -502,6 +528,7 @@ tasks.check {
         moneyGuard,
         acceptedCoverageCheck,
         acceptedMutationCheck,
+        generatedClientInterop,
         tasks.spotlessCheck,
         tasks.jacocoTestCoverageVerification,
         integrationTest,

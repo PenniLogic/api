@@ -1,0 +1,12 @@
+    SyntheticEnvelope:
+      type: object
+      required: [total, recorded_at]
+      properties:
+        total:
+          $ref: '#/components/schemas/Money'
+        recorded_at:
+          $ref: '#/components/schemas/Instant'
+        booked_on:
+          $ref: '#/components/schemas/LocalDate'
+        note:
+          type: string
