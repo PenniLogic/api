@@ -109,7 +109,7 @@ def money_name(name):
     return name in RAW_MEMBERS or bool(set(words) & MONEY_WORDS)
 
 
-def tokenize(source):
+def tokenize(source, *, logging=False, kotlin=True):
     newlines = [-1] + [index for index, character in enumerate(source) if character == "\n"]
     tokens = []
 
@@ -136,6 +136,9 @@ def tokenize(source):
     def string(index):
         start = index
         quote = '"""' if source.startswith('"""', index) else source[index]
+        template = logging and kotlin and quote != "'"
+        if template:
+            emit("(", "template", start)
         index += len(quote)
         body_start = index
         interpolated = False
@@ -143,20 +146,29 @@ def tokenize(source):
             if source.startswith(quote, index):
                 label = source[body_start:index]
                 label = re.sub(r"\\u([0-9a-fA-F]{4})", lambda match: chr(int(match[1], 16)), label)
-                if not interpolated:
+                if template:
+                    emit(")", "symbol", index)
+                elif not interpolated:
                     kind = "money_key" if IDENTIFIER.fullmatch(label) and money_name(label) else "literal"
                     emit(label if kind == "money_key" else "", kind, start)
                 return index + len(quote)
             if quote != '"""' and source[index] == "\\":
                 index += 2
-            elif quote != "'" and source.startswith("${", index):
+            elif quote != "'" and (not logging or kotlin) and source.startswith("${", index):
                 interpolated = True
+                if template:
+                    emit("(", "symbol", index)
                 index = code(index + 2, template=True)
-            elif quote != "'" and source[index] == "$":
+                if template:
+                    emit(")", "symbol", index - 1)
+                    emit(",", "symbol", index - 1)
+            elif quote != "'" and (not logging or kotlin) and source[index] == "$":
                 match = IDENTIFIER.match(source, index + 1)
                 if match:
                     interpolated = True
                     emit(match[0], "identifier", index + 1)
+                    if template:
+                        emit(",", "symbol", match.end())
                     index = match.end()
                 else:
                     index += 1
@@ -512,7 +524,18 @@ def floating_literal(token):
     ) and not text.lower().startswith(("0x", "0b"))
 
 
-def direct_logging(tokens, chunks, declarations, inferred, wrapped, raw, aliases, kotlin, java_types):
+def direct_logging(source, tokens, declarations, inferred, wrapped, raw, aliases, kotlin, java_types):
+    # MG000..005 keep their original tokens; only logging needs language-aware literal boundaries.
+    original = tokens
+    tokens = tokenize(source, logging=True, kotlin=kotlin)
+    positions = {token: index for index, token in enumerate(tokens) if token.kind == "identifier"}
+    declarations = {positions[original[index]]: names for index, names in declarations.items() if original[index] in positions}
+    java_types = {positions[original[index]]: names for index, names in java_types.items() if original[index] in positions}
+    inferred = [
+        (token, expression_after(tokens, positions[token] + 2))
+        for token, _ in inferred if token in positions
+    ]
+    chunks = list(statements(tokens))
     imports = {"System": "java.lang.System", "String": "java.lang.String"}
     for chunk in chunks:
         if not chunk or chunk[0].text != "import":
@@ -566,13 +589,16 @@ def direct_logging(tokens, chunks, declarations, inferred, wrapped, raw, aliases
         return name if name in LOGGING_TYPES else None
 
     receiver_types = {}
-    values = (wrapped | raw) - callables - (alias_positions.keys() - unambiguous_aliases)
+    values = {
+        name: "money" if name in wrapped else "raw"
+        for name in (wrapped | raw) - callables - alias_positions.keys()
+    }
     for index, names in declarations.items():
         name = tokens[index].text
         receiver_types.setdefault(name, set()).add(sink_type(index, names))
         expanded = set().union(*(aliases.get(item, {item}) for item in names))
         if name in wrapped and "Money" not in expanded or name in raw and not expanded & (INTEGER_TYPES | UNSAFE_TYPES):
-            values.discard(name)
+            values.pop(name, None)
     receivers = {name: next(iter(kinds)) for name, kinds in receiver_types.items() if len(kinds) == 1 and None not in kinds}
 
     def receiver(parts):
@@ -582,35 +608,49 @@ def direct_logging(tokens, chunks, declarations, inferred, wrapped, raw, aliases
             return "java.io.PrintStream"
         return None
 
-    def carries_value(expression):
-        index = 0
+    def expression_parts(expression, separators):
+        parts, start, index = [], 0, 0
         while index < len(expression):
-            token = expression[index]
-            if token.text in {"(", "[", "{"}:
+            if expression[index].text in {"(", "[", "{"}:
                 end = java_group_end(expression, index)
                 if end is None:
-                    return False
-                if token.text != "{" and carries_value(expression[index + 1:end - 1]):
-                    return True
+                    return [expression]
                 index = end
                 continue
-            if token.kind != "identifier":
-                index += 1
-                continue
-            parts, end = chain(expression, index)
-            if parts[0] == "this":
-                parts = parts[1:]
-            following = expression[end].text if end < len(expression) else ""
-            previous = expression[index - 1].text if index else ""
-            rooted_value = bool(parts) and parts[0] in values
-            if following == "(":
+            if expression[index].text in separators:
+                parts.append(expression[start:index])
+                start = index + 1
+            index += 1
+        return [*parts, expression[start:]]
+
+    def carries_value(arguments):
+        return any(value_kind(argument) is not None for argument in expression_parts(arguments, {","}))
+
+    def value_kind(expression):
+        if not expression:
+            return None
+        comparisons = {"==", "!=", "<", ">", "<=", ">=", "is", "instanceof", "&&", "||"}
+        if len(expression_parts(expression, comparisons)) > 1:
+            return None
+        additions = expression_parts(expression, {"+"})
+        if len(additions) > 1:
+            kinds = [value_kind(part) for part in additions]
+            return "money" if all(kind == "money" for kind in kinds) else "rendered" if any(kinds) else None
+        if expression[0].text == "(":
+            index = java_group_end(expression, 0)
+            if index is None:
+                return None
+            inner = expression[1:index - 1]
+            kind = ("rendered" if carries_value(inner) else None) if expression[0].kind == "template" else value_kind(inner)
+        elif expression[0].kind == "identifier":
+            parts, end = chain(expression, 0)
+            if end < len(expression) and expression[end].text == "(":
                 stop = java_group_end(expression, end)
                 if stop is None:
-                    return False
+                    return None
                 arguments = expression[end + 1:stop - 1]
                 name = qualified(parts, static=True)
-                if rooted_value and len(parts) == 2 and parts[1] in {"toString", "getMinorUnits"}:
-                    return True
+                kind = None
                 if name in {
                     "com.pennilogic.contracts.money.Money.parse",
                     "com.pennilogic.contracts.money.Money.ofMinorUnits",
@@ -619,10 +659,10 @@ def direct_logging(tokens, chunks, declarations, inferred, wrapped, raw, aliases
                     "com.pennilogic.contracts.money.Money.Companion.ofMinorUnits",
                     "com.pennilogic.contracts.money.Money.Companion.fromWire",
                 }:
-                    return True
-                if name == "java.lang.String.valueOf" and carries_value(arguments):
-                    return True
-                if name in {
+                    kind = "money"
+                elif name == "java.lang.String.valueOf" and carries_value(arguments):
+                    kind = "rendered"
+                elif name in {
                     "kotlinx.serialization.json.Json.encodeToString",
                     "kotlinx.serialization.json.Json.Default.encodeToString",
                     "kotlinx.serialization.json.Json.encodeToJsonElement",
@@ -633,18 +673,37 @@ def direct_logging(tokens, chunks, declarations, inferred, wrapped, raw, aliases
                     }
                     for position, item in enumerate(arguments) if item.kind == "identifier"
                 ) and carries_value(arguments):
-                    return True
-                # An unknown function's result is not its arguments; no interprocedural inference.
+                    kind = "rendered"
                 index = stop
-                continue
-            if rooted_value and (
-                len(parts) == 2 and parts[1] in RAW_MEMBERS
-                or len(parts) == 1 and following not in {"::", "==", "!=", "<", ">", "<=", ">="}
-                and previous not in {"==", "!=", "<", ">", "<=", ">=", "is", "as"}
-            ):
-                return True
-            index = end
-        return False
+                if kind is not None:
+                    return member_result(expression, index, kind)
+            index = 2 if parts[0] == "this" and len(parts) > 1 else 0
+            kind = values.get(expression[index].text)
+            index += 1
+        else:
+            return None
+        return member_result(expression, index, kind)
+
+    def member_result(expression, index, kind):
+        while index + 1 < len(expression) and expression[index].text in {".", "?."}:
+            member = expression[index + 1].text
+            index += 2
+            if index < len(expression) and expression[index].text == "(":
+                end = java_group_end(expression, index)
+                if end is None:
+                    return None
+                no_arguments = end == index + 2
+                if no_arguments and kind == "money" and member == "getMinorUnits":
+                    kind = "raw"
+                elif no_arguments and kind is not None and member == "toString":
+                    kind = "rendered"
+                else:
+                    # Unknown calls are opaque; their result is not their receiver or arguments.
+                    kind = None
+                index = end
+            else:
+                kind = "raw" if kind == "money" and member in RAW_MEMBERS else None
+        return kind if index == len(expression) else None
 
     def inferred_receiver(expression):
         if not expression:
@@ -665,8 +724,10 @@ def direct_logging(tokens, chunks, declarations, inferred, wrapped, raw, aliases
 
     for _ in range(len(inferred) + 1):
         for token, expression in inferred:
-            if token.text in unambiguous_aliases and carries_value(expression):
-                values.add(token.text)
+            if token.text in unambiguous_aliases:
+                kind = value_kind(expression)
+                if kind is not None:
+                    values[token.text] = kind
             kind = inferred_receiver(expression)
             if kind is not None and token.text in unambiguous_aliases:
                 receivers[token.text] = kind
@@ -866,7 +927,7 @@ def analyze(path, source):
             end = next((i for i, item in enumerate(tail) if item.text == "}"), len(tail))
             if raw_reference(tail[:end]):
                 find(token, "MG002")
-    for token in direct_logging(tokens, chunks, declarations, inferred, wrapped, raw, aliases, not java, java_logging_types):
+    for token in direct_logging(source, tokens, declarations, inferred, wrapped, raw, aliases, not java, java_logging_types):
         find(token, "MG006")
     return sorted(findings, key=lambda item: (item.path, item.token.line, item.token.column, item.rule, item.field))
 

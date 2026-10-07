@@ -289,6 +289,20 @@ Static diagnostic maps, non-money counters/temperatures, schema tokens and norma
 returns to a synthetic transport are not banned. A `PrintStream` is an output sink even if a
 caller intends it as transport: use an actual transport boundary, not a source-file exemption.
 
+The 2026-10-08 correction preserves the known Money -> minor units -> no-argument `toString()`
+result through direct calls, parentheses, Kotlin templates and simple inferred aliases.
+For example, `sink.println(value.minorUnits.toString())` and
+`logger.info("{}", value.minorUnits.toString())` refuse just like raw-unit output.
+The complete result matters: a genuine Money factory followed by `.currency`/`getCurrency()`,
+or a complete `(value) != null` comparison, is metadata rather than Money. Merely enclosing a
+Money value or factory in parentheses does not make it safe. A harmless comparison in one
+argument or template substitution does not exempt Money in another.
+
+Only the logging analysis uses language-aware string boundaries. Java `"$value"` and
+`"${value}"`, including text-block contents, are literals; concatenating actual Money to
+one still refuses. Kotlin substitutions still carry their real expression results.
+The existing MG000..005 tokenization and declaration/arithmetic checks are unchanged.
+
 This is **not universal JVM taint analysis**. Arbitrary helper results, assignments after
 declaration, explicitly typed aliases of extracted/rendered values, member/inheritance flow,
 reflection, callbacks, collections' indirect projections, wildcard imports, custom wrappers,

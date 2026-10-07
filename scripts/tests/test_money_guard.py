@@ -1351,6 +1351,114 @@ class MoneySourceGuardTest(unittest.TestCase):
         self.assertNotIn("synthetic-account-marker", rendered)
         self.assertNotIn(source, rendered)
 
+    def test_raw_unit_rendering_composes_through_sinks_groups_and_inferred_aliases(self):
+        for body in (
+            "sink.println(value.minorUnits.toString())",
+            'println("operation=${value.minorUnits.toString()}")',
+            'logger.info("{}", value.minorUnits.toString())',
+            "sink.println((value.minorUnits).toString())",
+            "sink.println((value).minorUnits.toString())",
+            "val raw = value.minorUnits; sink.println(raw.toString())",
+            "val raw = value.minorUnits; val rendered = raw.toString(); val copy = rendered; sink.println(copy)",
+            "val copy = value; sink.println(copy.minorUnits.toString())",
+            'sink.println(Money.parse("0.01", "INR").minorUnits.toString())',
+            'sink.println((Money.parse("0.01", "INR")).minorUnits.toString())',
+            'val rendered = "${value.minorUnits}"; sink.println(rendered)',
+        ):
+            with self.subTest(body=body):
+                self.assertEqual({"MG006"}, self.rules(
+                    "import com.pennilogic.contracts.money.Money\n"
+                    "import java.io.PrintStream\nimport org.slf4j.Logger\n"
+                    f"fun check(sink: PrintStream, logger: Logger, value: Money) {{ {body} }}",
+                ))
+
+    def test_java_strings_and_text_blocks_are_literal_only_for_direct_logging(self):
+        for literal in ('"$value"', '"${value}"', '"escaped \\"${value}\\""', '"""\n$value\n${value}\n"""'):
+            with self.subTest(literal=literal):
+                prefix = "import com.pennilogic.contracts.money.Money;\nimport java.io.PrintStream;\n"
+                self.assertEqual(set(), self.rules(
+                    prefix + f"class Control {{ void check(PrintStream sink, Money value) {{ sink.println({literal}); }} }}",
+                    "java",
+                ))
+                self.assertEqual(set(), self.rules(
+                    prefix + f"class Control {{ void check(PrintStream sink, Money value) {{ var text = {literal}; sink.println(text); }} }}",
+                    "java",
+                ))
+                self.assertEqual({"MG006"}, self.rules(
+                    prefix + f"class Control {{ void check(PrintStream sink, Money value) {{ sink.println({literal} + value); }} }}",
+                    "java",
+                ))
+
+    def test_known_currency_and_comparison_results_are_not_money_subexpressions(self):
+        for suffix, factory, currency in (
+            ("kt", 'Money.parse("0.01", "INR")', "currency"),
+            ("java", 'Money.Companion.parse("0.01", "INR")', "getCurrency()"),
+        ):
+            for expression in (
+                f"{factory}.{currency}", f"({factory}).{currency}", f"((value)).{currency}",
+                "(value) != null", "null != (value)", "((value) == null)", f"({factory}) != null",
+                "((value) != null).toString()" if suffix == "kt" else "String.valueOf((value) != null)",
+            ):
+                source = "import com.pennilogic.contracts.money.Money;\nimport java.io.PrintStream;\n"
+                source += (
+                    f"class Control {{ void check(PrintStream sink, Money value) {{ sink.println({expression}); }} }}"
+                    if suffix == "java" else f"fun check(sink: PrintStream, value: Money) {{ sink.println({expression}) }}"
+                )
+                with self.subTest(language=suffix, expression=expression):
+                    self.assertEqual(set(), self.rules(source, suffix))
+            for expression in ("value", "(value)", "((value))", factory, f"({factory})", f"(({factory}))"):
+                source = "import com.pennilogic.contracts.money.Money;\nimport java.io.PrintStream;\n"
+                source += (
+                    f"class Control {{ void check(PrintStream sink, Money value) {{ sink.println({expression}); }} }}"
+                    if suffix == "java" else f"fun check(sink: PrintStream, value: Money) {{ sink.println({expression}) }}"
+                )
+                with self.subTest(language=suffix, expression=expression):
+                    self.assertEqual({"MG006"}, self.rules(source, suffix))
+
+    def test_comparisons_do_not_hide_another_argument_or_template_value(self):
+        for expression, expected in (
+            ('"present=${(value) != null}"', set()),
+            ('"present=${(value) != null} currency=${value.currency}"', set()),
+            ('"value=$value present=${(value) != null}"', {"MG006"}),
+            ('"present=${(value) != null} value=$value"', {"MG006"}),
+            ('"literal == $value"', {"MG006"}),
+            ('"literal != ${value.minorUnits.toString()}"', {"MG006"}),
+        ):
+            with self.subTest(expression=expression):
+                self.assertEqual(expected, self.rules(
+                    "import com.pennilogic.contracts.money.Money\n"
+                    f"fun check(value: Money) {{ println({expression}) }}",
+                ))
+        for suffix in ("kt", "java"):
+            for arguments, expected in (
+                ('"{}", (value) != null', set()),
+                ('"{} {}", (value) != null, value', {"MG006"}),
+                ('"{} {}", value, (value) != null', {"MG006"}),
+            ):
+                source = "import com.pennilogic.contracts.money.Money;\nimport org.slf4j.Logger;\n"
+                source += (
+                    f"class Control {{ void check(Logger sink, Money value) {{ sink.info({arguments}); }} }}"
+                    if suffix == "java" else f"fun check(sink: Logger, value: Money) {{ sink.info({arguments}) }}"
+                )
+                with self.subTest(language=suffix, arguments=arguments):
+                    self.assertEqual(expected, self.rules(source, suffix))
+
+    def test_inferred_terminal_metadata_and_unknown_helper_results_stay_nonmonetary(self):
+        for body in (
+            'val copy = Money.parse("0.01", "INR"); val text = copy.currency; println(text)',
+            "val result = (value) != null; println(result)",
+            "val result = value.minorUnits == 0L; println(result)",
+            "println(fixed(value.minorUnits))",
+            "val text = fixed(value.minorUnits); println(text)",
+            "println(fixed(value.minorUnits).toString())",
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(set(), self.rules(
+                    "import com.pennilogic.contracts.money.Money\n"
+                    'fun fixed(input: Long): String = "static"\n'
+                    f"fun check(value: Money) {{ {body} }}",
+                ))
+
     def check(self, root):
         with contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()) as errors:
             result = guard.check(root)
