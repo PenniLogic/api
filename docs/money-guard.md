@@ -298,6 +298,13 @@ or a complete `(value) != null` comparison, is metadata rather than Money. Merel
 Money value or factory in parentheses does not make it safe. A harmless comparison in one
 argument or template substitution does not exempt Money in another.
 
+Checked Kotlin Money `+`, binary `-` and unary `-` results remain Money through grouping,
+known factories, supported renderings and unambiguous inferred aliases. For example,
+`sink.println(value - other)`, `println(-value)` and
+`val result = -value; println(result.minorUnits.toString())` refuse.
+This does not infer custom operators or opaque helper results; terminal currency and
+Boolean results are still metadata.
+
 Only the logging analysis uses language-aware string boundaries. Java `"$value"` and
 `"${value}"`, including text-block contents, are literals; concatenating actual Money to
 one still refuses. Kotlin substitutions still carry their real expression results.

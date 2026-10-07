@@ -617,7 +617,10 @@ def direct_logging(source, tokens, declarations, inferred, wrapped, raw, aliases
                     return [expression]
                 index = end
                 continue
-            if expression[index].text in separators:
+            if expression[index].text in separators and not (
+                expression[index].text == "-"
+                and (index == start or expression[index - 1].text in ARITHMETIC)
+            ):
                 parts.append(expression[start:index])
                 start = index + 1
             index += 1
@@ -636,6 +639,12 @@ def direct_logging(source, tokens, declarations, inferred, wrapped, raw, aliases
         if len(additions) > 1:
             kinds = [value_kind(part) for part in additions]
             return "money" if all(kind == "money" for kind in kinds) else "rendered" if any(kinds) else None
+        if kotlin:
+            subtractions = expression_parts(expression, {"-"})
+            if len(subtractions) > 1:
+                return "money" if all(value_kind(part) == "money" for part in subtractions) else None
+            if expression[0].text == "-":
+                return "money" if value_kind(expression[1:]) == "money" else None
         if expression[0].text == "(":
             index = java_group_end(expression, 0)
             if index is None:
