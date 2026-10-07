@@ -212,12 +212,25 @@ This is a positional distinction, not an exemption for the name `Money`: actual 
 values, initializers and annotation arguments retain their refusals and raw-alias tracking.
 The imported-type regression controls use the genuine Contracts type, not a replacement class.
 
+Java class/interface/record and recognized generic-method type parameters retain their
+declaration scopes and individual bounds. A simple type parameter shadowing `Money` is not
+the imported wrapper: floating bounds refuse monetary declarations with `MG001`, and
+unbounded or unresolved monetary types retain `MG005`. Referenced bounds follow local
+chains, including forward references, in the bound's declaration environment; unrelated
+parameters do not taint a genuine Money return. Nested shadows end with their declarations.
+Qualified type names remain distinct from local parameters, and varargs dots are not a
+package qualifier. Shared declarators, arrays, parameters and raw aliases keep their rules.
+The regression controls include real compiler-valid shadows beside genuinely imported
+Money fields and safe bounds; recursive bounds cannot recover the wrapper by spelling alone.
+
 Money value-type operator dispatch is allowed: `left + right` when both values are Money is not
 raw integer arithmetic. The authoritative wrapper's own implementation remains the exact
 upstream source dependency, not a locally invented exception or duplicate type.
 
 This is a conservative lexical guard, not JVM compiler type resolution or complete
-interprocedural taint analysis. Naming rules and local aliases are tested; arbitrary indirect
+interprocedural taint analysis. Generic constructors and full inheritance/member or
+value-identifier scope resolution are outside this model; the recognized declaration
+shapes do not certify every Java grammar. Naming rules and local aliases are tested; arbitrary indirect
 factory return types and externally defined serializers still require the accepted provider,
 compiler checks and independent review. Neither scanned-file counts nor planted local failures
 prove native protected CI enforcement, cross-language interoperability or completion of API #1.
