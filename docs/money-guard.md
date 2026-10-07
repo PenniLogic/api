@@ -31,6 +31,67 @@ API interoperability. Full functional contract/release adoption and protected in
 pending. The separately executed three-language Contracts scaffold is not an API cross-language
 consumer test. No published-client acceptance is inferred from local fixture hashes.
 
+## API-owned log projection (2026-10-07 source increment)
+
+The earlier source/qualification history and holds in this guide remain history, not a claim
+that the complete original [API #1](https://github.com/PenniLogic/api/issues/1) or
+[API #22](https://github.com/PenniLogic/api/issues/22) is closed. This bounded increment addresses
+diagnostic projection and finite direct logging prevention on accepted API main `27dfeb8`.
+It does not establish an existing production Money log leak or revise the earlier guard acceptance.
+
+`com.pennilogic.money.MoneyDiagnostic` is API-owned **log metadata**, not another Money type,
+codec, exception contract, route or logging framework:
+
+```kotlin
+val projection = MoneyDiagnostic.failed(MoneyOperation.DECODE, error)
+logger.warn("{}", projection.fields())
+```
+
+`succeeded(operation: MoneyOperation)` is used only after a successful operation.
+`failed(operation: MoneyOperation, error: Throwable? = null)` always projects a failure, including
+when no throwable is supplied. The constructor is private. Neither factory accepts a value,
+wire object, free-form operation string, field string, request, or metadata map.
+The returned `Map<String, String>` has these fixed meanings:
+
+| Field | Allowed metadata |
+| --- | --- |
+| `event` | `money_diagnostic` |
+| `operation` | `construct`, `parse`, `decode`, `encode`, `add`, `subtract`, `negate`, `compare`, selected by `MoneyOperation` |
+| `outcome` | `succeeded`, `validation_rejected` for an actual provider `MoneyWireException`, or `failed` otherwise |
+| `field` | Exactly `amount` or `currency` when that exact schema field is supplied by the provider; otherwise the fixed whole-value token `value` |
+| `reason` | The actual provider's `MoneyReason.wireName`: `shape`, `number_not_string`, `grammar`, `currency_unknown`, `scale_mismatch`, `out_of_range`; absent on success or when no provider reason exists |
+
+The projection retains only enums, not the throwable. It does not read exception messages,
+class names, stack traces, causes or suppressed exceptions. Arbitrary extra keys, even keys
+containing control characters, schema-looking prefixes or schema-name hash collisions, become
+`field=value`. Decoder syntax
+errors can occur before provider validation and have no `MoneyReason`: they remain `outcome=failed`,
+not success or a fabricated codec rejection. Arithmetic and nested unexpected exceptions likewise
+remain failures without guessing a reason from their text or searching their causes.
+
+The accepted provider is already an `implementation(files(contractsMoneyJar))` dependency, shipped
+on the main runtime classpath and in `installDist`; no test-only replacement or new dependency is
+introduced. Its reason, original machine field, check order, symmetric range, canonical rendering
+and serialization are unchanged. In particular, an arbitrary extra key still appears in the
+provider's machine field, and `Money.toString()` and serializer output are **value-bearing**.
+Neither is a log-safe diagnostic. Intentional synthetic wire transport and in-memory comparisons
+continue using the genuine serializer; do not redact the transport to make a logging test pass.
+
+The existing primitive-model assertion boundary reuses `MoneyDiagnostic` for failures while
+retaining its static case identifiers, counts and refusal to attach expected/actual values or a
+cause. The projection stays in the ordinary main-source JaCoCo inventory; the provider-only
+qualification catalogue and all existing floors are unchanged.
+`MoneyDiagnosticTest` captures a real enabled INFO Logback appender, including exception
+rendering in its pattern, for genuine provider rejections, malicious extra keys, an actual JSON
+decoder syntax failure, nested/hostile unexpected exceptions and successful operations. Assertions
+compare static metadata and check canary absence without printing the original failures.
+The unrelated root logger's OFF configuration is not redaction evidence.
+
+There is still **no production Money-consuming API entry point**. Its first implementation must
+wire this projection at both validation and unexpected-failure output boundaries, must not append
+amounts, accounts, requests or the original throwable, and needs enabled-output privacy evidence
+for that real route. This increment does not certify arbitrary future callers or deployment logs.
+
 ## Commands and ownership
 
 ```text
@@ -189,7 +250,56 @@ name, never an initializer, amount, account value or source line.
 | `MG003` | Floating/decimal conversion in monetary expressions |
 | `MG004` | Floating descriptor fields or numeric monetary serializer calls |
 | `MG005` | A money-named declaration whose type cannot be established, including unresolved cross-file aliases and inferred factory results |
+| `MG006` | Guard-known Money values, raw units or supported value renderings passed directly to a resolved logging/output sink |
 | `MG000` | An incomplete/unreadable source inventory or tokenization |
+
+### Finite direct logging/output rule
+
+`MG006` runs in the same handwritten guard, inventory, `quality.py money-guard` and direct
+Gradle `moneyGuard`/compilation/build routes as the existing rules. It has no file exemptions,
+warn-only mode, new framework or numeric-literal ban. A refusal names the file, location and
+static rule text, never the sink arguments or captured runtime failure.
+
+Supported, resolvable sink shapes are:
+
+| Sink | Calls |
+| --- | --- |
+| Kotlin standard output | Unshadowed `print`/`println`, `kotlin.io.print`/`println`, and explicit import aliases |
+| JVM standard streams | `System.out`/`err`, `java.lang.System.out`/`err` and resolved local aliases |
+| `java.io.PrintStream`, `java.io.PrintWriter` | `print`, `println`, `printf`, `format`, `append` on ordinary typed receivers, or receivers inferred from their constructors |
+| `org.slf4j.Logger` | `trace`, `debug`, `info`, `warn`, `error` on ordinary typed receivers, or receivers from the actual `LoggerFactory.getLogger` factory (assigned or inline) |
+
+Types are resolved from exact qualified names or explicit imports (including Kotlin import
+aliases), using the existing declaration/token helpers. A receiver merely named `logger`,
+`sink`, `PrintStream` or `Logger` is not proof of a standard sink. Function/type declarations
+and class literals are not calls carrying Money; local functions or imported functions that
+shadow standard `println` are not assumed to log. Conflicting file-local receiver types and
+ambiguous inferred aliases are deliberately unresolved rather than assigned another declaration's
+meaning. There is no full lexical scope or overload resolution.
+
+The supported payloads are guard-known Money variables, direct `minorUnits` access and Java
+`getMinorUnits()`, the guard's existing raw-unit declarations, `toString()`, Java
+`String.valueOf`, simple concatenation and Kotlin interpolation, and the actual Money serializer
+in `Json.encodeToString`/`Json.encodeToJsonElement` (`Json.Default.encodeToString` in Java).
+Direct genuine Money factories and unambiguous inferred `val`/Java `var` aliases of these
+values/renderings are also recognized. For example, `sink.println(value)`,
+`sink.println(value.minorUnits)`, `sink.println(value.getMinorUnits())` and
+`logger.info("{}", Json.encodeToString(MoneySerializer, value))` refuse.
+Static diagnostic maps, non-money counters/temperatures, schema tokens and normal serializer
+returns to a synthetic transport are not banned. A `PrintStream` is an output sink even if a
+caller intends it as transport: use an actual transport boundary, not a source-file exemption.
+
+This is **not universal JVM taint analysis**. Arbitrary helper results, assignments after
+declaration, explicitly typed aliases of extracted/rendered values, member/inheritance flow,
+reflection, callbacks, collections' indirect projections, wildcard imports, custom wrappers,
+generic sink type parameters, other logging libraries and SLF4J fluent builders are outside this
+direct rule. The original
+Money exception's arbitrary field/message and general request text are not tracked as Money
+values: callers must use the projection instead of logging exceptions. Unsupported/ambiguous
+forms require compiler checks, caller-level privacy tests and independent review; a zero
+`MG006` count is not proof that every logging path is safe.
+
+### Declaration and arithmetic rules
 
 The shared Java declaration type applies to each comma-separated declarator, including names
 after initialized variables. Commas nested in calls, arrays, generic arguments or initializer

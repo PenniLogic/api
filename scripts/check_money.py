@@ -1,4 +1,4 @@
-"""Fail closed on unsafe JVM money declarations, conversions and raw arithmetic."""
+"""Reject unsafe JVM money declarations, arithmetic and supported direct logging."""
 
 from bisect import bisect_right
 from dataclasses import dataclass
@@ -55,6 +55,12 @@ NUMBER_SERIALIZERS = {
     for kind in ("Double", "Float", "Long", "Int", "Short", "Byte")
     for suffix in ("", "Element")
 } | {"writeNumber", "writeNumberField", "numberValue"}
+OUTPUT_METHODS = {"print", "println", "printf", "format", "append"}
+LOGGING_TYPES = {
+    "java.io.PrintStream": OUTPUT_METHODS,
+    "java.io.PrintWriter": OUTPUT_METHODS,
+    "org.slf4j.Logger": {"trace", "debug", "info", "warn", "error"},
+}
 IDENTIFIER = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
 NUMBER = re.compile(r"(?:[0-9][A-Za-z0-9_]*(?:\.[0-9_]+)?(?:[eE][+-]?[0-9_]+)?|\.[0-9]+[fFdD]?)")
 OPERATORS = re.compile(r"::|\?\.|->|\+=|-=|\*=|/=|%=|\+\+|--|==|!=|<=|>=|&&|\|\|")
@@ -64,6 +70,7 @@ MESSAGES = {
     "MG003": "floating/decimal money conversion is forbidden",
     "MG004": "numeric money serialization is forbidden; use the accepted Contracts seam",
     "MG005": "unresolved money type; declare the Contracts Money type explicitly",
+    "MG006": "direct money logging/output is forbidden; use fixed MoneyDiagnostic metadata",
     "MG000": "source inventory or tokenization failed; the guard cannot certify this source",
 }
 
@@ -382,7 +389,7 @@ def java_resolved_type(tokens, position, scopes):
     return names or {"Object"}, references_parameter
 
 
-def java_declaration_types(tokens, type_positions=None):
+def java_declaration_types(tokens, type_positions=None, declaration_tokens=None):
     code, positions = [], []
     index = 0
     while index < len(tokens):
@@ -488,7 +495,11 @@ def java_declaration_types(tokens, type_positions=None):
     for index, end, recognized_tail in candidates:
         types, references_parameter = java_resolved_type(code[index:end], end, scopes)
         # Only a complete type at a declaration boundary may supply shared declarator types.
-        declarations.update((positions[declarator], types) for declarator in java_declarators(code, end))
+        declarators = list(java_declarators(code, end))
+        declarations.update((positions[declarator], types) for declarator in declarators)
+        if declaration_tokens is not None and recognized_tail:
+            for declarator in {*declarators, end}:
+                declaration_tokens[positions[declarator]] = [] if references_parameter else code[index:end]
         if references_parameter and recognized_tail:
             declarations[positions[end]] = types
     return declarations
@@ -501,10 +512,201 @@ def floating_literal(token):
     ) and not text.lower().startswith(("0x", "0b"))
 
 
+def direct_logging(tokens, chunks, declarations, inferred, wrapped, raw, aliases, kotlin, java_types):
+    imports = {"System": "java.lang.System", "String": "java.lang.String"}
+    for chunk in chunks:
+        if not chunk or chunk[0].text != "import":
+            continue
+        names = [token.text for token in chunk[1:] if token.text not in {"static", ";"}]
+        split = names.index("as") if "as" in names else len(names)
+        path = "".join(names[:split])
+        name = names[split + 1] if split < len(names) else path.rsplit(".", 1)[-1]
+        imports[name] = path
+
+    typed_names = {tokens[index].text for index in declarations}
+    declared_names = typed_names | {token.text for token, _ in inferred}
+    alias_positions = {}
+    for token, _ in inferred:
+        alias_positions.setdefault(token.text, set()).add(token)
+    unambiguous_aliases = {name for name, positions in alias_positions.items() if len(positions) == 1} - typed_names
+    local_types = {
+        tokens[index + 1].text for index, token in enumerate(tokens[:-1])
+        if token.text in {"class", "interface", "object", "record"} and tokens[index + 1].kind == "identifier"
+    }
+    callable_positions = {
+        index for index in declarations if index + 1 < len(tokens) and tokens[index + 1].text == "("
+    } | {index + 1 for index, token in enumerate(tokens[:-1]) if token.text == "fun"}
+    callables = {tokens[index].text for index in callable_positions}
+
+    def qualified(parts, static=False):
+        if not parts or parts[0] in local_types or static and parts[0] in declared_names | callables:
+            return None
+        return ".".join([imports.get(parts[0], parts[0]), *parts[1:]])
+
+    def chain(expression, start):
+        parts = [expression[start].text]
+        end = start + 1
+        while end + 1 < len(expression) and expression[end].text in {".", "?."} and expression[end + 1].kind == "identifier":
+            parts.append(expression[end + 1].text)
+            end += 2
+        return parts, end
+
+    def sink_type(index, names):
+        if names & {"<", "[", "(", "->"}:
+            return None
+        expression = java_types.get(index, [])
+        if kotlin and index + 2 < len(tokens) and tokens[index + 1].text == ":":
+            expression = tokens[index + 2:]
+        if not expression or expression[0].kind != "identifier":
+            return None
+        parts, _ = chain(expression, 0)
+        if kotlin and len(parts) == 1 and parts[0] in typed_names:
+            return None
+        name = qualified(parts)
+        return name if name in LOGGING_TYPES else None
+
+    receiver_types = {}
+    values = (wrapped | raw) - callables - (alias_positions.keys() - unambiguous_aliases)
+    for index, names in declarations.items():
+        name = tokens[index].text
+        receiver_types.setdefault(name, set()).add(sink_type(index, names))
+        expanded = set().union(*(aliases.get(item, {item}) for item in names))
+        if name in wrapped and "Money" not in expanded or name in raw and not expanded & (INTEGER_TYPES | UNSAFE_TYPES):
+            values.discard(name)
+    receivers = {name: next(iter(kinds)) for name, kinds in receiver_types.items() if len(kinds) == 1 and None not in kinds}
+
+    def receiver(parts):
+        if len(parts) == 1 and parts[0] in receivers:
+            return receivers[parts[0]]
+        if qualified(parts, static=True) in {"java.lang.System.out", "java.lang.System.err"}:
+            return "java.io.PrintStream"
+        return None
+
+    def carries_value(expression):
+        index = 0
+        while index < len(expression):
+            token = expression[index]
+            if token.text in {"(", "[", "{"}:
+                end = java_group_end(expression, index)
+                if end is None:
+                    return False
+                if token.text != "{" and carries_value(expression[index + 1:end - 1]):
+                    return True
+                index = end
+                continue
+            if token.kind != "identifier":
+                index += 1
+                continue
+            parts, end = chain(expression, index)
+            if parts[0] == "this":
+                parts = parts[1:]
+            following = expression[end].text if end < len(expression) else ""
+            previous = expression[index - 1].text if index else ""
+            rooted_value = bool(parts) and parts[0] in values
+            if following == "(":
+                stop = java_group_end(expression, end)
+                if stop is None:
+                    return False
+                arguments = expression[end + 1:stop - 1]
+                name = qualified(parts, static=True)
+                if rooted_value and len(parts) == 2 and parts[1] in {"toString", "getMinorUnits"}:
+                    return True
+                if name in {
+                    "com.pennilogic.contracts.money.Money.parse",
+                    "com.pennilogic.contracts.money.Money.ofMinorUnits",
+                    "com.pennilogic.contracts.money.Money.fromWire",
+                    "com.pennilogic.contracts.money.Money.Companion.parse",
+                    "com.pennilogic.contracts.money.Money.Companion.ofMinorUnits",
+                    "com.pennilogic.contracts.money.Money.Companion.fromWire",
+                }:
+                    return True
+                if name == "java.lang.String.valueOf" and carries_value(arguments):
+                    return True
+                if name in {
+                    "kotlinx.serialization.json.Json.encodeToString",
+                    "kotlinx.serialization.json.Json.Default.encodeToString",
+                    "kotlinx.serialization.json.Json.encodeToJsonElement",
+                } and any(
+                    qualified(chain(arguments, position)[0]) in {
+                        "com.pennilogic.contracts.money.MoneySerializer",
+                        "com.pennilogic.contracts.money.MoneySerializer.INSTANCE",
+                    }
+                    for position, item in enumerate(arguments) if item.kind == "identifier"
+                ) and carries_value(arguments):
+                    return True
+                # An unknown function's result is not its arguments; no interprocedural inference.
+                index = stop
+                continue
+            if rooted_value and (
+                len(parts) == 2 and parts[1] in RAW_MEMBERS
+                or len(parts) == 1 and following not in {"::", "==", "!=", "<", ">", "<=", ">="}
+                and previous not in {"==", "!=", "<", ">", "<=", ">=", "is", "as"}
+            ):
+                return True
+            index = end
+        return False
+
+    def inferred_receiver(expression):
+        if not expression:
+            return None
+        start = 1 if expression[0].text == "new" else 0
+        if start >= len(expression) or expression[start].kind != "identifier":
+            return None
+        parts, end = chain(expression, start)
+        if end == len(expression):
+            return receiver(parts)
+        if expression[end].text == "(" and java_group_end(expression, end) == len(expression):
+            name = qualified(parts, static=True)
+            if name in LOGGING_TYPES:
+                return name
+            if name == "org.slf4j.LoggerFactory.getLogger":
+                return "org.slf4j.Logger"
+        return None
+
+    for _ in range(len(inferred) + 1):
+        for token, expression in inferred:
+            if token.text in unambiguous_aliases and carries_value(expression):
+                values.add(token.text)
+            kind = inferred_receiver(expression)
+            if kind is not None and token.text in unambiguous_aliases:
+                receivers[token.text] = kind
+
+    for index, token in enumerate(tokens[:-1]):
+        if token.kind != "identifier" or tokens[index + 1].text != "(" or index in callable_positions:
+            continue
+        start = index
+        while start >= 2 and tokens[start - 1].text in {".", "?."} and tokens[start - 2].kind == "identifier":
+            start -= 2
+        parts, _ = chain(tokens, start)
+        kind = receiver(parts[:-1])
+        if start == index and index >= 2 and tokens[index - 1].text in {".", "?."} and tokens[index - 2].text == ")":
+            opening, depth = index - 2, 1
+            while opening and depth:
+                opening -= 1
+                depth += (tokens[opening].text == ")") - (tokens[opening].text == "(")
+            beginning = opening - 1
+            while beginning >= 2 and tokens[beginning - 1].text == "." and tokens[beginning - 2].kind == "identifier":
+                beginning -= 2
+            if depth == 0 and beginning >= 0:
+                kind = inferred_receiver(tokens[beginning:index - 1])
+        standard_print = (
+            kotlin and token.text in {"print", "println"} and len(parts) == 1
+            and token.text not in declared_names | callables | imports.keys()
+        ) or kotlin and qualified(parts, static=True) in {"kotlin.io.print", "kotlin.io.println"}
+        if not standard_print and (kind is None or token.text not in LOGGING_TYPES[kind]):
+            continue
+        end = java_group_end(tokens, index + 1)
+        if end is not None and carries_value(tokens[index + 2:end - 1]):
+            yield token
+
+
 def analyze(path, source):
     tokens = tokenize(source)
     chunks = list(statements(tokens))
-    aliases = {name: {name} for name in UNSAFE_TYPES | INTEGER_TYPES | {"Money"}}
+    aliases = {
+        name: {name} for name in UNSAFE_TYPES | INTEGER_TYPES | {"Money"}
+        | {kind.rsplit(".", 1)[-1] for kind in LOGGING_TYPES}
+    }
     alias_declarations = []
     for chunk in chunks:
         for index, token in enumerate(chunk):
@@ -540,9 +742,10 @@ def analyze(path, source):
         )
 
     java_type_positions = set()
-    java_types = {
-        index: expanded(types) for index, types in java_declaration_types(tokens, java_type_positions).items()
-    } if Path(path).suffix.lower() == ".java" else {}
+    java_logging_types = {}
+    java = Path(path).suffix.lower() == ".java"
+    java_types = java_declaration_types(tokens, java_type_positions, java_logging_types) if java else {}
+    declarations = {}
     for index, token in enumerate(tokens):
         if token.kind != "identifier" or index in java_type_positions:
             continue
@@ -550,7 +753,7 @@ def analyze(path, source):
         if index in java_types:
             types = java_types[index]
         elif index + 1 < len(tokens) and tokens[index + 1].text == ":":
-            types = expanded(declared_type(tokens, index + 2))
+            types = declared_type(tokens, index + 2)
         elif index and tokens[index - 1].text in {"val", "var"}:
             if index + 1 < len(tokens) and tokens[index + 1].text == "=":
                 inferred.append((token, expression_after(tokens, index + 2)))
@@ -561,15 +764,18 @@ def analyze(path, source):
                     depth += 1 if tokens[end].text == "(" else -1
                 end += 1
             if end < len(tokens) and tokens[end].text == ":":
-                types = expanded(declared_type(tokens, end + 1))
+                types = declared_type(tokens, end + 1)
         elif index and tokens[index - 1].text in aliases:
-            types = expanded({tokens[index - 1].text})
+            types = {tokens[index - 1].text}
         elif index and (
             tokens[index - 1].text in {">", "]"}
             or money_name(token.text) and tokens[index - 1].kind == "identifier"
             and tokens[index - 1].text not in {"return", "class", "object", "interface", "typealias", "new", "throw"}
         ):
-            types = expanded(java_type_prefix(tokens, index))
+            types = java_type_prefix(tokens, index)
+        if types:
+            declarations[index] = types
+        types = expanded(types)
         if types & (UNSAFE_TYPES | INTEGER_TYPES):
             numeric.add(token.text)
         if "Money" in types and not types & (UNSAFE_TYPES | INTEGER_TYPES):
@@ -660,6 +866,8 @@ def analyze(path, source):
             end = next((i for i, item in enumerate(tail) if item.text == "}"), len(tail))
             if raw_reference(tail[:end]):
                 find(token, "MG002")
+    for token in direct_logging(tokens, chunks, declarations, inferred, wrapped, raw, aliases, not java, java_logging_types):
+        find(token, "MG006")
     return sorted(findings, key=lambda item: (item.path, item.token.line, item.token.column, item.rule, item.field))
 
 

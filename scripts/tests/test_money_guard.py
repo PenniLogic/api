@@ -1125,6 +1125,232 @@ class MoneySourceGuardTest(unittest.TestCase):
         self.assertNotIn("\u001b", rendered)
         self.assertTrue(rendered.isascii())
 
+    def test_direct_money_and_raw_values_are_refused_at_resolved_print_stream_sinks(self):
+        for suffix in ("kt", "java"):
+            for kind in ("PrintStream", "PrintWriter", "java.io.PrintStream", "java.io.PrintWriter"):
+                for argument in ("value", "value.toString()", "value.getMinorUnits()" if suffix == "java" else "value.minorUnits"):
+                    for method in ("print", "println", "printf", "format"):
+                        arguments = f'"%s", {argument}' if method in {"printf", "format"} else argument
+                        body = f"sink.{method}({arguments});"
+                        source = (
+                            "import com.pennilogic.contracts.money.Money;\n"
+                            "import java.io.PrintStream;\nimport java.io.PrintWriter;\n"
+                            + (f"class Control {{ void check({kind} sink, Money value) {{ {body} }} }}"
+                               if suffix == "java" else f"fun check(sink: {kind}, value: Money) {{ {body} }}")
+                        )
+                        with self.subTest(language=suffix, kind=kind, method=method, form=argument):
+                            self.assertEqual({"MG006"}, self.rules(source, suffix))
+
+    def test_system_and_kotlin_standard_output_sinks_refuse_direct_money(self):
+        for call in (
+            "print(value)", "println(value)", "kotlin.io.print(value)", "kotlin.io.println(value)",
+            "System.out.println(value)", "System.err.print(value)",
+            "java.lang.System.out.printf(\"%s\", value)", "java.lang.System.err.format(\"%s\", value)",
+        ):
+            with self.subTest(call=call):
+                self.assertEqual({"MG006"}, self.rules(
+                    f"import com.pennilogic.contracts.money.Money\nfun check(value: Money) {{ {call} }}",
+                ))
+        for call in ("System.out.println(value)", "java.lang.System.err.println(value.getMinorUnits())"):
+            self.assertEqual({"MG006"}, self.rules(
+                "import com.pennilogic.contracts.money.Money;\n"
+                f"class Control {{ void check(Money value) {{ {call}; }} }}", "java",
+            ))
+
+    def test_slf4j_sinks_require_a_resolved_receiver_not_a_logger_spelling(self):
+        for suffix in ("kt", "java"):
+            for method in ("trace", "debug", "info", "warn", "error"):
+                body = f'sink.{method}("operation {{}}", value);'
+                source = (
+                    "import com.pennilogic.contracts.money.Money;\nimport org.slf4j.Logger;\n"
+                    + (f"class Control {{ void check(Logger sink, Money value) {{ {body} }} }}"
+                       if suffix == "java" else f"fun check(sink: Logger, value: Money) {{ {body} }}")
+                )
+                with self.subTest(language=suffix, method=method):
+                    self.assertEqual({"MG006"}, self.rules(source, suffix))
+        self.assertEqual({"MG006"}, self.rules(
+            "import com.pennilogic.contracts.money.Money\nimport org.slf4j.LoggerFactory\n"
+            'fun check(value: Money) { val sink = LoggerFactory.getLogger("control"); sink.info("{}", value) }',
+        ))
+        self.assertEqual({"MG006"}, self.rules(
+            "import com.pennilogic.contracts.money.Money;\nimport org.slf4j.LoggerFactory;\n"
+            'class Control { void check(Money value) { var sink = LoggerFactory.getLogger("control"); sink.info("{}", value); } }',
+            "java",
+        ))
+        for suffix in ("kt", "java"):
+            source = (
+                "import com.pennilogic.contracts.money.Money;\n"
+                "import org.slf4j.LoggerFactory;\n"
+                + ('class Control { void check(Money value) { LoggerFactory.getLogger("control").info("{}", value); } }'
+                   if suffix == "java" else 'fun check(value: Money) { LoggerFactory.getLogger("control").info("{}", value) }')
+            )
+            self.assertEqual({"MG006"}, self.rules(source, suffix))
+
+    def test_supported_value_renderings_and_local_aliases_cannot_escape_direct_sinks(self):
+        for body in (
+            'println("$value")',
+            'println("value=${value.toString()}")',
+            'println("""value=$value""")',
+            'println("value=" + value)',
+            'val copy = value; println(copy)',
+            'val raw = value.minorUnits; val copy = raw; println(copy)',
+            'val rendered = value.toString(); println(rendered)',
+            'println(Json.encodeToString(MoneySerializer, value))',
+            'val encoded = Json.encodeToString(MoneySerializer, value); println(encoded)',
+            'println(Money.parse("1.00", "INR"))',
+        ):
+            with self.subTest(case=body):
+                self.assertIn("MG006", self.rules(
+                    "import com.pennilogic.contracts.money.Money\n"
+                    "import com.pennilogic.contracts.money.MoneySerializer\n"
+                    "import kotlinx.serialization.json.Json\n"
+                    f"fun check(value: Money) {{ {body} }}",
+                ))
+        for body in (
+            "sink.println(String.valueOf(value));",
+            "sink.println(java.lang.String.valueOf(value));",
+            "var raw = value.getMinorUnits(); sink.println(raw);",
+            "var rendered = value.toString(); sink.append(rendered);",
+            'sink.println(Money.Companion.parse("1.00", "INR"));',
+        ):
+            with self.subTest(case=body):
+                self.assertEqual({"MG006"}, self.rules(
+                    "import com.pennilogic.contracts.money.Money;\nimport java.io.PrintStream;\n"
+                    f"class Control {{ void check(PrintStream sink, Money value) {{ {body} }} }}", "java",
+                ))
+
+    def test_import_aliases_and_resolved_sink_aliases_keep_logging_refusals(self):
+        for body in (
+            "sink.println(value)",
+            "val copy = sink; copy.println(value)",
+            "val copy = java.lang.System.out; copy.println(value)",
+        ):
+            self.assertEqual({"MG006"}, self.rules(
+                "import com.pennilogic.contracts.money.Money as Exact\n"
+                "import java.io.PrintStream as Output\n"
+                f"fun check(sink: Output, value: Exact) {{ {body} }}",
+            ))
+        self.assertEqual({"MG006"}, self.rules(
+            "import com.pennilogic.contracts.money.Money\nimport kotlin.io.println as emit\n"
+            "fun check(value: Money) { emit(value) }",
+        ))
+
+    def test_log_metadata_nonmoney_numbers_and_synthetic_transport_are_not_banned(self):
+        source = (
+            "import com.pennilogic.contracts.money.Money\n"
+            "import com.pennilogic.contracts.money.MoneySerializer\n"
+            "import kotlinx.serialization.json.Json\n"
+            "import java.io.PrintStream\n"
+            "fun check(sink: PrintStream, value: Money, count: Int, temperature: Double) {\n"
+            'sink.println("money_diagnostic operation=parse field=amount"); sink.println(count); sink.println(temperature)\n'
+            "sink.println(Money::class.java.simpleName); sink.println(value.currency)\n"
+            "val encoded = Json.encodeToString(MoneySerializer, value); transport(encoded)\n"
+            "}\nfun transport(payload: String) {}\n"
+        )
+        self.assertEqual(set(), self.rules(source))
+        self.assertEqual(set(), self.rules(
+            "import com.pennilogic.contracts.money.Money;\nimport java.io.PrintStream;\n"
+            "class Control { void check(PrintStream sink, Money value, int count) {"
+            "sink.println(Money.class.getSimpleName()); sink.println(count); sink.println(value.getCurrency()); } }",
+            "java",
+        ))
+
+    def test_type_declarations_and_harmless_shadowed_output_functions_are_not_sinks(self):
+        for source in (
+            "fun println(value: Money): Money = value\nfun check(value: Money) { println(value) }",
+            "class Control { fun print(value: Money) {} fun check(value: Money) { print(value) } }",
+            "fun check(value: Money) { val println: (Money) -> Unit = {}; println(value) }",
+            "import custom.println\nfun check(value: Money) { println(value) }",
+            "class Sink { fun println(value: Money) {} }\nfun check(sink: Sink, value: Money) { sink.println(value) }",
+            "class Sink { fun info(value: Money) {} }\nfun check(logger: Sink, value: Money) { logger.info(value) }",
+            "class Sink { fun println(value: Money) {} }\n"
+            "object System { val out = Sink() }\nfun check(value: Money) { System.out.println(value) }",
+        ):
+            with self.subTest(case=source):
+                self.assertEqual(set(), self.rules("import com.pennilogic.contracts.money.Money\n" + source))
+        self.assertEqual(set(), self.rules(
+            "import com.pennilogic.contracts.money.Money;\n"
+            "class Control { void println(Money value) {} void check(Money value) { println(value); } }",
+            "java",
+        ))
+
+    def test_unqualified_custom_sink_types_are_not_assumed_to_be_standard_output(self):
+        for kind, method in (("PrintStream", "println"), ("Logger", "info")):
+            self.assertEqual(set(), self.rules(
+                "import com.pennilogic.contracts.money.Money\n"
+                f"class {kind} {{ fun {method}(value: Money) {{}} }}\n"
+                f"fun check(sink: {kind}, value: Money) {{ sink.{method}(value) }}",
+            ))
+            self.assertEqual(set(), self.rules(
+                "import com.pennilogic.contracts.money.Money;\n"
+                f"class {kind} {{ void {method}(Money value) {{}} }}\n"
+                f"class Control {{ void check({kind} sink, Money value) {{ sink.{method}(value); }} }}", "java",
+            ))
+
+    def test_qualified_sink_types_do_not_require_simple_imports(self):
+        for suffix in ("kt", "java"):
+            for kind, method in (("java.io.PrintStream", "println"), ("org.slf4j.Logger", "info")):
+                body = f'{method}("{{}}", value)' if method == "info" else f"{method}(value)"
+                source = (
+                    "import com.pennilogic.contracts.money.Money;\n"
+                    + (f"class Control {{ void check({kind} sink, Money value) {{ sink.{body}; }} }}"
+                       if suffix == "java" else f"fun check(sink: {kind}, value: Money) {{ sink.{body} }}")
+                )
+                self.assertEqual({"MG006"}, self.rules(source, suffix))
+
+    def test_ambiguous_names_and_opaque_helpers_are_outside_direct_sink_resolution(self):
+        for source in (
+            "fun staticText(value: Money): String = \"static\"\nfun check(value: Money) { println(staticText(value)) }",
+            "fun check(value: Money) { println(value.compareTo(value)); println(value == value) }",
+            "fun first(sink: java.io.PrintStream, value: Money) {}\n"
+            "class Sink { fun println(value: Money) {} }\nfun second(sink: Sink, value: Money) { sink.println(value) }",
+            "fun first(value: Money) { val copy = value }\nfun second(copy: String) { println(copy) }",
+            "fun first(value: Money) { val copy = value }\nfun second() { val copy = \"static\"; println(copy) }",
+        ):
+            with self.subTest(case=source):
+                self.assertEqual(set(), self.rules("import com.pennilogic.contracts.money.Money\n" + source))
+
+    def test_qualified_lookalikes_do_not_resolve_by_an_unordered_subset_of_type_names(self):
+        for suffix in ("kt", "java"):
+            for kind, method in (
+                ("org.slf4j.custom.Logger", "info"), ("slf4j.org.Logger", "info"),
+                ("custom.java.io.PrintStream", "println"), ("io.java.PrintStream", "println"),
+            ):
+                source = (
+                    "import com.pennilogic.contracts.money.Money;\n"
+                    + (f"class Control {{ void check({kind} sink, Money value) {{ sink.{method}(value); }} }}"
+                       if suffix == "java" else f"fun check(sink: {kind}, value: Money) {{ sink.{method}(value) }}")
+                )
+                with self.subTest(language=suffix, kind=kind):
+                    self.assertEqual(set(), self.rules(source, suffix))
+
+    def test_sink_type_parameters_cannot_recover_an_import_with_the_same_spelling(self):
+        self.assertEqual(set(), self.rules(
+            "import com.pennilogic.contracts.money.Money\nimport org.slf4j.Logger\n"
+            "open class Harmless { fun info(template: String, value: Money) {} }\n"
+            'fun <Logger : Harmless> check(sink: Logger, value: Money) { sink.info("{}", value) }',
+        ))
+        self.assertEqual(set(), self.rules(
+            "import com.pennilogic.contracts.money.Money;\nimport org.slf4j.Logger;\n"
+            "class Harmless { void info(String template, Money value) {} }\n"
+            'class Control { <Logger extends Harmless> void check(Logger sink, Money value) { sink.info("{}", value); } }',
+            "java",
+        ))
+
+    def test_direct_sink_findings_do_not_quote_arguments_fields_or_source(self):
+        source = (
+            "import com.pennilogic.contracts.money.Money\n"
+            'fun check(value: Money) { println("synthetic-account-marker ${value.toString()}") }\n'
+        )
+        findings = guard.analyze("Control.kt", source)
+        self.assertEqual(1, len(findings))
+        self.assertEqual(("MG006", "", 2, 27), (
+            findings[0].rule, findings[0].field, findings[0].token.line, findings[0].token.column,
+        ))
+        rendered = findings[0].diagnostic()
+        self.assertNotIn("synthetic-account-marker", rendered)
+        self.assertNotIn(source, rendered)
+
     def check(self, root):
         with contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()) as errors:
             result = guard.check(root)
