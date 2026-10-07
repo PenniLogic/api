@@ -406,7 +406,7 @@ def check_latest():
     if not re.fullmatch(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}", run_id):
         raise ValueError("Mutation run reference is invalid")
     directory = provider.safe_path(ROOT / REPORTS, run_id)
-    record = json.loads(provider.safe_path(directory, "run.json").read_text(encoding="utf-8"))
+    record = quality.money_execution_event(provider.safe_path(directory, "run.json").read_text(encoding="utf-8"))
     if record.get("schema_version") != SCHEMA_VERSION or record.get("feature_selection") != list(FEATURE_SELECTION):
         raise ValueError("Mutation attempt uses a different native feature measurement scope")
     elapsed = record["elapsed_seconds"]
@@ -418,6 +418,9 @@ def check_latest():
         or record["inputs"] != input_snapshot(record["config"])
     ):
         raise ValueError("Latest mutation attempt failed, exceeded budget or has stale inputs")
+    test_evidence = quality.money_test_metrics()
+    if json.dumps(record.get("test_evidence"), sort_keys=True) != json.dumps(test_evidence, sort_keys=True):
+        raise ValueError("Mutation test evidence differs from executed Money comparisons")
     for name, expected in record["outputs"].items():
         if Path(name).name != name or file_record(provider.safe_path(directory, name)) != expected:
             raise ValueError("Mutation attempt output changed after execution")
@@ -452,6 +455,7 @@ def check_latest():
     print(json.dumps({
         "event": "money_mutation_verified", "run_id": run_id,
         "counts": result["counts"], "score": result["score"],
+        "primitive_model": test_evidence["primitive_model"],
     }))
 
 

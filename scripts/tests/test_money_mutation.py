@@ -24,6 +24,35 @@ SPEC.loader.exec_module(mutation)
 quality = mutation.quality
 process_budget = quality.script_module("process_budget")
 
+PRIMITIVE_CLASS = "com.pennilogic.money.AcceptedMoneyPrimitiveModelTest"
+PRIMITIVE_METHODS = {
+    "construction": "constructionMatchesExactModel()",
+    "parsing": "parsingMatchesExactModel()",
+    "rendering": "renderingMatchesExactModel()",
+    "addition": "additionMatchesExactModel()",
+    "subtraction": "subtractionMatchesExactModel()",
+    "negation": "negationMatchesExactModel()",
+    "ordering": "orderingMatchesExactModel()",
+    "mixed_currency": "mixedCurrenciesMatchExactModel()",
+    "wire": "wireMatchesExactModel()",
+}
+
+
+def primitive_fixture(directory):
+    suite = ET.Element("testsuite", {
+        "name": PRIMITIVE_CLASS, "tests": str(len(PRIMITIVE_METHODS)), "failures": "0", "errors": "0", "skipped": "0",
+    })
+    events = []
+    for index, (category, method) in enumerate(PRIMITIVE_METHODS.items(), 1):
+        ET.SubElement(suite, "testcase", {"classname": PRIMITIVE_CLASS, "name": method})
+        events.append({
+            "event": "money_primitive_model", "category": category, "comparisons": index, "disagreements": 0,
+        })
+    ET.SubElement(suite, "system-out").text = "\n".join(json.dumps(event) for event in events)
+    path = directory / "TEST-primitive.xml"
+    ET.ElementTree(suite).write(path)
+    return suite, path
+
 
 class SyntheticStrategy:
     BUNDLE = Path("synthetic")
@@ -391,7 +420,181 @@ class MutationReportTest(unittest.TestCase):
                 mutation.read_report(path, {self.target}, {self.operator: "SYNTHETIC"}, {"Money.kt"})
 
 
+class PrimitiveModelEvidenceTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.directory = self.root / "build/test-results/moneyTest"
+        self.directory.mkdir(parents=True)
+        properties = ET.Element("testsuite", {"tests": "3", "failures": "0", "errors": "0", "skipped": "0"})
+        for name in ("round_trip", "associativity", "collision_keys"):
+            ET.SubElement(properties, "testcase", {"classname": "com.pennilogic.money.SyntheticTest", "name": name})
+        ET.SubElement(properties, "system-out").text = "\n".join(
+            json.dumps({"event": "money_property_cases", "property": name, "count": 2}, separators=(",", ":"))
+            for name in ("round_trip", "associativity", "collision_keys")
+        )
+        self.properties = self.directory / "TEST-properties.xml"
+        ET.ElementTree(properties).write(self.properties)
+        self.suite, self.path = primitive_fixture(self.directory)
+        self.output = self.suite.find("system-out")
+        self.rows = self.output.text.splitlines()
+
+    def save(self, rows=None):
+        self.output.text = "\n".join(self.rows if rows is None else rows)
+        ET.ElementTree(self.suite).write(self.path)
+
+    def metrics(self):
+        return quality.money_test_metrics(self.root)
+
+    def test_real_shape_requires_all_scoped_counts_and_preserves_undelivered_product_oracle(self):
+        evidence = self.metrics()
+        self.assertEqual(12, evidence["target_tests"])
+        self.assertEqual(0, evidence["skipped"])
+        self.assertEqual(0, evidence["failed"])
+        self.assertEqual({"round_trip": 2, "associativity": 2, "collision_keys": 2}, evidence["property_cases"])
+        self.assertEqual({"status": "not_implemented", "disagreements": None}, evidence["independent_oracle"])
+        self.assertEqual({
+            "status": "passed", "representation": "jdk_big_integer", "comparisons": 45, "disagreements": 0,
+            "categories": dict(zip(PRIMITIVE_METHODS, range(1, 10))),
+        }, evidence["primitive_model"])
+
+    def test_missing_suite_or_each_category_refuses_and_restores(self):
+        self.path.unlink()
+        with self.assertRaisesRegex(ValueError, "primitive"):
+            self.metrics()
+        self.save()
+        for index in range(len(self.rows)):
+            self.save(self.rows[:index] + self.rows[index + 1:])
+            with self.subTest(index=index), self.assertRaisesRegex(ValueError, "primitive"):
+                self.metrics()
+            self.save()
+            self.assertEqual(45, self.metrics()["primitive_model"]["comparisons"])
+
+    def test_duplicate_events_and_fields_cannot_hide_alongside_valid_evidence(self):
+        duplicate_field = self.rows[0].replace('"comparisons": 1', '"comparisons": 0, "comparisons": 1')
+        escaped_field = self.rows[0].replace('"comparisons": 1', '"comparisons": 0, "\\u0063omparisons": 1')
+        escaped_event = self.rows[0].replace("money_primitive_model", "\\u006doney_primitive_model")
+        for extra in [*self.rows, duplicate_field, escaped_field, escaped_event]:
+            self.save([*self.rows, extra])
+            with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, "primitive"):
+                self.metrics()
+        self.save()
+        duplicate = ET.SubElement(self.suite, "system-out")
+        duplicate.text = self.rows[0]
+        self.save()
+        with self.assertRaisesRegex(ValueError, "duplicated"):
+            self.metrics()
+        self.suite.remove(duplicate)
+        self.save()
+        self.assertEqual(45, self.metrics()["primitive_model"]["comparisons"])
+
+    def test_missing_invalid_zero_or_disagreeing_counters_refuse(self):
+        original = json.loads(self.rows[0])
+        for field in ("comparisons", "disagreements"):
+            missing = {key: value for key, value in original.items() if key != field}
+            self.save([json.dumps(missing), *self.rows[1:]])
+            with self.subTest(missing=field), self.assertRaisesRegex(ValueError, "primitive"):
+                self.metrics()
+            values = [None, False, True, "1", 1.0, [], {}, -1]
+            values.append(0 if field == "comparisons" else 1)
+            for value in values:
+                self.save([json.dumps({**original, field: value}), *self.rows[1:]])
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(ValueError, "primitive"):
+                    self.metrics()
+        for category in (None, [], {}, 1, "", "debt", "allocation"):
+            self.save([json.dumps({**original, "category": category}), *self.rows[1:]])
+            with self.subTest(category=category), self.assertRaisesRegex(ValueError, "primitive"):
+                self.metrics()
+
+    def test_malformed_model_records_never_hide_beside_valid_events_or_echo_payloads(self):
+        marker = "synthetic-private-marker"
+        invalid = [
+            '{"event":"money_primitive_model",',
+            '["money_primitive_model"]',
+            '["\\u006doney_primitive_model"]',
+            '"money_primitive_model"',
+            '"\\u006doney_primitive_model"',
+            "money_primitive_model " + marker,
+            self.rows[0].replace('"comparisons": 1', '"comparisons": NaN'),
+            self.rows[0].replace('"comparisons": 1', '"comparisons": Infinity'),
+            self.rows[0] + self.rows[0],
+            json.dumps({**json.loads(self.rows[0]), "unexpected": marker}),
+            self.rows[0].replace("money_primitive_model", "money_primitive_model_invalid"),
+            self.rows[0].replace("money_primitive_model", "\\u006doney_primitive_model_invalid"),
+            self.rows[0].replace('"money_primitive_model"', '["\\u006doney_primitive_model"]'),
+        ]
+        for extra in invalid:
+            self.save([*self.rows, extra])
+            with self.subTest(extra=extra):
+                with self.assertRaises(ValueError) as refusal:
+                    self.metrics()
+                self.assertNotIn(marker, str(refusal.exception))
+        self.save()
+        self.assertEqual(45, self.metrics()["primitive_model"]["comparisons"])
+
+    def test_model_events_are_bound_to_their_own_executed_test_class_and_method(self):
+        case = self.suite.find("testcase")
+        for node, field, changed in (
+            (self.suite, "name", "com.pennilogic.money.OtherTest"),
+            (case, "name", "notTheComparison()"),
+            (case, "classname", "com.pennilogic.money.OtherTest"),
+        ):
+            original = node.get(field)
+            node.set(field, changed)
+            self.save()
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "executed comparison"):
+                self.metrics()
+            node.set(field, original)
+        self.save()
+        other_suite = ET.parse(self.properties)
+        other_suite.getroot().find("system-out").text += "\n" + self.rows[0]
+        other_suite.write(self.properties)
+        self.save(self.rows[1:])
+        with self.assertRaisesRegex(ValueError, "executed comparison"):
+            self.metrics()
+
+    def test_unexecuted_skipped_failed_error_or_duplicate_cases_never_qualify(self):
+        first = self.suite.find("testcase")
+        for counter, element in (("skipped", "skipped"), ("failures", "failure"), ("errors", "error")):
+            self.suite.set(counter, "1")
+            status = ET.SubElement(first, element)
+            self.save()
+            with self.subTest(status=element), self.assertRaises(ValueError):
+                self.metrics()
+            first.remove(status)
+            self.suite.set(counter, "0")
+        extra = ET.SubElement(self.suite, "testcase", dict(first.attrib))
+        self.suite.set("tests", "10")
+        self.save()
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            self.metrics()
+        self.suite.remove(extra)
+        for case in self.suite.findall("testcase"):
+            self.suite.remove(case)
+        self.suite.set("tests", "0")
+        self.save()
+        with self.assertRaisesRegex(ValueError, "executed comparison"):
+            self.metrics()
+
+
 class MutationEvidenceTest(unittest.TestCase):
+    def test_provider_properties_without_primitive_model_refuse(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / "build/test-results/moneyTest"
+            directory.mkdir(parents=True)
+            suite = ET.Element("testsuite", {"tests": "3", "failures": "0", "errors": "0", "skipped": "0"})
+            for name in ("round_trip", "associativity", "collision_keys"):
+                ET.SubElement(suite, "testcase", {
+                    "classname": "com.pennilogic.money.SyntheticTest", "name": name,
+                })
+            ET.SubElement(suite, "system-out").text = "\n".join(
+                json.dumps({"event": "money_property_cases", "property": name, "count": 2}, separators=(",", ":"))
+                for name in ("round_trip", "associativity", "collision_keys")
+            )
+            ET.ElementTree(suite).write(directory / "TEST-synthetic.xml")
+            with self.assertRaisesRegex(ValueError, "primitive"):
+                quality.money_test_metrics(root)
+
     def test_standalone_consumer_rejects_below_floor_changed_outputs_and_stale_inputs_then_restores(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -413,6 +616,15 @@ class MutationEvidenceTest(unittest.TestCase):
             provider.safe_path = lambda base, relative: base / relative
             floors, strategy_hash = quality.money_policy(provider)
             fixture = MutationReportTest()
+            test_evidence = {
+                "target_tests": 12, "skipped": 0, "failed": 0,
+                "property_cases": {"round_trip": 2, "associativity": 2, "collision_keys": 2},
+                "independent_oracle": {"status": "not_implemented", "disagreements": None},
+                "primitive_model": {
+                    "status": "passed", "representation": "jdk_big_integer", "comparisons": 45, "disagreements": 0,
+                    "categories": dict(zip(PRIMITIVE_METHODS, range(1, 10))),
+                },
+            }
 
             def store(record):
                 (directory / "run.json").write_text(json.dumps(record))
@@ -445,6 +657,7 @@ class MutationEvidenceTest(unittest.TestCase):
                     "catalogue": catalogue, "features": features,
                     "commands": commands,
                     "report": mutation.file_record(report), "result": result,
+                    "test_evidence": json.loads(json.dumps(test_evidence)),
                 }
                 store(record)
                 return record
@@ -454,9 +667,43 @@ class MutationEvidenceTest(unittest.TestCase):
                 patch.object(quality, "money_provider_module", return_value=provider),
                 patch.object(quality, "money_class_inventory", return_value={fixture.target.replace(".", "/"): "synthetic"}),
                 patch.object(mutation, "input_snapshot", return_value={"synthetic": "bound"}) as snapshot,
+                patch.object(quality, "money_test_metrics", return_value=test_evidence) as metrics,
                 patch("sys.stdout", new_callable=io.StringIO),
             ):
                 save(90)
+                mutation.check_latest()
+                for replacement in (
+                    None, {}, {**test_evidence, "primitive_model": None},
+                    {**test_evidence, "primitive_model": {**test_evidence["primitive_model"], "comparisons": 46}},
+                    {**test_evidence, "primitive_model": {**test_evidence["primitive_model"], "comparisons": 45.0}},
+                    {**test_evidence, "primitive_model": {**test_evidence["primitive_model"], "disagreements": 1}},
+                    {**test_evidence, "primitive_model": {**test_evidence["primitive_model"], "disagreements": False}},
+                    {**test_evidence, "independent_oracle": {"status": "passed", "disagreements": 0}},
+                ):
+                    record = save(90)
+                    if replacement is None:
+                        del record["test_evidence"]
+                    else:
+                        record["test_evidence"] = replacement
+                    store(record)
+                    with self.subTest(evidence=replacement), self.assertRaisesRegex(ValueError, "test evidence"):
+                        mutation.check_latest()
+                    save(90)
+                    mutation.check_latest()
+                for field in ("test_evidence", "disagreements"):
+                    record = save(90)
+                    content = json.dumps(record)
+                    key = json.dumps(field) + ":"
+                    duplicate = key + ("null, " if field == "test_evidence" else "1, ") + key
+                    (directory / "run.json").write_text(content.replace(key, duplicate, 1))
+                    with self.subTest(duplicate=field), self.assertRaisesRegex(ValueError, "malformed"):
+                        mutation.check_latest()
+                    save(90)
+                    mutation.check_latest()
+                metrics.side_effect = ValueError("Money primitive model evidence is missing a required category")
+                with self.assertRaisesRegex(ValueError, "primitive"):
+                    mutation.check_latest()
+                metrics.side_effect = None
                 mutation.check_latest()
                 for change in ("omit-survivor", "reclassify-kill"):
                     record = save(95)
@@ -557,6 +804,7 @@ class MutationEvidenceTest(unittest.TestCase):
             root = Path(temporary)
             directory = root / "build/test-results/moneyTest"
             directory.mkdir(parents=True)
+            primitive_fixture(directory)
             suite = ET.Element("testsuite", {"tests": "3", "failures": "0", "errors": "0", "skipped": "0"})
             for index in range(3):
                 ET.SubElement(suite, "testcase", {"classname": "com.pennilogic.money.SyntheticTest", "name": f"case-{index}"})
@@ -573,7 +821,7 @@ class MutationEvidenceTest(unittest.TestCase):
 
             save(events)
             evidence = quality.money_test_metrics(root)
-            self.assertEqual(3, evidence["target_tests"])
+            self.assertEqual(12, evidence["target_tests"])
             self.assertEqual({"round_trip": 2, "associativity": 2, "collision_keys": 2}, evidence["property_cases"])
             self.assertEqual({"status": "not_implemented", "disagreements": None}, evidence["independent_oracle"])
             for rows in ([], events[:2], events + [events[0]], [{**events[0], "count": True}, *events[1:]]):
@@ -589,7 +837,7 @@ class MutationEvidenceTest(unittest.TestCase):
                     quality.money_test_metrics(root)
                 suite.set(name, previous)
             save(events)
-            self.assertEqual(3, quality.money_test_metrics(root)["target_tests"])
+            self.assertEqual(12, quality.money_test_metrics(root)["target_tests"])
             case = suite.find("testcase")
             case.set("classname", "unrelated.SyntheticTest")
             save(events)
