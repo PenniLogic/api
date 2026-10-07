@@ -205,11 +205,18 @@ concrete shared type. Known Money aliases remain allowed; numeric and unresolved
 initializers retain the existing refusals. Legal variable or package names `var` stay supported.
 Raw minor-unit aliases still feed the arithmetic, conversion and numeric-serialization rules.
 
+Recognized Java declaration type positions are separate from money-named value identifiers.
+The same declaration boundaries distinguish imported `Money` type tokens in fields, locals,
+parameters and method returns, including annotated arrays, containers and generic methods.
+This is a positional distinction, not an exemption for the name `Money`: actual money-named
+values, initializers and annotation arguments retain their refusals and raw-alias tracking.
+The imported-type regression controls use the genuine Contracts type, not a replacement class.
+
 Money value-type operator dispatch is allowed: `left + right` when both values are Money is not
 raw integer arithmetic. The authoritative wrapper's own implementation remains the exact
 upstream source dependency, not a locally invented exception or duplicate type.
 
-This is a conservative lexical guard, not Kotlin compiler type resolution or complete
+This is a conservative lexical guard, not JVM compiler type resolution or complete
 interprocedural taint analysis. Naming rules and local aliases are tested; arbitrary indirect
 factory return types and externally defined serializers still require the accepted provider,
 compiler checks and independent review. Neither scanned-file counts nor planted local failures

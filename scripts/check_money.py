@@ -287,7 +287,7 @@ def java_declarators(tokens, index):
         end = index + 1
         while end + 1 < len(tokens) and tokens[end].text == "[" and tokens[end + 1].text == "]":
             end += 2
-        if end >= len(tokens) or tokens[end].text not in {"=", ",", ";"}:
+        if end >= len(tokens) or tokens[end].text not in {"=", ",", ";", ":"}:
             return
         yield index
         if tokens[end].text == "=":
@@ -307,7 +307,7 @@ def java_declarators(tokens, index):
         index = end + 1
 
 
-def java_declaration_types(tokens):
+def java_declaration_types(tokens, type_positions=None):
     code, positions = [], []
     index = 0
     while index < len(tokens):
@@ -335,6 +335,12 @@ def java_declaration_types(tokens):
         index = start
         while index < len(code) and code[index].text in JAVA_MODIFIERS:
             index += 1
+        type_start = index
+        if index < len(code) and code[index].text == "<":
+            following = java_group_end(code, index)
+            if following is None:
+                continue
+            index = following
         if index >= len(code) or code[index].kind != "identifier":
             continue
         end = index + 1
@@ -358,8 +364,16 @@ def java_declaration_types(tokens):
             continue
         while end + 1 < len(code) and code[end].text == "[" and code[end + 1].text == "]":
             end += 2
+        if [token.text for token in code[end:end + 3]] == [".", ".", "."]:
+            end += 3
         if end >= len(code) or code[end].kind != "identifier" or code[end].text in JAVA_RESERVED_WORDS:
             continue
+        tail = end + 1
+        while tail + 1 < len(code) and code[tail].text == "[" and code[tail + 1].text == "]":
+            tail += 2
+        if type_positions is not None and tail < len(code) and code[tail].text in {"=", ",", ";", "(", ")", ":"}:
+            # Keep type spans, not their spelling, out of the value-identifier fallback.
+            type_positions.update(positions[type_start:end])
         # Only a complete type at a declaration boundary may supply shared declarator types.
         types = java_type_prefix(code[index:end], end - index)
         declarations.update((positions[declarator], types) for declarator in java_declarators(code, end))
@@ -411,11 +425,12 @@ def analyze(path, source):
             for index, token in enumerate(chunk)
         )
 
+    java_type_positions = set()
     java_types = {
-        index: expanded(types) for index, types in java_declaration_types(tokens).items()
+        index: expanded(types) for index, types in java_declaration_types(tokens, java_type_positions).items()
     } if Path(path).suffix.lower() == ".java" else {}
     for index, token in enumerate(tokens):
-        if token.kind != "identifier":
+        if token.kind != "identifier" or index in java_type_positions:
             continue
         types = set()
         if index in java_types:

@@ -41,6 +41,129 @@ class MoneySourceGuardTest(unittest.TestCase):
                 with self.subTest(kind=kind, declaration=declaration):
                     self.assertIn("MG001", self.rules(declaration, "java"))
 
+    def test_java_imported_money_field_does_not_report_the_type_token(self):
+        source = (
+            "import com.pennilogic.contracts.money.Money;\n"
+            "final class ExistingMoneyField {\n"
+            "private Money amount;\n"
+            "}\n"
+        )
+        self.assertEqual([], guard.analyze("ExistingMoneyField.java", source))
+
+    def test_java_imported_money_declaration_shapes_keep_type_and_value_positions_distinct(self):
+        for index, body in enumerate((
+            "public static final Money amount = null, balance = null;",
+            "@Deprecated private Money amount;",
+            "private @Marker Money amount;",
+            "private Money[] amount, balance[];",
+            "private Money amount[], balance[][];",
+            "private Money @Marker({1, 2}) [] amount = null, balance = null;",
+            "private Money amount @Marker [] = null, balance @Marker({1, 2}) [] = null;",
+            "private java.util.List<? extends Money> amount;",
+            "private java.util.Map<String, java.util.List<Money[]>> amount, balance;",
+            "private Money amount() { return null; }",
+            "private Money[] amount() { return null; }",
+            "private <T extends Money> Money amount(T value) { return value; }",
+            "void copy(final Money amount) {}",
+            "void copy(@Marker Money amount, final Money balance) {}",
+            "void copy(final Money[] amount, final Money balance[]) {}",
+            "void copy(final Money... amounts) {}",
+            "void copy(Money incoming) { final Money amount = incoming; var balance = amount; }",
+            "void copy(Money[] incoming) { for (final Money amount : incoming) { var balance = amount; } }",
+            "private Money Money, amount; void copy() { final var balance = Money; }",
+        )):
+            name = f"ImportedType{index}"
+            source = (
+                "import com.pennilogic.contracts.money.Money;\n"
+                f"final class {name} {{\n{body}\n"
+                "@java.lang.annotation.Target(java.lang.annotation.ElementType.TYPE_USE)\n"
+                "@interface Marker { int[] value() default {}; }\n"
+                "}\n"
+            )
+            with self.subTest(case_id=name):
+                self.assertEqual([], [
+                    (finding.rule, finding.field, finding.token.line, finding.token.column)
+                    for finding in guard.analyze(f"{name}.java", source)
+                ])
+
+    def test_java_imported_money_does_not_exempt_money_named_value_declarations(self):
+        for type_index, kind in enumerate(("double", "float", "java.math.BigDecimal", "Object")):
+            for name_index, field in enumerate(("Money", "money", "amount", "balance")):
+                name = f"ImportedValue{type_index}_{name_index}"
+                source = (
+                    "import com.pennilogic.contracts.money.Money;\n"
+                    f"final class {name} {{\n"
+                    "private Money incoming;\n"
+                    f"private {kind} {field};\n"
+                    "}\n"
+                )
+                rule = "MG005" if kind == "Object" else "MG001"
+                with self.subTest(case_id=name):
+                    self.assertEqual([(rule, field, 4, len(f"private {kind} ") + 1)], [
+                        (finding.rule, finding.field, finding.token.line, finding.token.column)
+                        for finding in guard.analyze(f"{name}.java", source)
+                    ])
+
+    def test_java_imported_money_keeps_adjacent_inference_and_raw_alias_refusals(self):
+        for index, (body, expected) in enumerate((
+            ("void read() { final var amount = 0.5; }", ("MG001", "amount", 4, 25)),
+            ("void read() { var amount = incoming.getMinorUnits(); }", ("MG005", "amount", 4, 19)),
+            (
+                "void read() { var amount = unknown(); }\nObject unknown() { return null; }",
+                ("MG005", "amount", 4, 19),
+            ),
+            ("void read() { final var amount = 1L; }", ("MG005", "amount", 4, 25)),
+            (
+                "long read(long minorUnits) {\nfinal var raw = minorUnits;\nreturn raw + 1L;\n}",
+                ("MG002", "", 6, 12),
+            ),
+            (
+                "double read(long minorUnits) {\nfinal var raw = minorUnits;\nreturn ((Long) raw).doubleValue();\n}",
+                ("MG003", "", 6, 21),
+            ),
+            (
+                "void read(long minorUnits) {\nfinal var raw = minorUnits;\nwriteNumber(raw);\n}\n"
+                "void writeNumber(long value) {}",
+                ("MG004", "", 6, 1),
+            ),
+            (
+                "void read(double[] values) {\nfor (double amount : values) {}\n}",
+                ("MG001", "amount", 5, 13),
+            ),
+            (
+                "long read(long[] values) {\nlong result = 0L;\n"
+                "for (long amount : values) { result = amount + 1L; }\nreturn result;\n}",
+                ("MG002", "", 6, 46),
+            ),
+        )):
+            name = f"ImportedFlow{index}"
+            source = (
+                "import com.pennilogic.contracts.money.Money;\n"
+                f"final class {name} {{\n"
+                f"private Money incoming;\n{body}\n"
+                "}\n"
+            )
+            with self.subTest(case_id=name):
+                self.assertEqual([expected], [
+                    (finding.rule, finding.field, finding.token.line, finding.token.column)
+                    for finding in guard.analyze(f"{name}.java", source)
+                ])
+
+    def test_java_imported_money_type_annotations_do_not_hide_raw_value_uses(self):
+        source = (
+            "import com.pennilogic.contracts.money.Money;\n"
+            "final class ImportedAnnotationFlow {\n"
+            "private static final long Money = 1L;\n"
+            "@java.lang.annotation.Target(java.lang.annotation.ElementType.TYPE_USE)\n"
+            "@interface Marker { long value(); }\n"
+            "@Marker(Money + 1L) private Money amount;\n"
+            "}\n"
+        )
+        self.assertEqual([("MG002", "", 6, 15)], [
+            (finding.rule, finding.field, finding.token.line, finding.token.column)
+            for finding in guard.analyze("ImportedAnnotationFlow.java", source)
+        ])
+
     def test_java_later_declarators_reject_every_unsafe_type(self):
         for kind in (
             "double", "float", "Double", "Float", "java.lang.Double", "java.lang.Float",
