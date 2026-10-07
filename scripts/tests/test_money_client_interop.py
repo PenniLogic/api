@@ -194,6 +194,38 @@ class CatalogTest(InteropTest):
         self.assertEqual((base / "unowned.txt").read_bytes(), b"preserve")
 
 
+class GateSelfTestCopyTest(InteropTest):
+    def test_real_self_test_copy_preserves_all_required_interop_inputs(self):
+        quality = interop.module_at("interop_quality_copy", ROOT / "scripts/quality.py")
+        required = (
+            "scripts/money_client_interop.py",
+            "scripts/tests/fixtures/money_client_interop",
+            "build/source-materialization",
+        )
+
+        class CopyVerified(Exception):
+            pass
+
+        def inspect_copy(*tasks, root, **_kwargs):
+            self.assertEqual(tasks, ("test", "spotlessCheck"))
+            self.assertNotEqual(root, ROOT)
+            self.assertEqual([], [name for name in required if not (root / name).exists()])
+            for name in required:
+                with self.subTest(path=name):
+                    if (ROOT / name).is_dir():
+                        self.assertEqual(interop.inventory(ROOT / name), interop.inventory(root / name))
+                    else:
+                        self.assertEqual(interop.binding(ROOT / name), interop.binding(root / name))
+            self.assertEqual(interop.catalog(ROOT), interop.catalog(root))
+            self.assertEqual(interop.binding(ROOT / interop.BACKEND), interop.binding(root / interop.BACKEND))
+            raise CopyVerified
+
+        with mock.patch.object(quality, "gradle", side_effect=inspect_copy) as gradle, self.assertRaises(CopyVerified):
+            quality.gate_self_test(self.root)
+        self.assertEqual(gradle.call_count, 1)
+        self.assertEqual([], list(self.root.iterdir()))
+
+
 class TransportTest(InteropTest):
     def test_seeded_rows_need_no_invented_names_to_retain_canonical_order(self):
         values = [

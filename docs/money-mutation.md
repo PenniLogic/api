@@ -1,11 +1,105 @@
 # Local Money mutation gate
 
-This is the executable Money-only source slice of [#22](https://github.com/PenniLogic/api/issues/22),
-stacked on unaccepted local preparation `8e79ddd25f4cebff550999ca37bfbe02cc0d18a9`
-(tree `c843380583ef3a706967662ffc6d416ea1c8c145`). The API slice is not protected-source
-acceptance, a native CI result, non-author approval, or completion of #1, #3 or #22.
-Its current source dependency is the coordinator-confirmed protected accepted Contracts
-commit `aa8d90cb98cec9b6dd08c91b3a4d869e47362662`; that provider acceptance is not API acceptance.
+This guide records the Money-only source work for [#1](https://github.com/PenniLogic/api/issues/1)
+and [#22](https://github.com/PenniLogic/api/issues/22). The exact primitive-model increment starts
+from accepted API `da79e80e9a2e9e72723ee39693190d49e7943b9f`, composed by an ordinary fast-forward
+from `3054b74b4fada5db73fa58dfcc0f76229b5dd870`. Its source dependency remains the protected accepted
+Contracts commit `aa8d90cb98cec9b6dd08c91b3a4d869e47362662` and the same byte-bound Docs strategy.
+This local increment is not independent approval, native-hosted CI proof, release acceptance,
+or completion of either original issue.
+
+## Exact primitive reference model
+
+`ExactMoneyModel` is test-only and imports no provider implementation or fixture answers.
+It reads only accepted registry data. Its coefficients are JDK `BigInteger`, with the symmetric
+bound derived mathematically. Parsing uses ASCII token checks and positional digit accumulation,
+not the provider's regex/Long conversion; rendering uses exact quotient/remainder, not the
+provider's digit slicing. Addition, subtraction, negation and ordering are calculated with
+unbounded exact integers before enforcing the accepted range. Canonical JSON shape, rejection
+precedence, currency membership and exponent scale follow ADR-015. The real provider supplies
+only the observed side of each comparison, through its unchanged public operations and serializer.
+Arithmetic range failures normalize checked-overflow and excluded-minimum refusals to the same
+range outcome; parsing and construction retain their exact reason/field checks.
+
+`AcceptedMoneyPrimitiveModelTest` traverses every accepted currency/exponent and a deterministic
+finite corpus: symmetric endpoints, signed neighbors of every binary pivot through bit 62,
+decimal carry boundaries, and 64 seeded unsigned byte samples with both signs. Pair matrices
+exercise cancellation, doubling, unit carries/borrows and full-range sampled pairs. Additional
+cases cover the excluded minimum, out-of-range wire values, grammar/scale/currency precedence,
+mixed-currency arithmetic and ordering, equality, and both wire entrypoints. This is full-range
+representation and boundary sampling, **not exhaustive enumeration** of all possible operands.
+No debt, budget, allocation, division, rounding or runtime API is introduced.
+
+Nine executed methods emit `money_primitive_model` events. The comparison helper increments
+counts only when comparisons are attempted, counts actual disagreements, rejects duplicate
+static case IDs, and emits no input/output values. Any calculation/equality throwable becomes
+a fresh assertion carrying only the case ID, without expected/actual payloads or a retained
+cause. Dedicated controls exercise mismatches, both throwing sides, throwing equality and
+duplicate IDs; these diagnostic controls are not credited as primitive comparisons.
+
+`money_test_metrics()` requires each category's event in the suite of its actual executed
+comparison method. Missing, skipped, failed, zero, malformed, duplicate, non-integer or
+disagreeing evidence refuses qualification. Its separate `primitive_model` summary aggregates
+the observed counters; the broader `independent_oracle` remains **`not_implemented` with
+`disagreements: null`**. The original round-trip, associativity and collision categories remain
+required and unchanged. Synthetic Python refusal probes do not provide primitive execution credit.
+
+No Gradle discovery or selection change is needed: the existing `moneyTest` package selection
+already discovers the new test. Coverage and the unconditional `check -> moneyMutation` path
+consume the same required evidence. Mutation readback re-parses current JUnit evidence and
+requires a type-exact match to the recorded summary, rejecting duplicate JSON fields too.
+Both provider files, all eight classes, ALL/125 factories, 27 features, `-flogcall,+fkotlin`,
+the accepted coverage/mutation floors, ratchets and budgets are unchanged.
+
+### Observed author-local qualification
+
+The restored model executes **66,851 comparisons with zero disagreements** in 39 Money tests,
+with zero failures/skips. Coverage remains 75/75 lines and 83/86 branches. The original
+10,030 round trips, 10,000 associativity cases and 384 collision keys remain unchanged.
+The complete Python discovery run reports 168 tests with zero failures/errors and six
+explicit Windows permission/platform skips; those skips are not passing test executions.
+
+A labelled, temporary precision-loss mutation in an owned test expression discarded a
+low-order unit from the observed addition using real Money operations. The normal
+`python scripts\quality.py build` actually failed both `moneyTest` and `test` at
+`primitive-addition-precision-c0`: one attempted comparison, one disagreement. Its JUnit
+failure retained only the static case ID, not compared values or a throwable cause.
+Provider verification remained intact and PIT did not start behind the failed test gate.
+Restoring only that expression recovered the passing Money comparisons. The pre-correction
+missing-model regression and the escaped malformed-evidence failures are retained separately;
+malformed escaped arrays, strings, event names and event types now also refuse qualification.
+
+The restored normal build and full coverage each executed real PIT, respectively
+`20261007T071802Z-44b82d83e610` and `20261007T072258Z-ca29d0749c80`.
+Both measured **309/342**, with 28 survivors, five uncovered mutants and zero timeout,
+non-viable, memory/run-error or incomplete outcomes. The native harness times were 56.184
+and 44.681 seconds. No extra kill, changed population or stronger mutation score is claimed.
+The fresh terminal mutation readback and the separate Money coverage readback against
+`da79e80e9a2e9e72723ee39693190d49e7943b9f` both pass.
+
+**The aggregate Windows qualification remains blocked, not green.** The normal build's
+Gradle graph succeeds, including 69 integration tests without skips, but the existing final
+scaffold check rejects its 163-test report: zero failures and one skipped
+`AdmissionInstallationTest` symlink control because this account cannot create symlinks.
+Full explicit-base coverage also completes its Gradle/PIT graph, then refuses unchanged
+API-main branch coverage of 709/717 against the reviewed 711/717; line coverage is unchanged
+at 1461/1463 and no API-main executable line changed. These are separate recorded refusals,
+not a passing normal build or full-build recovery claim.
+
+Preparation through normal build, Python discovery, full coverage and terminal mutation
+readback took 380.300 seconds, including inter-command time; two aggregate commands exited
+1. Build and coverage command wall times were 172.124 and 75.336 seconds. Being under the
+unchanged strict 600-second timing bound does not waive either refusal. No skipped test,
+coverage baseline, privilege, host configuration or gate was changed. This blocked local
+qualification does not authorize a feature commit or replace separate review and native CI.
+
+## Historical mutation progression
+
+The following progression originated on local preparation
+`8e79ddd25f4cebff550999ca37bfbe02cc0d18a9`
+(tree `c843380583ef3a706967662ffc6d416ea1c8c145`). Its original source/review decisions,
+populations, failures and acceptance-state wording remain historical evidence, not new claims
+about this primitive-model increment.
 
 **This is a prospective measurement-scope proposal, not source or methodology acceptance.**
 It restores the unmodified PIT 1.30.0 built-in FKOTLIN filter while keeping FLOGCALL disabled.
@@ -467,7 +561,7 @@ consumer fixtures are not counted as real PIT mutants or independent-model evide
 | Original acceptance criterion | Local evidence and remaining scope |
 | --- | --- |
 | Deliberate rounding error caught by properties | Not demonstrated. Real round-trip, integer arithmetic and associativity tests exist; debt/budget/allocation rounding modules and their deliberate-fault demonstration do not. |
-| Independent-model disagreement fails and names the case | Not implemented. No independent oracle is substituted by provider round trips or made-up disagreement counts. |
+| Independent-model disagreement fails and names the case | Implemented only for the exact Money primitive comparison scope described above. The independent debt/budget/allocation implementations required by the original issue remain unimplemented; `independent_oracle` remains `not_implemented`/`null`. |
 | Below published package mutation floor fails the build | Implemented for the materialized `api.money` package: historical native failures and unchanged normal wiring are preserved; `MutationPolicyTest` and the standalone consumer prove numeric-floor refusal and restoration. One actual candidate run passes at 309/342 within the new scope; independent scope/source/QA approval is pending, and old RED runs are not qualified by it. |
 | Duplicate idempotency key has one ledger effect | Not implemented. API #3 remains dependent on API #2's real ledger; migration tests are not financial idempotency evidence. |
 | Serializable concurrent writes stay non-negative and balanced | Not implemented. No live ledger endpoint or financial concurrency suite exists in this slice. |

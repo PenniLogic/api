@@ -67,6 +67,7 @@ python scripts/money_client_interop.py prepare
 python scripts/money_client_interop.py verify
 python -m unittest discover -s scripts/tests -p test_money_client_interop.py
 python scripts/quality.py build
+python scripts/quality.py gate-self-test
 ```
 
 On Linux, use `sh ./gradlew` in place of `.\gradlew.bat`. The normal `check`
@@ -112,12 +113,12 @@ and satisfy the accepted package's runtime requirements; this gate does not
 install an unpinned system runtime. No service, paid runner,
 release, CI dispatch, publication or deployment is involved.
 
-The separate `quality.py gate-self-test` scratch-copy list predates this gate.
-Its owner must add `scripts/money_client_interop.py`,
-`scripts/tests/fixtures/money_client_interop`, and `build/source-materialization`
-before that isolated command can run its final clean `build`. The normal
-repository build does not use that copy list. No missing-file exemption or
-interop skip is introduced to conceal this integration prerequisite.
+The separate `quality.py gate-self-test` command copies
+`scripts/money_client_interop.py`, `scripts/tests/fixtures/money_client_interop`,
+and `build/source-materialization` into its isolated working directory. Its final
+clean `build` runs this gate after the planted test, lint and Money-guard refusals
+are restored. Generated outputs, client tool caches and passing interop reports
+are not copied; the scratch build uses the same verified preparation path.
 
 ## Evidence and limits
 
