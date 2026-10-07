@@ -41,6 +41,476 @@ class MoneySourceGuardTest(unittest.TestCase):
                 with self.subTest(kind=kind, declaration=declaration):
                     self.assertIn("MG001", self.rules(declaration, "java"))
 
+    def test_java_imported_money_field_does_not_report_the_type_token(self):
+        source = (
+            "import com.pennilogic.contracts.money.Money;\n"
+            "final class ExistingMoneyField {\n"
+            "private Money amount;\n"
+            "}\n"
+        )
+        self.assertEqual([], guard.analyze("ExistingMoneyField.java", source))
+
+    def test_java_imported_money_declaration_shapes_keep_type_and_value_positions_distinct(self):
+        for index, body in enumerate((
+            "public static final Money amount = null, balance = null;",
+            "@Deprecated private Money amount;",
+            "private @Marker Money amount;",
+            "private Money[] amount, balance[];",
+            "private Money amount[], balance[][];",
+            "private Money @Marker({1, 2}) [] amount = null, balance = null;",
+            "private Money amount @Marker [] = null, balance @Marker({1, 2}) [] = null;",
+            "private java.util.List<? extends Money> amount;",
+            "private java.util.Map<String, java.util.List<Money[]>> amount, balance;",
+            "private Money amount() { return null; }",
+            "private Money[] amount() { return null; }",
+            "private <T extends Money> Money amount(T value) { return value; }",
+            "void copy(final Money amount) {}",
+            "void copy(@Marker Money amount, final Money balance) {}",
+            "void copy(final Money[] amount, final Money balance[]) {}",
+            "void copy(final Money... amounts) {}",
+            "void copy(Money incoming) { final Money amount = incoming; var balance = amount; }",
+            "void copy(Money[] incoming) { for (final Money amount : incoming) { var balance = amount; } }",
+            "private Money Money, amount; void copy() { final var balance = Money; }",
+        )):
+            name = f"ImportedType{index}"
+            source = (
+                "import com.pennilogic.contracts.money.Money;\n"
+                f"final class {name} {{\n{body}\n"
+                "@java.lang.annotation.Target(java.lang.annotation.ElementType.TYPE_USE)\n"
+                "@interface Marker { int[] value() default {}; }\n"
+                "}\n"
+            )
+            with self.subTest(case_id=name):
+                self.assertEqual([], [
+                    (finding.rule, finding.field, finding.token.line, finding.token.column)
+                    for finding in guard.analyze(f"{name}.java", source)
+                ])
+
+    def test_java_imported_money_does_not_exempt_money_named_value_declarations(self):
+        for type_index, kind in enumerate(("double", "float", "java.math.BigDecimal", "Object")):
+            for name_index, field in enumerate(("Money", "money", "amount", "balance")):
+                name = f"ImportedValue{type_index}_{name_index}"
+                source = (
+                    "import com.pennilogic.contracts.money.Money;\n"
+                    f"final class {name} {{\n"
+                    "private Money incoming;\n"
+                    f"private {kind} {field};\n"
+                    "}\n"
+                )
+                rule = "MG005" if kind == "Object" else "MG001"
+                with self.subTest(case_id=name):
+                    self.assertEqual([(rule, field, 4, len(f"private {kind} ") + 1)], [
+                        (finding.rule, finding.field, finding.token.line, finding.token.column)
+                        for finding in guard.analyze(f"{name}.java", source)
+                    ])
+
+    def test_java_imported_money_keeps_adjacent_inference_and_raw_alias_refusals(self):
+        for index, (body, expected) in enumerate((
+            ("void read() { final var amount = 0.5; }", ("MG001", "amount", 4, 25)),
+            ("void read() { var amount = incoming.getMinorUnits(); }", ("MG005", "amount", 4, 19)),
+            (
+                "void read() { var amount = unknown(); }\nObject unknown() { return null; }",
+                ("MG005", "amount", 4, 19),
+            ),
+            ("void read() { final var amount = 1L; }", ("MG005", "amount", 4, 25)),
+            (
+                "long read(long minorUnits) {\nfinal var raw = minorUnits;\nreturn raw + 1L;\n}",
+                ("MG002", "", 6, 12),
+            ),
+            (
+                "double read(long minorUnits) {\nfinal var raw = minorUnits;\nreturn ((Long) raw).doubleValue();\n}",
+                ("MG003", "", 6, 21),
+            ),
+            (
+                "void read(long minorUnits) {\nfinal var raw = minorUnits;\nwriteNumber(raw);\n}\n"
+                "void writeNumber(long value) {}",
+                ("MG004", "", 6, 1),
+            ),
+            (
+                "void read(double[] values) {\nfor (double amount : values) {}\n}",
+                ("MG001", "amount", 5, 13),
+            ),
+            (
+                "long read(long[] values) {\nlong result = 0L;\n"
+                "for (long amount : values) { result = amount + 1L; }\nreturn result;\n}",
+                ("MG002", "", 6, 46),
+            ),
+        )):
+            name = f"ImportedFlow{index}"
+            source = (
+                "import com.pennilogic.contracts.money.Money;\n"
+                f"final class {name} {{\n"
+                f"private Money incoming;\n{body}\n"
+                "}\n"
+            )
+            with self.subTest(case_id=name):
+                self.assertEqual([expected], [
+                    (finding.rule, finding.field, finding.token.line, finding.token.column)
+                    for finding in guard.analyze(f"{name}.java", source)
+                ])
+
+    def test_java_imported_money_type_annotations_do_not_hide_raw_value_uses(self):
+        source = (
+            "import com.pennilogic.contracts.money.Money;\n"
+            "final class ImportedAnnotationFlow {\n"
+            "private static final long Money = 1L;\n"
+            "@java.lang.annotation.Target(java.lang.annotation.ElementType.TYPE_USE)\n"
+            "@interface Marker { long value(); }\n"
+            "@Marker(Money + 1L) private Money amount;\n"
+            "}\n"
+        )
+        self.assertEqual([("MG002", "", 6, 15)], [
+            (finding.rule, finding.field, finding.token.line, finding.token.column)
+            for finding in guard.analyze("ImportedAnnotationFlow.java", source)
+        ])
+
+    def test_tt01_method_type_parameters_resolve_only_the_referenced_bounds(self):
+        for index, (parameters, result, argument, returned, rule) in enumerate((
+            ("Money extends Double", "Money", "Money", "value", "MG001"),
+            ("Money extends java.lang.Float", "Money", "Money", "value", "MG001"),
+            ("Money extends java.math.BigDecimal", "Money", "Money", "value", "MG001"),
+            ("T extends Double, Money extends T", "Money", "Money", "value", "MG001"),
+            ("Money extends T, T extends Double", "Money", "Money", "value", "MG001"),
+            ("Money", "Money", "Money", "value", "MG005"),
+            ("Money extends Number", "Money", "Money", "value", "MG005"),
+            ("Money extends Comparable<Money>", "Money", "Money", "value", "MG005"),
+            ("Money extends java.util.Map<String, java.util.List<Double>>", "Money", "Money", "value", "MG001"),
+            ("T extends Money", "Money", "T", "value", None),
+            ("T extends Double", "Money", "T", "incoming", None),
+            ("Money extends com.pennilogic.contracts.money.Money", "Money", "Money", "value", None),
+            ("Double extends com.pennilogic.contracts.money.Money", "Double", "Double", "value", None),
+            ("T extends Double, Money extends Number", "Money", "Money", "value", "MG005"),
+            (
+                "T extends Double, Money extends com.pennilogic.contracts.money.Money",
+                "Money", "Money", "value", None,
+            ),
+        )):
+            name = f"TT01Method{index}"
+            prefix = f"private <{parameters}> {result} "
+            source = (
+                "import com.pennilogic.contracts.money.Money;\n"
+                f"final class {name} {{\nprivate Money incoming;\n"
+                f"{prefix}amount({argument} value) {{ return {returned}; }}\n}}\n"
+            )
+            expected = [(rule, "amount", 4, len(prefix) + 1)] if rule else []
+            with self.subTest(case_id=name):
+                self.assertEqual(expected, [
+                    (finding.rule, finding.field, finding.token.line, finding.token.column)
+                    for finding in guard.analyze(f"{name}.java", source)
+                ])
+
+    def test_tt01_class_shadows_leave_qualified_types_and_following_classes_genuine(self):
+        for index, (parameters, kind, rule) in enumerate((
+            ("Money extends Double", "Money", "MG001"),
+            ("Money extends Number", "Money", "MG005"),
+            ("Money", "Money", "MG005"),
+            ("T extends Float, Money extends T", "Money", "MG001"),
+            ("Money extends com.pennilogic.contracts.money.Money", "Money", None),
+            ("Money extends Double", "com.pennilogic.contracts.money.Money", None),
+            ("Money extends Double", "java.util.List<Money>", "MG001"),
+            ("Double extends com.pennilogic.contracts.money.Money", "Double", None),
+        )):
+            name = f"TT01Class{index}"
+            source = (
+                "import com.pennilogic.contracts.money.Money;\n"
+                f"final class {name}<{parameters}> {{\n"
+                "private com.pennilogic.contracts.money.Money genuine;\n"
+                f"private {kind} amount;\n}}\n"
+                f"final class FollowingTT01Class{index} {{\nprivate Money balance;\n"
+                "private <T extends Double> Money copy(T value) { return balance; }\n}\n"
+            )
+            expected = [(rule, "amount", 4, len(f"private {kind} ") + 1)] if rule else []
+            with self.subTest(case_id=name):
+                self.assertEqual(expected, [
+                    (finding.rule, finding.field, finding.token.line, finding.token.column)
+                    for finding in guard.analyze(f"{name}.java", source)
+                ])
+
+    def test_tt01_bounds_keep_their_declaration_scope_through_nested_shadows(self):
+        for index, (parameters, body, expected) in enumerate((
+            (
+                "T extends Money",
+                "private <Money extends Double> T amount(T value) { return value; }",
+                [],
+            ),
+            (
+                "T extends Double",
+                "private <Money extends com.pennilogic.contracts.money.Money> T amount(T value) { return value; }",
+                [("MG001", "amount")],
+            ),
+            (
+                "Money extends Double",
+                "private <Money extends com.pennilogic.contracts.money.Money> Money amount(Money value) "
+                "{ return value; }",
+                [],
+            ),
+            (
+                "Money extends com.pennilogic.contracts.money.Money",
+                "private <Money extends Double> Money amount(Money value) { return value; }\n"
+                "private Money balance;",
+                [("MG001", "amount")],
+            ),
+            (
+                "Money extends Double",
+                "class Inner<Money extends com.pennilogic.contracts.money.Money> { private Money amount; }\n"
+                "private Money balance;",
+                [("MG001", "balance")],
+            ),
+            (
+                "Unused",
+                "private <T extends Money> void copy() {\n"
+                "class Local<Money extends Double> { private T amount; }\n}",
+                [],
+            ),
+            (
+                "Unused",
+                "interface Inner { <Money extends Double> Money amount(Money value); Money balance(); }",
+                [("MG001", "amount")],
+            ),
+        )):
+            name = f"TT01Scope{index}"
+            source = (
+                "import com.pennilogic.contracts.money.Money;\n"
+                f"final class {name}<{parameters}> {{\n"
+                f"private com.pennilogic.contracts.money.Money genuine;\n{body}\n}}\n"
+            )
+            locations = [
+                (rule, field, line_number, line.index(field) + 1)
+                for rule, field in expected
+                for line_number, line in enumerate(source.splitlines(), 1) if field in line
+            ]
+            with self.subTest(case_id=name):
+                self.assertEqual(locations, [
+                    (finding.rule, finding.field, finding.token.line, finding.token.column)
+                    for finding in guard.analyze(f"{name}.java", source)
+                ])
+
+    def test_tt01_shadowed_parameter_and_local_types_keep_money_refusals_and_raw_flow(self):
+        for index, (body, rule, field, marker) in enumerate((
+            (
+                "private <Money extends Double> Money read(Money amount) { return amount; }",
+                "MG001", "amount", "amount",
+            ),
+            (
+                "private <Money extends Double> void copy(Money value) {\nMoney amount = value;\n}",
+                "MG001", "amount", "amount",
+            ),
+            (
+                "private <Money extends Double> void copy(Money value) {\nvar amount = value;\n}",
+                "MG005", "amount", "amount",
+            ),
+            (
+                "private <Money extends Long> long read(Money amount) {\nreturn amount + 1L;\n}",
+                "MG002", "", "+",
+            ),
+            (
+                "private <Money extends Long> double read(Money amount) {\n"
+                "final var raw = amount;\nreturn ((Long) raw).doubleValue();\n}",
+                "MG003", "", "doubleValue",
+            ),
+            (
+                "private <Money extends Long> void read(Money amount) {\n"
+                "final var raw = amount;\nwriteNumber(raw);\n}\nvoid writeNumber(long value) {}",
+                "MG004", "", "writeNumber",
+            ),
+        )):
+            name = f"TT01Flow{index}"
+            source = (
+                "import com.pennilogic.contracts.money.Money;\n"
+                f"final class {name} {{\nprivate Money incoming;\n{body}\n}}\n"
+            )
+            line_number, line = next(
+                (number, line) for number, line in enumerate(source.splitlines(), 1) if marker in line
+            )
+            with self.subTest(case_id=name):
+                self.assertEqual([(rule, field, line_number, line.index(marker) + 1)], [
+                    (finding.rule, finding.field, finding.token.line, finding.token.column)
+                    for finding in guard.analyze(f"{name}.java", source)
+                ])
+
+    def test_tt01_bound_shadows_preserve_shared_array_varargs_and_record_declarations(self):
+        for index, (kind, components, body, field) in enumerate((
+            ("final class", "", "private Money first, amount;", "amount"),
+            ("final class", "", "private Money[] first = null, amount[] = null;", "amount"),
+            ("final class", "", "@SafeVarargs private final void copy(Money... amounts) {}", "amounts"),
+            ("final class", "", "private double Money;", "Money"),
+            ("record", "(Money amount)", "", "amount"),
+        )):
+            name = f"TT01Shape{index}"
+            source = (
+                "import com.pennilogic.contracts.money.Money;\n"
+                f"{kind} {name}<Money extends Double>{components} {{\n"
+                "private static com.pennilogic.contracts.money.Money genuine;\n"
+                f"{body}\n}}\n"
+            )
+            line_number, line = next(
+                (number, line) for number, line in enumerate(source.splitlines(), 1) if f" {field}" in line
+            )
+            with self.subTest(case_id=name):
+                self.assertEqual([("MG001", field, line_number, line.index(f" {field}") + 2)], [
+                    (finding.rule, finding.field, finding.token.line, finding.token.column)
+                    for finding in guard.analyze(f"{name}.java", source)
+                ])
+
+    def test_c8901_generic_method_modifiers_bind_parameters_and_returns(self):
+        for modifier_index, (kind, modifier, body_allowed) in enumerate((
+            ("final class", "synchronized", True),
+            ("final class", "strictfp", True),
+            ("abstract class", "abstract", False),
+            ("final class", "native", False),
+            ("interface", "default", True),
+        )):
+            for shape_index, (parameters, signature, body, rule) in enumerate((
+                ("Money extends Double", "void copy(final Money amount)", "{}", "MG001"),
+                ("Money extends Double", "Money amount(Money value)", "{ return value; }", "MG001"),
+                ("Money extends Number", "void copy(final Money amount)", "{}", "MG005"),
+                (
+                    "Money extends com.pennilogic.contracts.money.Money",
+                    "void copy(final Money amount)", "{}", None,
+                ),
+                ("T extends Double", "Money amount(T value)", "{ return incoming; }", None),
+            )):
+                name = f"C8901Modifier{modifier_index}_{shape_index}"
+                prefix = f"{modifier} <{parameters}> "
+                source = (
+                    "import com.pennilogic.contracts.money.Money;\n"
+                    f"{kind} {name} {{\nMoney incoming = null;\n"
+                    f"{prefix}{signature}{body if body_allowed else ';'}\n}}\n"
+                )
+                expected = [(rule, "amount", 4, len(prefix) + signature.index("amount") + 1)] if rule else []
+                with self.subTest(case_id=name):
+                    self.assertEqual(expected, [
+                        (finding.rule, finding.field, finding.token.line, finding.token.column)
+                        for finding in guard.analyze(f"{name}.java", source)
+                    ])
+
+    def test_c8901_generic_methods_and_constructors_keep_local_and_raw_refusals(self):
+        for callable_index, constructor in enumerate((False, True)):
+            for shape_index, (bound, argument, body, rule, field, marker) in enumerate((
+                ("Double", "", "class Row { private Money amount; }", "MG001", "amount", "amount"),
+                ("Number", "final Money amount", "", "MG005", "amount", "amount"),
+                (
+                    "Long", "final Money amount", "final var raw = amount;\nlong result = raw + 1L;",
+                    "MG002", "", "+",
+                ),
+                (
+                    "Long", "final Money amount", "final var raw = amount;\n((Long) raw).doubleValue();",
+                    "MG003", "", "doubleValue",
+                ),
+                (
+                    "Long", "final Money amount", "final var raw = amount;\nwriteNumber(raw);",
+                    "MG004", "", "writeNumber",
+                ),
+            )):
+                name = f"C8901Flow{callable_index}_{shape_index}"
+                prefix = "" if constructor else "private synchronized "
+                declaration = name if constructor else "void post"
+                source = (
+                    "import com.pennilogic.contracts.money.Money;\n"
+                    f"final class {name} {{\nprivate Money incoming;\n"
+                    f"{prefix}<Money extends {bound}> {declaration}({argument}) {{\n{body}\n}}\n"
+                    "void writeNumber(long value) {}\n}\n"
+                )
+                line_number, line = next(
+                    (number, line) for number, line in enumerate(source.splitlines(), 1) if marker in line
+                )
+                with self.subTest(case_id=name):
+                    self.assertEqual([(rule, field, line_number, line.index(marker) + 1)], [
+                        (finding.rule, finding.field, finding.token.line, finding.token.column)
+                        for finding in guard.analyze(f"{name}.java", source)
+                    ])
+
+    def test_c8901_generic_constructors_preserve_own_and_outer_bound_environments(self):
+        for index, (outer, parameters, kind, rule) in enumerate((
+            ("", "Money extends Double", "Money", "MG001"),
+            ("Money extends com.pennilogic.contracts.money.Money", "Money extends Double", "Money", "MG001"),
+            ("T extends Money", "Money extends Double", "T", None),
+            ("T extends Double", "Money extends com.pennilogic.contracts.money.Money", "T", "MG001"),
+            ("Money extends Double", "Money extends com.pennilogic.contracts.money.Money", "Money", None),
+            ("", "Money extends Double", "com.pennilogic.contracts.money.Money", None),
+            ("", "Money", "Money", "MG005"),
+            ("", "Money extends Number", "Money", "MG005"),
+            ("", "T extends Double, Money extends T", "Money", "MG001"),
+            ("", "Money extends T, T extends Double", "Money", "MG001"),
+            ("", "Money extends Comparable<Money>", "Money", "MG005"),
+            ("", "Double extends com.pennilogic.contracts.money.Money", "Double", None),
+            ("", "T extends Double", "Money", None),
+        )):
+            name = f"C8901Constructor{index}"
+            outer_parameters = f"<{outer}>" if outer else ""
+            source = (
+                "import com.pennilogic.contracts.money.Money;\n"
+                f"final class {name}{outer_parameters} {{\n"
+                "private com.pennilogic.contracts.money.Money genuine;\n"
+                f"public <{parameters}> {name}() {{\n"
+                f"class Row {{ private {kind} amount; }}\n}}\n"
+                "private com.pennilogic.contracts.money.Money balance;\n}\n"
+            )
+            expected = [(rule, "amount", 5, len(f"class Row {{ private {kind} ") + 1)] if rule else []
+            with self.subTest(case_id=name):
+                self.assertEqual(expected, [
+                    (finding.rule, finding.field, finding.token.line, finding.token.column)
+                    for finding in guard.analyze(f"{name}.java", source)
+                ])
+
+    def test_c8901_callable_annotations_arrays_and_constructor_names_keep_type_positions(self):
+        for index, (declaration, rule, field) in enumerate((
+            (
+                "@Deprecated public synchronized final <@Marker Money extends @Marker Double> "
+                "void post(Money @Marker [] amounts) {}",
+                "MG001", "amounts",
+            ),
+            (
+                "@Deprecated synchronized public static <Money extends Double> "
+                "Money amount(Money value) { return value; }",
+                "MG001", "amount",
+            ),
+            (
+                "@SafeVarargs private <Money extends Double> {name}(Money... amounts) {}",
+                "MG001", "amounts",
+            ),
+            (
+                "@Deprecated public <@Marker Money extends Double> {name}() {\n"
+                "class Row { private Money first[], amount[][]; }\n}",
+                "MG001", "amount",
+            ),
+            (
+                "public <Money extends Double> {name}(Money value) throws IllegalArgumentException {}\n"
+                "private Money balance;",
+                None, "",
+            ),
+            (
+                "public <Money extends Double> {name}(Money amount) { <Money>this(amount, true); }\n"
+                "private <Money extends Double> {name}(Money value, boolean marker) {}",
+                "MG001", "amount",
+            ),
+            (
+                "public <Money extends Double> {name}() {}\n"
+                "private Money amount;",
+                None, "",
+            ),
+        )):
+            name = f"C8901AmountScope{index}"
+            body = declaration.replace("{name}", name)
+            source = (
+                "import com.pennilogic.contracts.money.Money;\n"
+                f"final class {name} {{\n{body}\n"
+                "@java.lang.annotation.Target({java.lang.annotation.ElementType.TYPE_USE,"
+                "java.lang.annotation.ElementType.TYPE_PARAMETER})\n"
+                "@interface Marker {}\n}\n"
+            )
+            expected = []
+            if rule:
+                line_number, line = next(
+                    (number, line) for number, line in enumerate(source.splitlines(), 1) if field in line
+                )
+                expected = [(rule, field, line_number, line.index(field) + 1)]
+            with self.subTest(case_id=name):
+                self.assertEqual(expected, [
+                    (finding.rule, finding.field, finding.token.line, finding.token.column)
+                    for finding in guard.analyze(f"{name}.java", source)
+                ])
+
     def test_java_later_declarators_reject_every_unsafe_type(self):
         for kind in (
             "double", "float", "Double", "Float", "java.lang.Double", "java.lang.Float",

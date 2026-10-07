@@ -16,7 +16,10 @@ SOURCE_SUFFIXES = {".kt", ".kts", ".java"}
 BUILD_DIRECTORIES = {".git", ".gradle", ".kotlin", ".idea", ".venv", "node_modules", "build"}
 UNSAFE_TYPES = {"Double", "Float", "BigDecimal", "double", "float"}
 INTEGER_TYPES = {"Long", "Int", "Short", "Byte", "BigInteger", "long", "int", "short", "byte"}
-JAVA_MODIFIERS = {"public", "protected", "private", "static", "final", "transient", "volatile"}
+JAVA_MODIFIERS = {
+    "abstract", "default", "final", "native", "private", "protected", "public",
+    "static", "strictfp", "synchronized", "transient", "volatile",
+}
 JAVA_RESERVED_WORDS = {
     "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class",
     "const", "continue", "default", "do", "double", "else", "enum", "extends", "final",
@@ -287,7 +290,7 @@ def java_declarators(tokens, index):
         end = index + 1
         while end + 1 < len(tokens) and tokens[end].text == "[" and tokens[end + 1].text == "]":
             end += 2
-        if end >= len(tokens) or tokens[end].text not in {"=", ",", ";"}:
+        if end >= len(tokens) or tokens[end].text not in {"=", ",", ";", ":"}:
             return
         yield index
         if tokens[end].text == "=":
@@ -307,7 +310,79 @@ def java_declarators(tokens, index):
         index = end + 1
 
 
-def java_declaration_types(tokens):
+def java_type_scope(tokens, start, following):
+    parameters = {}
+    index = start + 1
+    while index < following - 1:
+        name = tokens[index].text
+        end = index + 1
+        if end < following - 1 and tokens[end].text == "extends":
+            end += 1
+            bound = end
+            while end < following - 1 and tokens[end].text != ",":
+                if tokens[end].text in {"<", "["}:
+                    end = java_group_end(tokens, end)
+                    if end is None:
+                        raise ScanFailure("unterminated Java type bound")
+                else:
+                    end += 1
+            parameters[name] = tokens[bound:end]
+        else:
+            if end < following - 1 and tokens[end].text != ",":
+                raise ScanFailure("invalid Java type parameter")
+            parameters[name] = []
+        index = end + 1
+
+    end = following
+    while end < len(tokens) and tokens[end].text not in {"{", ";"}:
+        if tokens[end].text in {"(", "[", "<"}:
+            end = java_group_end(tokens, end)
+            if end is None:
+                raise ScanFailure("unterminated Java generic declaration")
+        else:
+            end += 1
+    if end < len(tokens):
+        end = java_group_end(tokens, end) if tokens[end].text == "{" else end + 1
+        if end is None:
+            raise ScanFailure("unterminated Java generic body")
+    return start, end, parameters
+
+
+def java_resolved_type(tokens, position, scopes):
+    names, visited = set(), set()
+    pending = [(tokens, position)]
+    references_parameter = False
+    while pending:
+        current, position = pending.pop()
+        for index, token in enumerate(current):
+            qualified = (
+                index > 0 and current[index - 1].text == "."
+                or index + 2 < len(current) and current[index + 1].text == "."
+                and current[index + 2].kind == "identifier"
+            )
+            scope = next((
+                scope for scope in reversed(scopes)
+                if not qualified and scope[0] <= position < scope[1] and token.text in scope[2]
+            ), None)
+            if scope is None:
+                names.add(token.text)
+                continue
+            references_parameter = True
+            key = (scope[0], token.text)
+            if key in visited:
+                continue
+            visited.add(key)
+            bound = scope[2][token.text]
+            if bound:
+                # An outer bound keeps its declaration environment through inner shadowing.
+                pending.append((bound, scope[0]))
+            else:
+                names.add("Object")
+    # Unbounded or cyclic parameters never recover an imported type with the same name.
+    return names or {"Object"}, references_parameter
+
+
+def java_declaration_types(tokens, type_positions=None):
     code, positions = [], []
     index = 0
     while index < len(tokens):
@@ -328,14 +403,49 @@ def java_declaration_types(tokens):
             positions.append(index)
             index += 1
 
-    declarations = {}
+    scopes = []
+    for index in range(len(code) - 2):
+        if (
+            code[index].text in {"class", "interface", "record"}
+            and code[index + 1].kind == "identifier" and code[index + 2].text == "<"
+        ):
+            following = java_group_end(code, index + 2)
+            if following is None:
+                raise ScanFailure("unterminated Java type parameters")
+            scopes.append(java_type_scope(code, index + 2, following))
+            if type_positions is not None:
+                type_positions.update(positions[index + 2:following])
+
+    candidates = []
     for start in range(len(code)):
         if start and code[start - 1].text not in {";", "{", "}", "(", ",", ":"}:
             continue
         index = start
         while index < len(code) and code[index].text in JAVA_MODIFIERS:
             index += 1
+        type_start = index
+        if index < len(code) and code[index].text == "<":
+            following = java_group_end(code, index)
+            if following is None:
+                continue
+            index = following
         if index >= len(code) or code[index].kind != "identifier":
+            continue
+        constructor = (
+            type_start < index and code[index].text not in JAVA_NON_TYPES
+            and index + 1 < len(code) and code[index + 1].text == "("
+        )
+        if (
+            constructor or type_start < index and code[index].text == "void" and index + 2 < len(code)
+            and code[index + 1].kind == "identifier" and code[index + 2].text == "("
+        ):
+            scopes.append(java_type_scope(code, type_start, index))
+            if type_positions is not None:
+                type_positions.update(positions[type_start:index])
+                if constructor:
+                    type_positions.add(positions[index])
+        if constructor:
+            # A constructor has no return type, and its name is not a value declaration.
             continue
         end = index + 1
         valid_type = True
@@ -358,11 +468,29 @@ def java_declaration_types(tokens):
             continue
         while end + 1 < len(code) and code[end].text == "[" and code[end + 1].text == "]":
             end += 2
+        if [token.text for token in code[end:end + 3]] == [".", ".", "."]:
+            end += 3
         if end >= len(code) or code[end].kind != "identifier" or code[end].text in JAVA_RESERVED_WORDS:
             continue
+        tail = end + 1
+        while tail + 1 < len(code) and code[tail].text == "[" and code[tail + 1].text == "]":
+            tail += 2
+        recognized_tail = tail < len(code) and code[tail].text in {"=", ",", ";", "(", ")", ":"}
+        if recognized_tail and type_start < index and code[tail].text == "(":
+            scopes.append(java_type_scope(code, type_start, index))
+        if type_positions is not None and recognized_tail:
+            # Keep type spans, not their spelling, out of the value-identifier fallback.
+            type_positions.update(positions[type_start:end])
+        candidates.append((index, end, recognized_tail))
+
+    declarations = {}
+    scopes.sort(key=lambda scope: scope[0])
+    for index, end, recognized_tail in candidates:
+        types, references_parameter = java_resolved_type(code[index:end], end, scopes)
         # Only a complete type at a declaration boundary may supply shared declarator types.
-        types = java_type_prefix(code[index:end], end - index)
         declarations.update((positions[declarator], types) for declarator in java_declarators(code, end))
+        if references_parameter and recognized_tail:
+            declarations[positions[end]] = types
     return declarations
 
 
@@ -411,11 +539,12 @@ def analyze(path, source):
             for index, token in enumerate(chunk)
         )
 
+    java_type_positions = set()
     java_types = {
-        index: expanded(types) for index, types in java_declaration_types(tokens).items()
+        index: expanded(types) for index, types in java_declaration_types(tokens, java_type_positions).items()
     } if Path(path).suffix.lower() == ".java" else {}
     for index, token in enumerate(tokens):
-        if token.kind != "identifier":
+        if token.kind != "identifier" or index in java_type_positions:
             continue
         types = set()
         if index in java_types:
