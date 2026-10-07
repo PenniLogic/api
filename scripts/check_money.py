@@ -16,7 +16,10 @@ SOURCE_SUFFIXES = {".kt", ".kts", ".java"}
 BUILD_DIRECTORIES = {".git", ".gradle", ".kotlin", ".idea", ".venv", "node_modules", "build"}
 UNSAFE_TYPES = {"Double", "Float", "BigDecimal", "double", "float"}
 INTEGER_TYPES = {"Long", "Int", "Short", "Byte", "BigInteger", "long", "int", "short", "byte"}
-JAVA_MODIFIERS = {"public", "protected", "private", "static", "final", "transient", "volatile"}
+JAVA_MODIFIERS = {
+    "abstract", "default", "final", "native", "private", "protected", "public",
+    "static", "strictfp", "synchronized", "transient", "volatile",
+}
 JAVA_RESERVED_WORDS = {
     "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class",
     "const", "continue", "default", "do", "double", "else", "enum", "extends", "final",
@@ -428,13 +431,22 @@ def java_declaration_types(tokens, type_positions=None):
             index = following
         if index >= len(code) or code[index].kind != "identifier":
             continue
+        constructor = (
+            type_start < index and code[index].text not in JAVA_NON_TYPES
+            and index + 1 < len(code) and code[index + 1].text == "("
+        )
         if (
-            type_start < index and code[index].text == "void" and index + 2 < len(code)
+            constructor or type_start < index and code[index].text == "void" and index + 2 < len(code)
             and code[index + 1].kind == "identifier" and code[index + 2].text == "("
         ):
             scopes.append(java_type_scope(code, type_start, index))
             if type_positions is not None:
                 type_positions.update(positions[type_start:index])
+                if constructor:
+                    type_positions.add(positions[index])
+        if constructor:
+            # A constructor has no return type, and its name is not a value declaration.
+            continue
         end = index + 1
         valid_type = True
         while end < len(code):
