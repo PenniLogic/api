@@ -16,6 +16,18 @@ SOURCE_SUFFIXES = {".kt", ".kts", ".java"}
 BUILD_DIRECTORIES = {".git", ".gradle", ".kotlin", ".idea", ".venv", "node_modules", "build"}
 UNSAFE_TYPES = {"Double", "Float", "BigDecimal", "double", "float"}
 INTEGER_TYPES = {"Long", "Int", "Short", "Byte", "BigInteger", "long", "int", "short", "byte"}
+JAVA_MODIFIERS = {"public", "protected", "private", "static", "final", "transient", "volatile"}
+JAVA_RESERVED_WORDS = {
+    "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class",
+    "const", "continue", "default", "do", "double", "else", "enum", "extends", "final",
+    "finally", "float", "for", "goto", "if", "implements", "import", "instanceof", "int",
+    "interface", "long", "native", "new", "package", "private", "protected", "public",
+    "return", "short", "static", "strictfp", "super", "switch", "synchronized", "this",
+    "throw", "throws", "transient", "try", "void", "volatile", "while", "_", "true", "false", "null",
+}
+JAVA_NON_TYPES = (JAVA_RESERVED_WORDS - {
+    "boolean", "byte", "char", "double", "float", "int", "long", "short",
+}) | {"record", "sealed", "permits", "var", "yield"}
 MONEY_WORDS = {
     "money", "amount", "balance", "price", "cost", "fee", "salary", "income", "expense",
     "payment", "refund", "budget", "tax", "principal", "debit", "credit", "total", "cash",
@@ -251,6 +263,109 @@ def java_type_prefix(tokens, index):
     return set(result)
 
 
+def java_group_end(tokens, index):
+    closing = {"(": ")", "[": "]", "{": "}", "<": ">"}
+    stack = [closing[tokens[index].text]]
+    for end in range(index + 1, len(tokens)):
+        token = tokens[end]
+        if token.text == stack[-1]:
+            stack.pop()
+            if not stack:
+                return end + 1
+        elif token.text in {"(", "[", "{"} or token.text == "<" and stack[-1] == ">":
+            stack.append(closing[token.text])
+        elif stack[-1] == ">" and token.kind != "identifier" and token.text not in {".", ",", "?", "@", "&"}:
+            # Outside annotation arguments, a generic group contains types, not comparisons.
+            return None
+    return None
+
+
+def java_declarators(tokens, index):
+    while index < len(tokens) and (
+        tokens[index].kind == "identifier" and tokens[index].text not in JAVA_RESERVED_WORDS
+    ):
+        end = index + 1
+        while end + 1 < len(tokens) and tokens[end].text == "[" and tokens[end + 1].text == "]":
+            end += 2
+        if end >= len(tokens) or tokens[end].text not in {"=", ",", ";"}:
+            return
+        yield index
+        if tokens[end].text == "=":
+            end += 1
+            while end < len(tokens) and tokens[end].text not in {",", ";", ")", "}"}:
+                text = tokens[end].text
+                if text in {"(", "[", "{", "<"}:
+                    following = java_group_end(tokens, end)
+                    if following is not None:
+                        end = following
+                        continue
+                    if text != "<":
+                        return
+                end += 1
+        if end >= len(tokens) or tokens[end].text != ",":
+            return
+        index = end + 1
+
+
+def java_declaration_types(tokens):
+    code, positions = [], []
+    index = 0
+    while index < len(tokens):
+        if (
+            tokens[index].text == "@" and index + 1 < len(tokens)
+            and tokens[index + 1].kind == "identifier" and tokens[index + 1].text != "interface"
+        ):
+            end = index + 2
+            while end + 1 < len(tokens) and tokens[end].text == "." and tokens[end + 1].kind == "identifier":
+                end += 2
+            if end < len(tokens) and tokens[end].text == "(":
+                end = java_group_end(tokens, end)
+                if end is None:
+                    raise ScanFailure("unterminated Java annotation")
+            index = end
+        else:
+            code.append(tokens[index])
+            positions.append(index)
+            index += 1
+
+    declarations = {}
+    for start in range(len(code)):
+        if start and code[start - 1].text not in {";", "{", "}", "(", ",", ":"}:
+            continue
+        index = start
+        while index < len(code) and code[index].text in JAVA_MODIFIERS:
+            index += 1
+        if index >= len(code) or code[index].kind != "identifier":
+            continue
+        end = index + 1
+        valid_type = True
+        while end < len(code):
+            # A qualifier may name a package rather than a restricted simple type.
+            non_types = JAVA_RESERVED_WORDS if code[end].text == "." else JAVA_NON_TYPES
+            if code[end - 1].text in non_types:
+                valid_type = False
+                break
+            if code[end].text == "<":
+                following = java_group_end(code, end)
+                if following is None:
+                    break
+                end = following
+            if end + 1 < len(code) and code[end].text == "." and code[end + 1].kind == "identifier":
+                end += 2
+            else:
+                break
+        if not valid_type:
+            continue
+        while end + 1 < len(code) and code[end].text == "[" and code[end + 1].text == "]":
+            end += 2
+        if end >= len(code) or code[end].kind != "identifier" or code[end].text in JAVA_RESERVED_WORDS:
+            continue
+        # Only a complete type at a declaration boundary may supply shared declarator types.
+        types = java_type_prefix(code[index:end], end - index)
+        declarations.update((positions[declarator], types) for declarator in java_declarators(code, end))
+    return declarations
+
+
 def floating_literal(token):
     text = token.text.replace("_", "")
     return token.kind == "number" and (
@@ -296,11 +411,16 @@ def analyze(path, source):
             for index, token in enumerate(chunk)
         )
 
+    java_types = {
+        index: expanded(types) for index, types in java_declaration_types(tokens).items()
+    } if Path(path).suffix.lower() == ".java" else {}
     for index, token in enumerate(tokens):
         if token.kind != "identifier":
             continue
         types = set()
-        if index + 1 < len(tokens) and tokens[index + 1].text == ":":
+        if index in java_types:
+            types = java_types[index]
+        elif index + 1 < len(tokens) and tokens[index + 1].text == ":":
             types = expanded(declared_type(tokens, index + 2))
         elif index and tokens[index - 1].text in {"val", "var"}:
             if index + 1 < len(tokens) and tokens[index + 1].text == "=":

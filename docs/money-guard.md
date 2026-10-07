@@ -191,6 +191,20 @@ name, never an initializer, amount, account value or source line.
 | `MG005` | A money-named declaration whose type cannot be established, including unresolved cross-file aliases and inferred factory results |
 | `MG000` | An incomplete/unreadable source inventory or tokenization |
 
+The shared Java declaration type applies to each comma-separated declarator, including names
+after initialized variables. Commas nested in calls, arrays, generic arguments or initializer
+bodies do not start another declarator, and a later typed declaration establishes its own type.
+Only a complete type at a declaration boundary supplies that shared type: shift operands and
+generic method calls in an initializer cannot replace it. Type-use annotation arguments are
+excluded from the type without losing the primitive, qualified or container type around them.
+Contextual keywords follow Java identifier rules: they may name variables even when they
+cannot name a simple type. Segments qualifying a type follow package-name identifier rules,
+so a contextual package name does not discard the declaration's shared type.
+Local `var` declarations, including `final var`, use initializer inference rather than a
+concrete shared type. Known Money aliases remain allowed; numeric and unresolved monetary
+initializers retain the existing refusals. Legal variable or package names `var` stay supported.
+Raw minor-unit aliases still feed the arithmetic, conversion and numeric-serialization rules.
+
 Money value-type operator dispatch is allowed: `left + right` when both values are Money is not
 raw integer arithmetic. The authoritative wrapper's own implementation remains the exact
 upstream source dependency, not a locally invented exception or duplicate type.
