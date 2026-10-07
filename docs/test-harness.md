@@ -111,11 +111,26 @@ The third command **must fail**. It propagates the normally captured meta-test
 failure after replacing only the zero-sum trigger function in that test's own
 fresh disposable database. The exact original function definition is restored
 in `finally`, every property trial is rolled back, and the existing container
-finalizer removes that specific container. No migration source, admission
+finalizer removes that specific container and its unshared anonymous volumes.
+No migration source, admission
 input, registry history, runtime grant or production database is modified.
 The ordinary integration command captures and checks that failure, verifies
 restoration, reruns rejecting cases and commits a balanced pair successfully.
 Never point this harness at a shared database.
+
+Both stale-container cleanup and the ordinary/failure finalizer use the same
+checked `docker rm -f -v` path. It accepts only the complete ID in this worktree's
+regular marker file and requires Docker to acknowledge that exact removal:
+`docker rm -f` can return zero without removing an already-missing container.
+The marker is retained on missing acknowledgment, Docker failure or timeout,
+and the Gradle task fails rather than silently clearing evidence. Diagnostics
+stay in `build\migration-test\docker-cleanup.log`. Named volumes and volumes referenced
+by another container are not removed; there is no volume sweep or prune.
+`PostgresCleanupPostgresTest` executes the actual finalizer from unchanged build
+files in a temporary project, covering anonymous removal, named/shared resource
+preservation, absent-marker idempotence and malformed/failed-removal refusals.
+Its additional containers are create-only storage fixtures, not a second
+database harness.
 
 Existing `test` and `integrationTest` selections execute all the new tests;
 `build` still invokes both. The existing `moneyTest`/PIT qualification inventory

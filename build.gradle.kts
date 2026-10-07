@@ -2,6 +2,9 @@ import org.gradle.api.artifacts.dsl.LockMode
 import org.gradle.api.tasks.testing.TestDescriptor
 import org.gradle.api.tasks.testing.TestListener
 import org.gradle.api.tasks.testing.TestResult
+import java.io.File
+import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
@@ -297,21 +300,38 @@ val dockerAvailable: Provider<Boolean> =
 
 val migrationTestContainerId = layout.buildDirectory.file("migration-test/container-id")
 
+object MigrationTestPostgresCleanup {
+    fun remove(file: File) {
+        if (!Files.exists(file.toPath(), LinkOption.NOFOLLOW_LINKS)) return
+        check(Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS)) { "Invalid migration test container marker" }
+        val id = file.readText().trim()
+        check(Regex("[0-9a-f]{64}").matches(id)) { "Invalid migration test container marker" }
+        val diagnostics = file.resolveSibling("docker-cleanup.log")
+        val process =
+            ProcessBuilder("docker", "rm", "-f", "-v", id)
+                .redirectErrorStream(true)
+                .redirectOutput(diagnostics)
+                .start()
+        if (!process.waitFor(30, TimeUnit.SECONDS)) {
+            process.destroyForcibly()
+            check(process.waitFor(5, TimeUnit.SECONDS)) { "Disposable PostgreSQL cleanup process did not stop; marker retained" }
+            error("Disposable PostgreSQL cleanup timed out; marker retained")
+        }
+        val acknowledged = diagnostics.readText().trim() == id
+        check(process.exitValue() == 0 && acknowledged) {
+            "Disposable PostgreSQL cleanup failed (exit=${process.exitValue()}, acknowledged=$acknowledged); marker retained"
+        }
+        check(file.delete()) { "Could not delete the disposable PostgreSQL container marker after cleanup" }
+    }
+}
+
 val stopMigrationTestPostgres =
     tasks.register("stopMigrationTestPostgres") {
-        description = "Removes the disposable Postgres container started for integrationTest."
+        description = "Removes the owned disposable Postgres container and its unshared anonymous volumes."
         group = "verification"
         val idFile = migrationTestContainerId
         doLast {
-            val file = idFile.get().asFile
-            if (file.isFile) {
-                ProcessBuilder("docker", "rm", "-f", file.readText().trim())
-                    .redirectErrorStream(true)
-                    .start()
-                    .apply { inputStream.readAllBytes() }
-                    .waitFor()
-                file.delete()
-            }
+            MigrationTestPostgresCleanup.remove(idFile.get().asFile)
         }
     }
 
@@ -388,14 +408,7 @@ val integrationTest =
                     .trim()
             }
             // A previous run whose JVM died before its finalizer may have left this container behind; remove exactly that one.
-            if (file.isFile) {
-                ProcessBuilder("docker", "rm", "-f", file.readText().trim())
-                    .redirectErrorStream(true)
-                    .start()
-                    .apply { inputStream.readAllBytes() }
-                    .waitFor()
-                file.delete()
-            }
+            MigrationTestPostgresCleanup.remove(file)
             val password = UUID.randomUUID().toString()
             val id =
                 dockerCommand(
