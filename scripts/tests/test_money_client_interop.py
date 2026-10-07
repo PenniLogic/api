@@ -827,6 +827,81 @@ class RetainedTransportTest(InteropTest):
 
 
 class RunnerBoundaryTest(InteropTest):
+    def test_failed_typescript_install_emits_only_bounded_allowlisted_diagnostics(self):
+        runner = interop.Runner(self.root, Path("install-failure-control"))
+        stdout = b"synthetic-private-package-output"
+        stderr = b"npm error code EBADENGINE\nsynthetic-private-path-or-value\n"
+        result = subprocess.CompletedProcess(["npm"], 1, stdout, stderr)
+        public = io.StringIO()
+        with mock.patch.object(interop.process_budget, "run", return_value=result), \
+                contextlib.redirect_stderr(public), \
+                self.assertRaisesRegex(interop.InteropError, "^command-failed-typescript-install$"):
+            runner.call("typescript-install", ["approved-node", "approved-npm", "ci"])
+        self.assertTrue(public.getvalue(), "installer-failure-diagnostic-missing")
+        self.assertEqual(json.loads(public.getvalue()), {
+            "event": "money_client_dependency_failure", "status": "refused",
+            "command": "typescript-install", "exit_code": 1, "npm_code": "EBADENGINE",
+            "stdout": {"bytes": len(stdout), "sha256": interop.digest(stdout)},
+            "stderr": {"bytes": len(stderr), "sha256": interop.digest(stderr)},
+        })
+        self.assertNotIn("synthetic-private", public.getvalue())
+        self.assertNotIn(str(self.root), public.getvalue())
+
+    def test_npm_diagnostics_never_echo_unknown_ambiguous_or_injected_codes(self):
+        for index, stderr in enumerate((
+            b"npm error code SYNTHETIC_PRIVATE\n",
+            b"npm error code EBADENGINE trailing-private-data\n",
+            b"prefix npm error code EBADENGINE\n",
+            b"npm error code EBADENGINE\nnpm error code EACCES\n",
+            b"npm error code \x1b[31mEBADENGINE\x1b[0m\n",
+            b"\xff\n",
+        )):
+            runner = interop.Runner(self.root, Path("unclassified-install-" + str(index)))
+            public = io.StringIO()
+            result = subprocess.CompletedProcess(["npm"], 1, b"", stderr)
+            with self.subTest(control=index), \
+                    mock.patch.object(interop.process_budget, "run", return_value=result), \
+                    contextlib.redirect_stderr(public), \
+                    self.assertRaisesRegex(interop.InteropError, "^command-failed-typescript-install$"):
+                runner.call("typescript-install", ["approved-node", "approved-npm", "ci"])
+            self.assertTrue(public.getvalue(), "unclassified-install-diagnostic-missing")
+            diagnostic = json.loads(public.getvalue())
+            self.assertEqual(diagnostic["npm_code"], "unclassified")
+            self.assertNotIn("PRIVATE", public.getvalue())
+            self.assertNotIn("\x1b", public.getvalue())
+
+    def test_dependency_diagnostics_do_not_change_success_or_other_command_protocols(self):
+        for label, result in (
+            ("typescript-install", subprocess.CompletedProcess(["npm"], 0, b"", b"npm error code EBADENGINE\n")),
+            ("python-install", subprocess.CompletedProcess(["python"], 1, b"", b"npm error code EBADENGINE\n")),
+        ):
+            runner = interop.Runner(self.root, Path("diagnostic-scope-" + label))
+            public = io.StringIO()
+            with mock.patch.object(interop.process_budget, "run", return_value=result), contextlib.redirect_stderr(public):
+                if result.returncode:
+                    with self.assertRaisesRegex(interop.InteropError, "^command-failed-python-install$"):
+                        runner.call(label, ["approved-runtime"])
+                else:
+                    self.assertEqual(runner.call(label, ["approved-runtime"])[0], 0)
+            self.assertEqual(public.getvalue(), "")
+
+    def test_npm_diagnostics_accept_exact_modern_legacy_and_repeated_code_lines(self):
+        for index, (stderr, expected) in enumerate((
+            (b"npm ERR! code EBADENGINE\r\n", "EBADENGINE"),
+            (b"npm error code EINTEGRITY\n", "EINTEGRITY"),
+            (b"npm error code E404\n", "E404"),
+            (b"npm error code EBADENGINE\nnpm error code EBADENGINE\n", "EBADENGINE"),
+        )):
+            runner = interop.Runner(self.root, Path("npm-code-lines-" + str(index)))
+            public = io.StringIO()
+            result = subprocess.CompletedProcess(["npm"], 1, b"", stderr)
+            with self.subTest(control=index), \
+                    mock.patch.object(interop.process_budget, "run", return_value=result), \
+                    contextlib.redirect_stderr(public), \
+                    self.assertRaisesRegex(interop.InteropError, "^command-failed-typescript-install$"):
+                runner.call("typescript-install", ["approved-node", "approved-npm", "ci"])
+            self.assertEqual(json.loads(public.getvalue())["npm_code"], expected)
+
     def test_generated_kotlin_is_compiled_not_restored_from_an_executable_build_cache(self):
         directory = Path(self.run_id)
         interop.write_json(self.root, directory / "kotlin-launch.json", {"classpath": [str(self.root)]})

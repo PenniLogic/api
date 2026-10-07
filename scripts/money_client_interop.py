@@ -673,6 +673,18 @@ class Runner:
         require(safe_protocol, "command-protocol")
         require(len(stdout) <= MAX_DOCUMENT and len(stderr) <= MAX_DOCUMENT
                 and len(stdout) + len(stderr) <= MAX_DOCUMENT, "command-output-size")
+        if label == "typescript-install" and executed and code != expected:
+            codes = set(re.findall(rb"^npm (?:error|ERR!) code ([A-Z][A-Z0-9_]{0,31})\r?$", stderr, re.MULTILINE))
+            allowed = {
+                b"EBADENGINE", b"EUSAGE", b"EINTEGRITY", b"EACCES", b"EPERM", b"ENOSPC",
+                b"ENOTFOUND", b"EAI_AGAIN", b"ECONNRESET", b"ETIMEDOUT", b"E401", b"E403", b"E404",
+            }
+            npm_code = next(iter(codes)).decode("ascii") if len(codes) == 1 and codes <= allowed else "unclassified"
+            print(json.dumps({
+                "event": "money_client_dependency_failure", "status": "refused",
+                "command": "typescript-install", "exit_code": code, "npm_code": npm_code,
+                **{name: {key: record[name][key] for key in ("bytes", "sha256")} for name in ("stdout", "stderr")},
+            }, sort_keys=True), file=sys.stderr)
         if not readiness:
             require(executed and code == expected, "command-failed-" + label)
         return code, stdout, stderr

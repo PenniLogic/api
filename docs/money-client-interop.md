@@ -94,6 +94,28 @@ absolute executable first. The budgeted normal `quality.py build` supplies it
 through the shared helper; this requires no global PATH, hook or configuration
 change.
 
+The accepted package requires Node `>=24.14.0 <25` and npm `>=11`.
+Configuring only Python/JDK, or prepending an arbitrary Node executable to PATH,
+does not satisfy the explicit runtime boundary above. The published
+`ubuntu24/20260927.320` runner inventory lists default Node 22.23.3/npm 10.9.9
+and a separately cached Node 24.21.0. Selecting or provisioning the supported
+SDK and handing off its approved absolute path is a canonical CI/setup
+responsibility; this gate does not auto-select another tool cache, install a
+system runtime, or weaken the package engines. Infra-owned generated workflow
+changes must be made at their canonical source, not hand-edited here.
+
+A failed `typescript-install` emits a bounded
+`money_client_dependency_failure` event before the existing
+`command-failed-typescript-install` refusal. It contains only the actual exit
+code, a finite allowlisted npm error code (or `unclassified`), and each stream's
+byte count/SHA-256. It never prints the raw package-manager output, paths,
+configuration or credentials. Unknown, ambiguous and malformed code lines are
+not promoted to a specific diagnosis; success and other command protocols are
+unchanged. Complete bounded command streams remain in the owned private
+execution evidence. The historical 7b native run has no uploaded command
+streams, so its precise npm error is not retroactively established by this
+diagnostic addition.
+
 The original cold path exhausted the shared anonymous REST quota: Money
 preparation makes 17 requests and database preparation makes 28; adding 35
 per-blob interop requests required 80, exceeding one 60-request pool. The native
