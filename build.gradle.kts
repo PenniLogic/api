@@ -1,4 +1,7 @@
 import org.gradle.api.artifacts.dsl.LockMode
+import org.gradle.api.tasks.testing.TestDescriptor
+import org.gradle.api.tasks.testing.TestListener
+import org.gradle.api.tasks.testing.TestResult
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
@@ -112,6 +115,7 @@ dependencies {
     implementation("org.postgresql:postgresql:42.7.13")
     testImplementation(platform("org.junit:junit-bom:6.1.3"))
     testImplementation("org.junit.jupiter:junit-jupiter")
+    testImplementation("io.kotest:kotest-property-jvm:6.2.5")
     testImplementation("io.ktor:ktor-server-test-host")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     mutationTool("org.pitest:pitest-command-line:1.30.0")
@@ -139,6 +143,42 @@ spotless {
 
 jacoco {
     toolVersion = "0.8.15"
+}
+
+tasks.withType<Test>().configureEach {
+    systemProperty("kotest.proptest.seed.write-failed", false)
+    systemProperty("kotest.proptest.output.shrink-steps", true)
+    val taskName = name
+    addTestListener(
+        object : TestListener {
+            override fun beforeSuite(suite: TestDescriptor) = Unit
+
+            override fun beforeTest(testDescriptor: TestDescriptor) = Unit
+
+            override fun afterTest(
+                testDescriptor: TestDescriptor,
+                result: TestResult,
+            ) = Unit
+
+            override fun afterSuite(
+                suite: TestDescriptor,
+                result: TestResult,
+            ) {
+                val className = suite.className ?: return
+                if (suite.parent?.className != null) return
+                val category =
+                    when {
+                        className.contains("Property") -> "property"
+                        className.contains("Contract") -> "contract"
+                        taskName == "integrationTest" -> "integration"
+                        else -> "unit"
+                    }
+                logger.lifecycle(
+                    """{"event":"test_category_suite","task":"$taskName","category":"$category","suite":"$className","wall_ms":${result.endTime - result.startTime},"tests":${result.testCount},"failed":${result.failedTestCount},"skipped":${result.skippedTestCount}}""",
+                )
+            }
+        },
+    )
 }
 
 tasks.test {
@@ -294,6 +334,14 @@ val integrationTest =
             (files(tasks.jar) + configurations.runtimeClasspath.get()).asPath,
         )
         systemProperty("user.timezone", "UTC")
+        systemProperty(
+            "pennilogic.testing.ledgerNegativeControl",
+            providers
+                .gradleProperty("ledgerPropertyNegativeControl")
+                .map(String::toBooleanStrict)
+                .orElse(false)
+                .get(),
+        )
         testLogging {
             events("failed", "skipped")
         }
