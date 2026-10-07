@@ -194,6 +194,11 @@ name, never an initializer, amount, account value or source line.
 The shared Java declaration type applies to each comma-separated declarator, including names
 after initialized variables. Commas nested in calls, arrays, generic arguments or initializer
 bodies do not start another declarator, and a later typed declaration establishes its own type.
+Only a complete type at a declaration boundary supplies that shared type: shift operands and
+generic method calls in an initializer cannot replace it. Type-use annotation arguments are
+excluded from the type without losing the primitive, qualified or container type around them.
+Contextual keywords follow Java identifier rules: they may name variables even when they
+cannot start a declaration's type.
 
 Money value-type operator dispatch is allowed: `left + right` when both values are Money is not
 raw integer arithmetic. The authoritative wrapper's own implementation remains the exact
