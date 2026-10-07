@@ -58,11 +58,14 @@ def run(command, root=ROOT, capture=False, budget=None):
     return result.stdout if capture else ""
 
 
-def gradle(*tasks, root=ROOT, capture=False, budget=None):
+def gradle(*tasks, root=ROOT, capture=False, budget=None, money_client_interop_node=None):
     wrapper = root / ("gradlew.bat" if os.name == "nt" else "gradlew")
     command = [str(wrapper)] if os.name == "nt" else ["sh", str(wrapper)]
+    properties = [] if money_client_interop_node is None else [
+        "-PmoneyClientInteropNode=" + str(money_client_interop_node),
+    ]
     return run(
-        [*command, "--no-daemon", "--console=plain", "-Pkotlin.compiler.execution.strategy=in-process", *tasks],
+        [*command, "--no-daemon", "--console=plain", "-Pkotlin.compiler.execution.strategy=in-process", *properties, *tasks],
         root, capture, budget,
     )
 
@@ -436,7 +439,10 @@ def check_money_coverage(base=None, write_baseline=False):
         raise ValueError("Money coverage baseline differs from the measured report; generate and review the actual baseline")
 
 
-def gate_self_test(artifact_dir):
+def gate_self_test(artifact_dir, *, money_client_interop_node=None):
+    gradle_options = {} if money_client_interop_node is None else {
+        "money_client_interop_node": money_client_interop_node,
+    }
     inputs = [
         "settings.gradle.kts", "build.gradle.kts", "gradle.properties", ".editorconfig",
         "gradlew", "gradlew.bat", "gradle.lockfile", "gradle", "src", "scripts/check_money.py",
@@ -458,7 +464,7 @@ def gate_self_test(artifact_dir):
             else:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, destination)
-        gradle("test", "spotlessCheck", root=root)
+        gradle("test", "spotlessCheck", root=root, **gradle_options)
         tests = root / "src/test/kotlin/com/pennilogic/bootstrap"
         failing_test = tests / "GateFailureTest.kt"
         failing_test.write_text(
@@ -470,7 +476,7 @@ def gate_self_test(artifact_dir):
             '}\n', encoding="utf-8",
         )
         try:
-            gradle("test", root=root)
+            gradle("test", root=root, **gradle_options)
         except subprocess.CalledProcessError:
             xml = root / "build/test-results/test/TEST-com.pennilogic.bootstrap.GateFailureTest.xml"
             if not xml.is_file():
@@ -494,7 +500,7 @@ def gate_self_test(artifact_dir):
             'package com.pennilogic.bootstrap\n\nclass GateLint{val value=1}\n', encoding="utf-8",
         )
         try:
-            gradle("build", root=root, capture=True)
+            gradle("build", root=root, capture=True, **gradle_options)
         except subprocess.CalledProcessError as error:
             if "GateLint.kt" not in error.output or "spotlessKotlinCheck" not in error.output:
                 raise ValueError("Lint failure was not the planted formatting violation")
@@ -516,7 +522,7 @@ def gate_self_test(artifact_dir):
                 f"package com.pennilogic.bootstrap\n\n{declaration}\n", encoding="utf-8", newline="\n",
             )
             try:
-                gradle("build", root=root, capture=True)
+                gradle("build", root=root, capture=True, **gradle_options)
             except subprocess.CalledProcessError as error:
                 if "GateMoney.kt" not in error.output or rule not in error.output or ":moneyGuard FAILED" not in error.output:
                     raise ValueError(f"Money guard failure was not the planted {case} defect")
@@ -525,7 +531,7 @@ def gate_self_test(artifact_dir):
                 raise ValueError(f"Money guard accepted the planted {case} defect")
             finally:
                 bad_money.unlink()
-        gradle("build", root=root)
+        gradle("build", root=root, **gradle_options)
 
 
 def test_metrics(root=ROOT):
@@ -551,50 +557,57 @@ def main():
     parser.add_argument("--base", help="Full trusted PR base commit SHA; required for coverage")
     parser.add_argument("--write-baseline", action="store_true")
     parser.add_argument("--artifact-dir", type=Path, help="Parent directory for isolated gate self-test copies")
+    parser.add_argument("--money-client-interop-node", type=Path, help="Approved absolute Node executable for Gradle commands")
     args = parser.parse_args()
     started = time.monotonic()
     budget = None
     try:
+        gradle_options = {}
+        if args.money_client_interop_node is not None:
+            if args.command in ("money-guard", "money-coverage-report", "money-mutation-report"):
+                parser.error("--money-client-interop-node requires a Gradle-producing command")
+            node, _ = script_module("money_client_interop").node_runtime(args.money_client_interop_node)
+            gradle_options["money_client_interop_node"] = node
         if args.command == "version":
-            gradle("--version")
+            gradle("--version", **gradle_options)
         elif args.command == "install":
-            gradle("resolveDependencies")
+            gradle("resolveDependencies", **gradle_options)
         elif args.command == "build":
             budget = money_budget(money_provider_module())["enforced_seconds"]
-            gradle("build", "installDist", budget=budget - (time.monotonic() - started))
+            gradle("build", "installDist", budget=budget - (time.monotonic() - started), **gradle_options)
             test_metrics()
         elif args.command == "test":
             run([sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests", "-v"])
-            gradle("test")
+            gradle("test", **gradle_options)
             test_metrics()
         elif args.command == "lint":
-            gradle("spotlessCheck", "compileKotlin", "compileTestKotlin")
+            gradle("spotlessCheck", "compileKotlin", "compileTestKotlin", **gradle_options)
         elif args.command == "format":
-            gradle("spotlessApply")
+            gradle("spotlessApply", **gradle_options)
         elif args.command == "coverage":
             if not args.base:
                 parser.error("coverage requires --base; no implicit or stale CI base is accepted")
             budget = money_budget(money_provider_module())["enforced_seconds"]
             gradle(
                 "jacocoTestReport", "jacocoTestCoverageVerification", "moneyCoverageReport", "moneyMutation",
-                budget=budget - (time.monotonic() - started),
+                budget=budget - (time.monotonic() - started), **gradle_options,
             )
             check_coverage(args.base, args.write_baseline)
             check_money_coverage(args.base, args.write_baseline)
         elif args.command == "money-guard":
             run([sys.executable, str(ROOT / "scripts/check_money.py")])
         elif args.command == "money-coverage":
-            gradle("moneyCoverageReport")
+            gradle("moneyCoverageReport", **gradle_options)
             check_money_coverage(args.base, args.write_baseline)
         elif args.command == "money-coverage-report":
             check_money_coverage(args.base, args.write_baseline)
         elif args.command == "money-mutation":
             budget = money_budget(money_provider_module())["enforced_seconds"]
-            gradle("moneyMutation", budget=budget - (time.monotonic() - started))
+            gradle("moneyMutation", budget=budget - (time.monotonic() - started), **gradle_options)
         elif args.command == "money-mutation-report":
             script_module("money_mutation").check_latest()
         else:
-            gate_self_test(args.artifact_dir)
+            gate_self_test(args.artifact_dir, **gradle_options)
         if args.command in ("build", "coverage", "money-mutation"):
             script_module("money_mutation").check_latest()
         if budget is not None and time.monotonic() - started > budget:

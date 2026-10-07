@@ -15,6 +15,199 @@ quality = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(quality)
 
 
+class QualityNodeBridgeTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="api-node-bridge-test-"))).resolve()
+        self.sdk = self.root / "approved sdk with spaces"
+        self.sdk.mkdir()
+        self.node = self.sdk / ("node.exe" if os.name == "nt" else "node")
+        self.node.write_bytes(b"inert validation-only fixture")
+        self.npm = self.sdk / "node_modules/npm/bin/npm-cli.js"
+        self.npm.parent.mkdir(parents=True)
+        self.npm.write_bytes(b"inert paired npm fixture")
+        self.interop = quality.script_module("money_client_interop")
+        self.validate = self.enterContext(patch.object(
+            self.interop, "node_runtime", wraps=self.interop.node_runtime,
+        ))
+        self.mutation = Mock()
+
+        def module(name):
+            self.assertIn(name, ("money_client_interop", "money_mutation"))
+            return self.interop if name == "money_client_interop" else self.mutation
+
+        self.loader = self.enterContext(patch.object(quality, "script_module", side_effect=module))
+        self.output = self.enterContext(patch("sys.stdout", new_callable=io.StringIO))
+        self.errors = self.enterContext(patch("sys.stderr", new_callable=io.StringIO))
+
+    def invoke(self, command, *arguments):
+        with patch.object(sys, "argv", ["quality.py", command, *map(str, arguments)]):
+            return quality.main()
+
+    def test_gradle_preserves_one_unsplit_property_after_compiler_option_before_tasks(self):
+        for selected in (None, str(self.node)):
+            with self.subTest(explicit=selected is not None), patch.object(quality, "run", return_value="observed") as run:
+                options = {} if selected is None else {"money_client_interop_node": selected}
+                self.assertEqual("observed", quality.gradle(
+                    "build", "installDist", root=self.root, capture=True, budget=17, **options,
+                ))
+                wrapper = self.root / ("gradlew.bat" if os.name == "nt" else "gradlew")
+                command = [str(wrapper)] if os.name == "nt" else ["sh", str(wrapper)]
+                expected = [*command, "--no-daemon", "--console=plain", "-Pkotlin.compiler.execution.strategy=in-process"]
+                if selected is not None:
+                    expected.append("-PmoneyClientInteropNode=" + selected)
+                self.assertEqual(call([*expected, "build", "installDist"], self.root, True, 17), run.call_args)
+        self.loader.assert_not_called()
+
+    def test_every_gradle_dispatcher_and_self_test_receive_the_validated_path(self):
+        tasks = {
+            "version": ("--version",), "install": ("resolveDependencies",),
+            "build": ("build", "installDist"), "test": ("test",),
+            "lint": ("spotlessCheck", "compileKotlin", "compileTestKotlin"), "format": ("spotlessApply",),
+            "coverage": ("jacocoTestReport", "jacocoTestCoverageVerification", "moneyCoverageReport", "moneyMutation"),
+            "money-coverage": ("moneyCoverageReport",), "money-mutation": ("moneyMutation",),
+        }
+        with (
+            patch.object(quality, "gradle") as gradle,
+            patch.object(quality, "run"),
+            patch.object(quality, "test_metrics"),
+            patch.object(quality, "check_coverage"),
+            patch.object(quality, "check_money_coverage"),
+            patch.object(quality, "money_provider_module"),
+            patch.object(quality, "money_budget", return_value={"enforced_seconds": 600}),
+            patch.object(quality, "gate_self_test") as self_test,
+        ):
+            for command, expected in tasks.items():
+                with self.subTest(command=command):
+                    gradle.reset_mock()
+                    self.validate.reset_mock()
+                    self.assertEqual(0, self.invoke(
+                        command, "--base", "a" * 40, "--money-client-interop-node", self.node,
+                    ))
+                    self.validate.assert_called_once_with(self.node)
+                    self.assertEqual(expected, gradle.call_args.args)
+                    options = gradle.call_args.kwargs
+                    self.assertEqual(str(self.node), options["money_client_interop_node"])
+                    if command in ("build", "coverage", "money-mutation"):
+                        self.assertEqual({"money_client_interop_node", "budget"}, set(options))
+                        self.assertGreater(options["budget"], 0)
+                        self.assertLessEqual(options["budget"], 600)
+                    else:
+                        self.assertEqual({"money_client_interop_node"}, set(options))
+            self.assertEqual(0, self.invoke(
+                "gate-self-test", "--artifact-dir", self.root, "--money-client-interop-node", self.node,
+            ))
+            self_test.assert_called_once_with(self.root, money_client_interop_node=str(self.node))
+
+    def test_omitted_option_keeps_existing_dispatch_without_loading_runtime_validation(self):
+        with patch.object(quality, "gradle") as gradle, patch.object(quality, "gate_self_test") as self_test:
+            self.assertEqual(0, self.invoke("install"))
+            gradle.assert_called_once_with("resolveDependencies")
+            self.assertEqual(0, self.invoke("gate-self-test", "--artifact-dir", self.root))
+            self_test.assert_called_once_with(self.root)
+        self.loader.assert_not_called()
+        self.validate.assert_not_called()
+
+    def test_invalid_explicit_path_and_missing_npm_refuse_without_executing_any_candidate(self):
+        wrong_name = self.sdk / "other-runtime"
+        wrong_name.write_bytes(b"inert wrong-basename fixture")
+        invalid = (Path(self.node.name), self.root / "missing" / self.node.name, self.sdk, wrong_name)
+        with patch.object(quality, "gradle") as gradle, patch.object(subprocess, "Popen") as popen:
+            for path in invalid:
+                with self.subTest(path_kind=path.name):
+                    self.assertEqual(1, self.invoke("install", "--money-client-interop-node", path))
+                    self.assertIn("Quality command failed: node-missing", self.errors.getvalue())
+            self.npm.unlink()
+            is_file = Path.is_file
+            with patch.object(Path, "is_file", autospec=True, side_effect=lambda path: (
+                path.is_relative_to(self.sdk) and is_file(path)
+            )):
+                self.assertEqual(1, self.invoke("install", "--money-client-interop-node", self.node))
+                self.assertIn("Quality command failed: npm-missing", self.errors.getvalue())
+            gradle.assert_not_called()
+            popen.assert_not_called()
+        self.assertEqual(self.node.read_bytes(), b"inert validation-only fixture")
+
+    def test_non_gradle_commands_reject_the_option_without_runtime_or_process_work(self):
+        with patch.object(quality, "gradle") as gradle, patch.object(quality, "run") as run:
+            for command in ("money-guard", "money-coverage-report", "money-mutation-report"):
+                with self.subTest(command=command), self.assertRaises(SystemExit) as error:
+                    self.invoke(command, "--money-client-interop-node", self.node)
+                self.assertEqual(2, error.exception.code)
+            self.assertIn("--money-client-interop-node requires a Gradle-producing command", self.errors.getvalue())
+            gradle.assert_not_called()
+            run.assert_not_called()
+        self.loader.assert_not_called()
+
+    def test_all_nine_self_test_calls_keep_root_path_tasks_and_all_seven_refusals(self):
+        for selected in (None, str(self.node)):
+            calls = []
+
+            def planted_result(*tasks, root, capture=False, **options):
+                calls.append((tasks, root, capture, options))
+                self.assertNotEqual(root, quality.ROOT)
+                self.assertEqual(self.root, root.parent)
+                self.assertEqual({} if selected is None else {"money_client_interop_node": selected}, options)
+                tests = root / "src/test/kotlin/com/pennilogic/bootstrap"
+                if (tests / "GateFailureTest.kt").exists():
+                    report = root / "build/test-results/test/TEST-com.pennilogic.bootstrap.GateFailureTest.xml"
+                    report.parent.mkdir(parents=True, exist_ok=True)
+                    report.write_text(
+                        '<testsuite tests="1" failures="1"><testcase>'
+                        '<failure type="org.opentest4j.AssertionFailedError"/></testcase></testsuite>', encoding="utf-8",
+                    )
+                    raise subprocess.CalledProcessError(1, ["synthetic-gradle", *tasks])
+                if (tests / "GateLint.kt").exists():
+                    raise subprocess.CalledProcessError(1, ["synthetic-gradle", *tasks],
+                                                        output="GateLint.kt spotlessKotlinCheck")
+                defect = tests / "GateMoney.kt"
+                if defect.exists():
+                    text = defect.read_text(encoding="utf-8")
+                    rule = "MG003" if "toDouble" in text else ("MG002" if "amount + fee" in text else "MG001")
+                    raise subprocess.CalledProcessError(1, ["synthetic-gradle", *tasks],
+                                                        output="GateMoney.kt " + rule + " :moneyGuard FAILED")
+
+            options = {} if selected is None else {"money_client_interop_node": selected}
+            with self.subTest(explicit=selected is not None), patch.object(quality, "gradle", side_effect=planted_result):
+                quality.gate_self_test(self.root, **options)
+            self.assertEqual([("test", "spotlessCheck"), ("test",)] + [("build",)] * 7,
+                             [tasks for tasks, _, _, _ in calls])
+            self.assertEqual([False, False] + [True] * 6 + [False], [capture for _, _, capture, _ in calls])
+            self.assertEqual(1, len({root for _, root, _, _ in calls}))
+            self.assertFalse(calls[0][1].exists())
+        self.assertEqual(14, sum('"rejected":true' in line.replace(" ", "")
+                                 for line in self.output.getvalue().splitlines()))
+
+    def test_owned_baseline_candidate_roots_and_repeated_invocations_cannot_share_node_or_report_state(self):
+        modules, reports = [], {}
+        for name in ("baseline", "candidate"):
+            root = self.root / name
+            for filename in ("quality.py", "money_client_interop.py", "process_budget.py", "materialize_money_sources.py"):
+                target = root / "scripts" / filename
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((quality.ROOT / "scripts" / filename).read_bytes())
+            report = root / "build/money-client-interop/backend-launch.json"
+            report.parent.mkdir(parents=True)
+            reports[report] = json.dumps({"synthetic_owner": name}).encode()
+            report.write_bytes(reports[report])
+            spec = importlib.util.spec_from_file_location("node_bridge_" + name, root / "scripts/quality.py")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            modules.append(module)
+        for module in modules:
+            with patch.object(module, "run", return_value="") as run:
+                with patch.object(sys, "argv", ["quality.py", "install", "--money-client-interop-node", str(self.node)]):
+                    self.assertEqual(0, module.main())
+                explicit = run.call_args
+                self.assertEqual(module.ROOT, explicit.args[1])
+                self.assertIn(str(module.ROOT / ("gradlew.bat" if os.name == "nt" else "gradlew")), explicit.args[0])
+                self.assertIn("-PmoneyClientInteropNode=" + str(self.node), explicit.args[0])
+                with patch.object(sys, "argv", ["quality.py", "install"]):
+                    self.assertEqual(0, module.main())
+                self.assertFalse(any(argument.startswith("-PmoneyClientInteropNode=") for argument in run.call_args.args[0]))
+        self.assertNotEqual(modules[0].ROOT, modules[1].ROOT)
+        self.assertEqual(reports, {path: path.read_bytes() for path in reports})
+
+
 class GateSelfTestAdmissionCopyTest(unittest.TestCase):
     def test_real_temp_copy_preserves_inventory_and_verifies_admission_before_the_first_gradle_call(self):
         class CopyVerified(Exception):

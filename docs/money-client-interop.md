@@ -94,6 +94,33 @@ absolute executable first. The budgeted normal `quality.py build` supplies it
 through the shared helper; this requires no global PATH, hook or configuration
 change.
 
+For an explicitly provisioned SDK, the manual quality CLI accepts the same
+approved Node executable without relying on ambient Gradle properties:
+
+```text
+python scripts/quality.py build --money-client-interop-node "<approved absolute Node executable>"
+python scripts/quality.py coverage --base "<full trusted base SHA>" --money-client-interop-node "<approved absolute Node executable>"
+python scripts/quality.py gate-self-test --artifact-dir "<owned parent>" --money-client-interop-node "<approved absolute Node executable>"
+```
+
+The optional argument defaults to omission and preserves standard-installation
+behavior. An explicit path reuses the collector's absolute-file, `node`/`node.exe`
+basename and existing paired-npm validation before Gradle starts; validation
+does not execute the candidate or search PATH/tool caches. Every Gradle-producing
+quality command forwards one unsplit `-PmoneyClientInteropNode=...` argument after
+the compiler property and before task names. All nine isolated self-test calls
+retain it, including the seven plants and clean restoration. Report-only commands
+and the direct Money guard reject the option; collector `prepare`/`verify` and the
+separate Kotlin smoke build do not gain new flags or tasks.
+
+Each owned baseline/candidate copy must run its own quality script with its own
+working directory and self-test artifact parent. Only the explicit SDK path is
+shared, not launch files, generated output or runtime evidence. `coverage --base`
+reads the named Git baseline; it does not build another checkout, and forwarding
+this option does not add interoperability to the coverage task graph. Canonical
+Infra setup must provision the supported SDK and explicitly supply its path only
+after this manual bridge is accepted; this change does not activate generated CI.
+
 The budgeted quality caller also admits the standard Windows Docker Desktop CLI
 directory on the approved system drive (`Program Files\Docker\Docker\resources\bin`).
 It does not inherit arbitrary ambient PATH entries or startup/credential options.
