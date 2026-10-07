@@ -932,6 +932,38 @@ class MutationNativeConsoleTest(unittest.TestCase):
 
 
 class ProcessBudgetTest(unittest.TestCase):
+    def test_approved_system_shell_survives_without_inheriting_ambient_path(self):
+        command = (["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Write-Output 'approved-shell'"]
+                   if os.name == "nt" else ["/bin/sh", "-c", "printf 'approved-shell\\n'"])
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"PATH": temporary}):
+            result = process_budget.run(command, SCRIPTS, 10, capture=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), "approved-shell")
+
+    def test_bootstrap_and_worker_exclude_startup_hooks_and_ambient_credentials(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            marker = root / "unexpected-startup"
+            (root / "sitecustomize.py").write_text(
+                f"__import__('pathlib').Path({str(marker)!r}).write_text('synthetic-startup')",
+                encoding="utf-8",
+            )
+            injected = {
+                "PYTHONPATH": str(root), "JAVA_TOOL_OPTIONS": "synthetic-options",
+                "NODE_OPTIONS": "synthetic-options", "AWS_SECRET_ACCESS_KEY": "synthetic-noncredential",
+            }
+            code = (
+                "import os,json; print(json.dumps({'clean':not any(name in os.environ for name in "
+                + repr(tuple(injected)) + ")}))"
+            )
+            with patch.dict(os.environ, injected):
+                result = process_budget.run(
+                    [sys.executable, "-I", "-S", "-B", "-c", code], root, 10, capture=True,
+                )
+            self.assertEqual(result.returncode, 0)
+            self.assertFalse(marker.exists(), "unbound-startup-hook-ran")
+            self.assertEqual(json.loads(result.stdout), {"clean": True})
+
     @unittest.skipUnless(sys.platform == "win32", "Windows Job Object startup ordering")
     def test_actual_command_waits_until_its_job_is_attached(self):
         with tempfile.TemporaryDirectory() as temporary:

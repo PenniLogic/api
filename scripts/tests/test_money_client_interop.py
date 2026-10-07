@@ -1,5 +1,9 @@
+import base64
 import contextlib
 import copy
+from email.message import Message
+import gzip
+import http.client
 import importlib.util
 import io
 import json
@@ -8,9 +12,11 @@ from pathlib import Path
 import py_compile
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
+import urllib.error
 
 
 ROOT = Path(__file__).absolute().parents[2]
@@ -71,6 +77,17 @@ class CatalogTest(InteropTest):
                 with self.assertRaises(interop.InteropError):
                     interop.verify_acquisition(self.root)
 
+    def test_orphan_acquisition_evidence_is_refused_before_any_download_or_source_write(self):
+        interop.write_file(self.root, interop.FIXTURES / "source-inputs.json",
+                           interop.read_file(ROOT / interop.FIXTURES / "source-inputs.json"))
+        receipt = interop.write_file(self.root, interop.AREA / "acquisition.json", b"preserve-orphan")
+        with mock.patch.object(interop, "acquire") as acquire:
+            with self.assertRaisesRegex(interop.InteropError, "acquisition-output-partial"):
+                interop.prepare(self.root)
+        acquire.assert_not_called()
+        self.assertEqual(receipt.read_bytes(), b"preserve-orphan")
+        self.assertFalse((self.root / interop.AREA / "inputs").exists())
+
     def test_new_catalog_binds_all_three_generators_without_changing_the_old_catalog(self):
         data = interop.catalog()
         bindings = interop.source_bindings(data)
@@ -107,40 +124,6 @@ class CatalogTest(InteropTest):
         with self.assertRaises(interop.sources.MaterializationError):
             interop.sources.check_bytes(b"tampered", interop.catalog()["sources"][0]["files"][0])
 
-    def test_acquisition_reuses_native_bounded_clients_and_exact_provider_inputs(self):
-        data = interop.catalog()
-        clients = []
-
-        class Client:
-            def __init__(self, catalog):
-                self.catalog = catalog
-                self.budget = mock.Mock(requests=3 + len(catalog["sources"][0]["files"]), bytes=100)
-                clients.append(self)
-
-        class Snapshot:
-            root = interop.SOURCE_TREE
-
-            def __init__(self, client, source, organization):
-                self.source = source
-                if organization != 335295566:
-                    raise AssertionError("organization")
-
-            def blob(self, entry):
-                return entry["path"].encode("ascii")
-
-        with mock.patch.object(interop.sources, "verify_inputs"), mock.patch.object(interop.sources, "verify_provider"), \
-                mock.patch.object(interop.sources, "ReadOnlyClient", Client), \
-                mock.patch.object(interop.sources, "GitSnapshot", Snapshot), \
-                mock.patch.object(interop.sources, "check_bytes") as check, \
-                mock.patch.object(interop, "read_file", return_value=b"verified-shared-input"):
-            contents, record = interop.acquire(data, self.root)
-        self.assertEqual(len(contents), 39)
-        self.assertEqual(check.call_count, 10)
-        self.assertEqual([len(client.catalog["sources"][0]["files"]) for client in clients], [28, 1])
-        self.assertEqual(record["requests"], 35)
-        self.assertEqual(record["mode"], "native-public-git-object-get")
-        self.assertTrue(all(client.budget.requests <= interop.sources.MAX_REQUESTS for client in clients))
-
     def test_acquisition_rejects_an_unexpected_tree_before_downloading_a_blob(self):
         data = interop.catalog()
         client = mock.Mock()
@@ -149,10 +132,12 @@ class CatalogTest(InteropTest):
                 mock.patch.object(interop.sources, "ReadOnlyClient", return_value=client), \
                 mock.patch.object(interop.sources, "GitSnapshot", return_value=snapshot), \
                 mock.patch.object(interop.sources, "check_bytes"), \
-                mock.patch.object(interop, "read_file", return_value=b"verified-shared-input"):
+                mock.patch.object(interop, "read_file", return_value=b"verified-shared-input"), \
+                mock.patch.object(interop, "fetch_archive") as download:
             with self.assertRaisesRegex(interop.InteropError, "source-tree-binding"):
                 interop.acquire(data, self.root)
         snapshot.blob.assert_not_called()
+        download.assert_not_called()
 
     def test_immutable_source_inventory_never_accepts_an_extra_executable(self):
         folder = self.root / "snapshot"
@@ -224,6 +209,417 @@ class GateSelfTestCopyTest(InteropTest):
             quality.gate_self_test(self.root)
         self.assertEqual(gradle.call_count, 1)
         self.assertEqual([], list(self.root.iterdir()))
+
+
+class PublicInputResponses:
+    """Exact accepted bytes and Git proofs; one shared anonymous REST quota, no sockets."""
+
+    archive_url = "https://codeload.github.com/PenniLogic/contracts/tar.gz/" + interop.SOURCE
+
+    def __init__(self, limit=60):
+        self.limit = limit
+        self.calls, self.api_requests, self.archive_requests, self.response_bytes = [], 0, 0, 0
+        self.metadata = interop.read_json(ROOT / interop.FIXTURES / "acquisition-metadata.json")
+        self.blobs = {}
+        self.database = interop.module_at("interop_database_inputs", ROOT / "scripts/prepare_database_admission.py")
+        self.installation = self.database.read_installation(ROOT, interop.sources)
+        self.contracts = {}
+        for entry in interop.catalog()["sources"][0]["files"]:
+            content = interop.read_file(ROOT / interop.AREA / "inputs" / entry["path"])
+            self.add_blob("PenniLogic/contracts", entry, content)
+            self.contracts[entry["path"]] = content
+        for source in interop.sources.CATALOG["sources"]:
+            for entry in source["files"]:
+                self.add_blob(source["repository"], entry,
+                              interop.read_file(ROOT / interop.sources.INPUTS / source["snapshot"] / entry["path"]))
+        prepared = interop.read_json(ROOT / self.database.OUTPUT / "inputs.json")
+        envelopes = {"policy": prepared["policy"], "evidence": prepared["inventory"]["source"]}
+        for role, source in self.installation["binding"]["sources"].items():
+            if role in envelopes:
+                contents = {item["path"]: base64.b64decode(item["content_base64"], validate=True)
+                            for item in envelopes[role]["files"]}
+            else:
+                prefix = self.database.OUTPUT if role == "infra" else Path(".")
+                contents = {entry["path"]: interop.read_file(ROOT / prefix / entry["path"])
+                            for entry in source["files"]}
+                if role == "inventory":
+                    contents = {name: content.replace(b"\r\n", b"\n") for name, content in contents.items()}
+            for entry in source["files"]:
+                self.add_blob(source["repository"], entry, contents[entry["path"]])
+        self.archive = self.archive_bytes()
+
+    def add_blob(self, repository, entry, content):
+        interop.sources.check_bytes(content, entry)
+        self.blobs["/repos/" + repository + "/git/blobs/" + entry["git_blob"]] = {
+            "sha": entry["git_blob"], "size": len(content), "encoding": "base64",
+            "content": base64.b64encode(content).decode("ascii"),
+        }
+
+    def archive_bytes(self):
+        stream = io.BytesIO()
+        prefix = "contracts-" + interop.SOURCE + "/"
+        with tarfile.open(fileobj=stream, mode="w", format=tarfile.PAX_FORMAT,
+                          pax_headers={"comment": interop.SOURCE}) as archive:
+            root = tarfile.TarInfo(prefix)
+            root.type, root.mode = tarfile.DIRTYPE, 0o755
+            archive.addfile(root)
+            for entry in interop.catalog()["sources"][0]["files"]:
+                member = tarfile.TarInfo(prefix + entry["path"])
+                member.mode, member.size = int(entry["mode"], 8) & 0o777, entry["bytes"]
+                archive.addfile(member, io.BytesIO(self.contracts[entry["path"]]))
+        return gzip.compress(stream.getvalue(), mtime=0)
+
+    def open(self, request, timeout):
+        self.calls.append({"url": request.full_url, "method": request.get_method(),
+                           "headers": dict(request.header_items()), "timeout": timeout})
+        if request.full_url == self.archive_url:
+            self.archive_requests += 1
+            body = self.archive
+        else:
+            if not request.full_url.startswith("https://api.github.com/"):
+                raise AssertionError("unexpected-source-host")
+            self.api_requests += 1
+            if self.api_requests > self.limit:
+                headers = Message()
+                headers["X-RateLimit-Remaining"] = "0"
+                raise urllib.error.HTTPError(request.full_url, 403, "synthetic-quota", headers, io.BytesIO())
+            endpoint = request.full_url.removeprefix("https://api.github.com")
+            body = interop.json_bytes(self.metadata[endpoint] if endpoint in self.metadata else self.blobs[endpoint])
+        owner = self
+
+        class Response(io.BytesIO):
+            status, chunked = 200, False
+
+            def geturl(self):
+                return request.full_url
+
+            def read1(self, size):
+                content = super().read1(size)
+                owner.response_bytes += len(content)
+                return content
+
+        response = Response(body)
+        response.headers = Message()
+        response.headers["Content-Length"] = str(len(body))
+        return response
+
+
+class ColdAcquisitionTest(InteropTest):
+    def test_complete_cold_pipeline_fits_one_anonymous_pool(self):
+        responses = PublicInputResponses()
+        client_type = interop.sources.ReadOnlyClient
+
+        def client(catalog, **kwargs):
+            return client_type(catalog, opener=responses, environ={"GH_TOKEN": "synthetic-unused-token"}, **kwargs)
+
+        interop.write_file(self.root, interop.FIXTURES / "source-inputs.json",
+                           interop.read_file(ROOT / interop.FIXTURES / "source-inputs.json"))
+        self.assertFalse((self.root / interop.sources.INPUTS).exists())
+        self.assertFalse((self.root / interop.sources.PROVIDER).exists())
+        self.assertFalse((self.root / responses.database.OUTPUT).exists())
+        self.assertFalse((self.root / interop.AREA / "inputs").exists())
+        with mock.patch.object(interop.sources, "ReadOnlyClient", side_effect=client):
+            money = interop.sources.materialize(root=self.root)
+            provider = interop.module_at("interop_cold_provider", ROOT / "scripts/money_provider.py")
+            provider.prepare(
+                root=self.root,
+                source=self.root / interop.sources.INPUTS / ("contracts-" + interop.SOURCE),
+                strategy_file=self.root / interop.sources.INPUTS
+                / "docs-a700e639585c61a4610e7b99dbd02b2dab28bdcc/governance/test-strategy.json",
+            )
+            database = responses.database.prepare(
+                self.root, responses.installation, interop.sources, fetch=True,
+            )
+            self.assertEqual((money["requests"], database["requests"]), (17, 28))
+            try:
+                result = interop.prepare(self.root)
+            finally:
+                print(interop.json_bytes({
+                    "event": "cold_public_input_fixture", "money_requests": money["requests"],
+                    "database_requests": database["requests"], "api_requests": responses.api_requests,
+                    "archive_requests": responses.archive_requests, "http_requests": len(responses.calls),
+                    "response_bytes": responses.response_bytes,
+                    "authorization_headers": sum(any(name.lower() in {"authorization", "proxy-authorization", "cookie"}
+                                                     for name in call["headers"]) for call in responses.calls),
+                }).decode("ascii").strip())
+        self.assertEqual(result["requests"], 4)
+        self.assertEqual((responses.api_requests, responses.archive_requests, len(responses.calls)), (48, 1, 49))
+        self.assertTrue(all(call["method"] == "GET" and 0 < call["timeout"] <= interop.sources.REQUEST_SECONDS
+                            for call in responses.calls), "bounded-read-only-requests")
+        self.assertTrue(all(not any(name.lower() in {"authorization", "proxy-authorization", "cookie"}
+                                    for name in call["headers"]) for call in responses.calls), "credential-free-requests")
+        interop.sources.verify_inputs(self.root)
+        interop.sources.verify_provider(self.root)
+        responses.database.verify(self.root, responses.installation, interop.sources)
+        interop.verify_sources(self.root)
+        interop.verify_acquisition(self.root)
+        before = len(responses.calls)
+        self.assertEqual(interop.prepare(self.root)["requests"], 0)
+        self.assertEqual(len(responses.calls), before)
+
+
+class ArchiveAcquisitionTest(InteropTest):
+    def setUp(self):
+        super().setUp()
+        self.responses = PublicInputResponses()
+        self.data = interop.catalog()
+        self.client = interop.sources.ReadOnlyClient(self.data, opener=self.responses)
+        self.snapshot = interop.sources.GitSnapshot(self.client, self.data["sources"][0], 335295566)
+        reused = {entry["path"] for entry in interop.sources.CATALOG["sources"][0]["files"]}
+        self.bindings = {name: value for name, value in interop.source_bindings(self.data).items() if name not in reused}
+        self.selected = next(iter(self.bindings))
+        self.prefix = "contracts-" + interop.SOURCE + "/"
+
+    def rewrite(self, change):
+        destination = io.BytesIO()
+        with tarfile.open(fileobj=io.BytesIO(gzip.decompress(self.responses.archive)), mode="r:") as original:
+            with tarfile.open(fileobj=destination, mode="w", format=tarfile.PAX_FORMAT,
+                              pax_headers={"comment": interop.SOURCE}) as output:
+                for member in original:
+                    value = original.extractfile(member).read() if member.isfile() else b""
+                    member.pax_headers = {}
+                    for item, content in change(member, value):
+                        item.size = len(content)
+                        output.addfile(item, io.BytesIO(content))
+        return gzip.compress(destination.getvalue(), mtime=0)
+
+    def contents(self, archive):
+        return interop.archive_contents(archive, self.snapshot, self.bindings)
+
+    def test_exact_selected_files_are_verified_without_extracting_unselected_members(self):
+        before = interop.inventory(self.root)
+        values, record = self.contents(self.responses.archive)
+        self.assertTrue(values == {name: self.responses.contracts[name] for name in self.bindings}, "exact-source-bytes")
+        self.assertEqual((len(values), record["archive_members"]), (29, 40))
+        self.assertEqual(record["archive_sha256"], interop.digest(self.responses.archive))
+        self.assertEqual(interop.inventory(self.root), before)
+
+    def test_codeload_batch_wrapper_crlf_exports_still_require_the_exact_canonical_blob(self):
+        name = "smoke/kotlin/gradlew.bat"
+        archive = self.rewrite(lambda member, content: [
+            (member, content.replace(b"\n", b"\r\n") if member.name == self.prefix + name else content),
+        ])
+        values, record = self.contents(archive)
+        self.assertTrue(values[name] == self.responses.contracts[name], "exact-canonical-wrapper")
+        self.assertEqual(record["archive_canonicalized_paths"], [name])
+        interop.sources.check_bytes(values[name], self.bindings[name])
+        for tampered in (True, False):
+            def change(member, content):
+                if member.name == self.prefix + (name if tampered else "generator/golden.json"):
+                    content = content.replace(b"\n", b"\r\n")
+                    if tampered:
+                        content = b"x" + content[1:]
+                return [(member, content)]
+
+            with self.subTest(tampered_wrapper=tampered):
+                with self.assertRaises((interop.InteropError, interop.sources.MaterializationError)):
+                    self.contents(self.rewrite(change))
+
+    def test_compressed_and_unpacked_byte_limits_are_enforced_before_publication(self):
+        cases = (
+            (b"x" * (interop.sources.MAX_RESPONSE_BYTES + 1), "source-size"),
+            (gzip.compress(b"\0" * (interop.sources.MAX_TOTAL_BYTES + 1), mtime=0), "archive-size"),
+        )
+        for value, cause in cases:
+            with self.subTest(control=cause), self.assertRaisesRegex(interop.InteropError, cause):
+                self.contents(value)
+        exact = gzip.decompress(self.responses.archive).ljust(interop.sources.MAX_TOTAL_BYTES, b"\0")
+        self.assertEqual(len(self.contents(gzip.compress(exact, mtime=0))[0]), 29)
+        self.assertEqual(interop.inventory(self.root), {})
+
+    def test_empty_corrupt_truncated_concatenated_and_trailing_compression_refuse(self):
+        archive = self.responses.archive
+        for label, value in (
+            ("empty", b""), ("corrupt", b"not-a-compressed-archive"),
+            ("truncated", archive[:-1]), ("concatenated", archive + archive), ("trailing", archive + b"x"),
+        ):
+            with self.subTest(control=label), self.assertRaises(interop.InteropError):
+                self.contents(value)
+        self.assertEqual(len(self.contents(archive)[0]), 29)
+
+    def test_tar_requires_complete_zero_termination_and_no_hidden_following_content(self):
+        raw = gzip.decompress(self.responses.archive)
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
+            last = archive.getmembers()[-1]
+        end = last.offset_data + ((last.size + 511) // 512) * 512
+        for label, value in (("single-zero-block", raw[:end + 512]), ("trailing-nonzero", raw + b"x"),
+                             ("truncated-file", raw[:end - 1]), ("second-tar", raw + raw)):
+            with self.subTest(control=label), self.assertRaises((interop.InteropError, interop.sources.MaterializationError)):
+                self.contents(gzip.compress(value, mtime=0))
+
+    def test_missing_and_tampered_selected_members_refuse_and_clean_bytes_recover(self):
+        for label in ("missing", "tampered"):
+            def change(member, content):
+                if member.name != self.prefix + self.selected:
+                    return [(member, content)]
+                return [] if label == "missing" else [(member, bytes([content[0] ^ 1]) + content[1:])]
+
+            with self.subTest(control=label), self.assertRaises((interop.InteropError, interop.sources.MaterializationError)):
+                self.contents(self.rewrite(change))
+        self.assertEqual(len(self.contents(self.responses.archive)[0]), 29)
+
+    def test_paths_duplicates_links_special_modes_and_unbound_members_refuse(self):
+        changes = {
+            "traversal": lambda member: setattr(member, "name", self.prefix + "../escape"),
+            "absolute": lambda member: setattr(member, "name", "/outside"),
+            "backslash": lambda member: setattr(member, "name", self.prefix + "bad\\name"),
+            "unbound": lambda member: setattr(member, "name", self.prefix + "unbound-file"),
+            "wrong-root": lambda member: setattr(member, "name", "contracts-" + "0" * 40 + "/file"),
+            "symlink": lambda member: (setattr(member, "type", tarfile.SYMTYPE), setattr(member, "linkname", "target")),
+            "hardlink": lambda member: (setattr(member, "type", tarfile.LNKTYPE), setattr(member, "linkname", "target")),
+            "fifo": lambda member: setattr(member, "type", tarfile.FIFOTYPE),
+            "special-mode": lambda member: setattr(member, "mode", 0o4755),
+            "wrong-executable": lambda member: setattr(member, "mode", 0o755),
+            "wrong-comment": lambda member: setattr(member, "pax_headers", {"comment": "0" * 40}),
+            "sparse-metadata": lambda member: setattr(member, "pax_headers", {"GNU.sparse.size": "0"}),
+        }
+        for label, mutate in changes.items():
+            def change(member, content):
+                if member.name == self.prefix + self.selected:
+                    mutate(member)
+                return [(member, content)]
+
+            with self.subTest(control=label), self.assertRaises(interop.InteropError):
+                self.contents(self.rewrite(change))
+        duplicate = self.rewrite(
+            lambda member, content: [(member, content)] * (2 if member.name == self.prefix + self.selected else 1),
+        )
+        with self.assertRaisesRegex(interop.InteropError, "archive-duplicate"):
+            self.contents(duplicate)
+
+    def test_tree_blob_identity_is_required_in_addition_to_catalog_sha256(self):
+        self.bindings[self.selected] = {**self.bindings[self.selected], "git_blob": "0" * 40}
+        with self.assertRaisesRegex(interop.InteropError, "source-blob-binding"):
+            self.contents(self.responses.archive)
+
+    def test_binary_reader_reuses_native_framing_redirect_and_byte_guards(self):
+        controls = {
+            "redirect": lambda response: setattr(response, "geturl", lambda: "https://example.invalid/source"),
+            "duplicate-length": lambda response: response.headers.add_header("Content-Length", "1"),
+            "short-body": lambda response: response.headers.replace_header("Content-Length", str(len(self.responses.archive) + 1)),
+            "oversized-length": lambda response: response.headers.replace_header("Content-Length", str(interop.sources.MAX_RESPONSE_BYTES + 1)),
+            "conflicting-framing": lambda response: response.headers.add_header("Transfer-Encoding", "chunked"),
+            "encoded-body": lambda response: response.headers.add_header("Content-Encoding", "gzip"),
+        }
+        for label, mutate in controls.items():
+            def open_response(request, timeout):
+                response = self.responses.open(request, timeout)
+                mutate(response)
+                return response
+
+            client = interop.sources.ReadOnlyClient(self.data, opener=mock.Mock(open=open_response))
+            with self.subTest(control=label), self.assertRaises((interop.InteropError, interop.sources.MaterializationError)):
+                interop.fetch_archive(client)
+
+    def test_binary_reader_accepts_exact_response_bound_and_rejects_plus_one(self):
+        for size in (interop.sources.MAX_RESPONSE_BYTES, interop.sources.MAX_RESPONSE_BYTES + 1):
+            self.responses.archive = b"x" * size
+            client = interop.sources.ReadOnlyClient(self.data, opener=self.responses)
+            if size == interop.sources.MAX_RESPONSE_BYTES:
+                self.assertEqual(len(interop.fetch_archive(client)), size)
+            else:
+                with self.assertRaisesRegex(interop.sources.MaterializationError, "source-size"):
+                    interop.fetch_archive(client)
+
+    def test_request_overall_deadline_and_aggregate_byte_budgets_are_not_reset(self):
+        clock = [0.0]
+        budget = interop.sources.Budget(clock=lambda: clock[0])
+        client = interop.sources.ReadOnlyClient(self.data, opener=self.responses, budget=budget)
+        clock[0] = interop.sources.DEADLINE_SECONDS
+        with self.assertRaisesRegex(interop.sources.MaterializationError, "source-deadline"):
+            interop.fetch_archive(client)
+        budget = interop.sources.Budget()
+        budget.requests = interop.sources.MAX_REQUESTS
+        client = interop.sources.ReadOnlyClient(self.data, opener=self.responses, budget=budget)
+        with self.assertRaisesRegex(interop.sources.MaterializationError, "source-request-limit"):
+            interop.fetch_archive(client)
+        budget = interop.sources.Budget()
+        budget.bytes = interop.sources.MAX_TOTAL_BYTES - len(self.responses.archive) + 1
+        client = interop.sources.ReadOnlyClient(self.data, opener=self.responses, budget=budget)
+        with self.assertRaisesRegex(interop.InteropError, "source-size"):
+            interop.fetch_archive(client)
+        clock[0] = 0.0
+        budget = interop.sources.Budget(clock=lambda: clock[0])
+
+        def slow_response(request, timeout):
+            response = self.responses.open(request, timeout)
+            clock[0] = interop.sources.REQUEST_SECONDS
+            return response
+
+        client = interop.sources.ReadOnlyClient(self.data, opener=mock.Mock(open=slow_response), budget=budget)
+        with self.assertRaisesRegex(interop.sources.MaterializationError, "source-request-deadline"):
+            interop.fetch_archive(client)
+
+    def test_rate_refusal_has_no_retry_authentication_or_success_fallback(self):
+        headers = Message()
+        headers["X-RateLimit-Remaining"] = "0"
+        failure = urllib.error.HTTPError(PublicInputResponses.archive_url, 403, "synthetic", headers, io.BytesIO())
+        opener = mock.Mock()
+        opener.open.side_effect = failure
+        client = interop.sources.ReadOnlyClient(self.data, opener=opener)
+        with self.assertRaisesRegex(interop.InteropError, "source-rate-exhausted"):
+            interop.fetch_archive(client)
+        self.assertEqual(opener.open.call_count, 1)
+        client.authenticated_local = True
+        with self.assertRaisesRegex(interop.InteropError, "acquisition-authentication"):
+            interop.fetch_archive(client)
+        self.assertEqual(opener.open.call_count, 1)
+
+    def test_chunked_binary_transfer_requires_its_actual_trailer_terminator(self):
+        content = self.responses.archive
+
+        class MemoryConnection:
+            def __init__(self, raw):
+                self.raw = raw
+
+            def makefile(self, *_args):
+                return io.BytesIO(self.raw)
+
+        for complete in (True, False):
+            wire = (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    + hex(len(content))[2:].encode("ascii") + b"\r\n" + content + b"\r\n0\r\n"
+                    + (b"\r\n" if complete else b""))
+            response = http.client.HTTPResponse(MemoryConnection(wire))
+            response.begin()
+            response.url = PublicInputResponses.archive_url
+            client = interop.sources.ReadOnlyClient(self.data, opener=mock.Mock(open=lambda *_args, **_kwargs: response))
+            if complete:
+                self.assertTrue(interop.fetch_archive(client) == content, "exact-chunked-body")
+            else:
+                with self.assertRaisesRegex(interop.InteropError, "source-protocol"):
+                    interop.fetch_archive(client)
+
+    def test_native_receipt_rejects_stale_shapes_source_counts_and_nonfinite_budgets(self):
+        _, archive = self.contents(self.responses.archive)
+        record = {
+            "schema": "pennilogic.api-money-client-acquisition/2",
+            "source_ref": interop.SOURCE, "source_tree": interop.SOURCE_TREE,
+            "catalog_sha256": interop.CATALOG_SHA256, "inputs": 39,
+            "mode": "native-public-git-tree-and-archive-get", "requests": 4,
+            "api_requests": 3, "archive_requests": 1, "reused_provider_inputs": 10,
+            "response_bytes": len(self.responses.archive) + 1, "elapsed_seconds": 1, **archive,
+        }
+        path = self.root / interop.AREA / "acquisition.json"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(interop.json_bytes(record))
+        interop.verify_acquisition(self.root)
+        changes = {
+            "schema": "pennilogic.api-money-client-acquisition/1", "source_ref": "0" * 40,
+            "source_tree": "0" * 40, "catalog_sha256": "0" * 64,
+            "inputs": 0, "requests": 35, "api_requests": True, "archive_requests": 0,
+            "reused_provider_inputs": 0, "archive_members": 0, "archive_sha256": "bad",
+            "archive_unpacked_bytes": interop.sources.MAX_TOTAL_BYTES + 1, "response_bytes": 0,
+            "elapsed_seconds": float("inf"), "mode": "native-public-git-object-get",
+        }
+        for key, value in changes.items():
+            with self.subTest(field=key):
+                with mock.patch.object(interop, "read_json", return_value={**record, key: value}):
+                    with self.assertRaises(interop.InteropError):
+                        interop.verify_acquisition(self.root)
+        for value in ({**record, "unexecuted": True}, {key: value for key, value in record.items() if key != "archive_sha256"}):
+            with mock.patch.object(interop, "read_json", return_value=value):
+                with self.assertRaises(interop.InteropError):
+                    interop.verify_acquisition(self.root)
 
 
 class TransportTest(InteropTest):
@@ -333,6 +729,213 @@ class TransportTest(InteropTest):
             interop.validate_transport(empty, empty)
 
 
+class RetainedTransportTest(InteropTest):
+    """Small retained-data controls, not generated-client or runtime-execution evidence."""
+
+    def setUp(self):
+        super().setUp()
+        self.values = interop.corpus(ROOT)["values"][:2]
+        self.expected = interop.transport(self.run_id, self.values)
+        self.invalid_vectors = interop.read_json(
+            ROOT / interop.AREA / "inputs/spec/fixtures/money-wire-fixtures.v1.json",
+        )
+        interop.write_json(self.root, interop.AREA / "inputs/spec/fixtures/money-wire-fixtures.v1.json",
+                           self.invalid_vectors)
+        self.invalid = interop.transport(self.run_id, self.invalid_vectors["invalid"], interop.INVALID_SHA256)
+        self.directory = Path("retained-data-controls")
+        self.plant = copy.deepcopy(self.expected)
+        self.plant["cases"][0]["envelope"]["total"] = copy.deepcopy(self.expected["cases"][1]["envelope"]["total"])
+        self.write("backend.json", self.expected)
+        self.write("invalid.json", self.invalid)
+        rejected = {**self.invalid, "schema": interop.REJECTIONS_SCHEMA,
+                    "cases": [{"id": row["id"], "status": "rejected"} for row in self.invalid["cases"]]}
+        for language in interop.LANGUAGES:
+            self.write(language + ".json", self.expected)
+            self.write(language + "-recovered.json", self.expected)
+            self.write(language + "-rejected.json", rejected)
+            self.write(language + "-disagreement.json", self.plant)
+
+    def write(self, name, value):
+        interop.write_json(self.root, self.directory / name, value, replace=True)
+
+    def verify_retained(self):
+        with mock.patch.object(interop, "corpus", return_value={"values": self.values}):
+            interop.verify_transports(self.root, self.directory, self.run_id)
+
+    def test_exact_money_field_plant_and_clean_recovery_are_retained(self):
+        self.verify_retained()
+
+    def test_nested_json_types_never_conflate_boolean_integer_and_float_neighbors(self):
+        groups = ((True, 1, 1.0), (False, 0, 0.0))
+        for group in groups:
+            for original in group:
+                for replacement in group:
+                    if type(original) is type(replacement):
+                        continue
+                    with self.subTest(original_type=type(original).__name__, replacement_type=type(replacement).__name__):
+                        expected = copy.deepcopy(self.expected)
+                        expected["cases"][0]["envelope"]["total"]["amount"] = original
+                        changed = copy.deepcopy(expected)
+                        changed["cases"][0]["envelope"]["total"]["amount"] = replacement
+                        with self.assertRaisesRegex(interop.InteropError, "wire-disagreement"):
+                            interop.validate_transport(changed, expected)
+
+    def test_retained_invalid_boolean_cannot_be_replaced_by_equal_numbers(self):
+        for replacement in (1, 1.0):
+            changed = copy.deepcopy(self.invalid)
+            self.assertIs(changed["cases"][3]["envelope"]["total"]["amount"], True)
+            changed["cases"][3]["envelope"]["total"]["amount"] = replacement
+            self.write("invalid.json", changed)
+            with self.subTest(replacement_type=type(replacement).__name__):
+                with self.assertRaisesRegex(interop.InteropError, "wire-disagreement"):
+                    self.verify_retained()
+        self.write("invalid.json", self.invalid)
+        self.verify_retained()
+
+    def test_retained_disagreement_must_be_the_exact_money_field_plant(self):
+        mutations = {
+            "unchanged-money": lambda row: row.update(copy.deepcopy(self.expected["cases"][0]["envelope"])),
+            "date-only": lambda row: row.update({**self.expected["cases"][0]["envelope"], "booked_on": "2026-10-01"}),
+            "plant-plus-date": lambda row: row.update(booked_on="2026-10-01"),
+            "numeric-total": lambda row: row.update(total=1),
+            "boolean-total": lambda row: row.update(total=True),
+            "null-total": lambda row: row.update(total=None),
+            "array-total": lambda row: row.update(total=[]),
+            "numeric-amount": lambda row: row["total"].update(amount=1),
+            "missing-currency": lambda row: row["total"].pop("currency"),
+        }
+        for label, mutate in mutations.items():
+            changed = copy.deepcopy(self.plant)
+            mutate(changed["cases"][0]["envelope"])
+            self.write("kotlin-disagreement.json", changed)
+            with self.subTest(control=label):
+                with self.assertRaisesRegex(interop.InteropError, "fault-not-planted"):
+                    self.verify_retained()
+        self.write("kotlin-disagreement.json", self.plant)
+        self.verify_retained()
+
+    def test_retained_disagreement_cannot_change_later_rows_or_their_types(self):
+        for replacement in (True, 1, 1.0, [], None):
+            changed = copy.deepcopy(self.plant)
+            changed["cases"][1]["envelope"]["total"]["amount"] = replacement
+            self.write("python-disagreement.json", changed)
+            with self.subTest(replacement_type=type(replacement).__name__):
+                with self.assertRaisesRegex(interop.InteropError, "fault-scope"):
+                    self.verify_retained()
+        self.write("python-disagreement.json", self.plant)
+        self.verify_retained()
+
+
+class RunnerBoundaryTest(InteropTest):
+    def test_exact_stream_and_aggregate_limits_preserve_separate_bytes_and_recover(self):
+        runner = interop.Runner(self.root, Path("exact-output-control"))
+        for label, stdout, stderr in (("stdout-bound", interop.MAX_DOCUMENT, 0),
+                                      ("aggregate-bound", interop.MAX_DOCUMENT // 2, interop.MAX_DOCUMENT // 2)):
+            code = f"import os;os.write(1,b'a'*{stdout});os.write(2,b'b'*{stderr})"
+            result = runner.call(label, [sys.executable, "-I", "-S", "-B", "-c", code])
+            self.assertEqual((len(result[1]), len(result[2])), (stdout, stderr))
+        result = runner.call("recovery", [sys.executable, "-I", "-S", "-B", "-c", "print('{}')"],
+                             protocol=({}, None))
+        self.assertEqual(result[0], 0)
+
+    def test_timeout_retains_only_bounded_metadata_and_clean_recovery(self):
+        runner = interop.Runner(self.root, Path("timeout-output-control"))
+        runner.started = interop.time.monotonic() - interop.SECONDS + 0.5
+        with self.assertRaisesRegex(interop.InteropError, "process-budget"):
+            runner.call("timeout", [sys.executable, "-I", "-S", "-B", "-c", "import time;time.sleep(30)"])
+        self.assertFalse(runner.records[0]["capture_complete"])
+        self.assertIsNone(runner.records[0]["stdout"]["path"])
+        runner.started = interop.time.monotonic()
+        self.assertEqual(runner.call("recovery", [sys.executable, "-I", "-S", "-B", "-c", "print('{}')"],
+                                     protocol=({}, None))[0], 0)
+
+    def test_partial_fresh_runtime_storage_is_preserved_before_any_execution(self):
+        base = self.root / interop.AREA / "runtimes" / self.run_id
+        base.mkdir(parents=True)
+        (base / "preserve.txt").write_bytes(b"partial")
+        runner = mock.Mock()
+        with self.assertRaisesRegex(interop.InteropError, "runtime-storage-exists"):
+            interop.runtime_dependencies(self.root, Path(self.run_id), runner, self.root, {})
+        runner.call.assert_not_called()
+        self.assertEqual((base / "preserve.txt").read_bytes(), b"partial")
+
+    def test_runtime_children_have_a_positive_environment_boundary(self):
+        runner = interop.Runner(self.root, Path("environment-control"))
+        injected = {
+            "JAVA_TOOL_OPTIONS": "synthetic-options", "_JAVA_OPTIONS": "synthetic-options",
+            "JDK_JAVA_OPTIONS": "synthetic-options", "NODE_OPTIONS": "synthetic-options",
+            "NODE_PATH": str(self.root), "PYTHONPATH": str(self.root), "PYTHONSTARTUP": str(self.root),
+            "AWS_SECRET_ACCESS_KEY": "synthetic-noncredential", "NPM_TOKEN": "synthetic-noncredential",
+            "UNLISTED_LAUNCHER_SETTING": "synthetic-unapproved",
+        }
+        code = (
+            "import os,json; print(json.dumps({'clean':not any(name in os.environ for name in "
+            + repr(tuple(injected)) + ")}))"
+        )
+        with mock.patch.dict(os.environ, injected):
+            result = runner.call("environment", [sys.executable, "-I", "-S", "-B", "-c", code],
+                                 protocol=({"clean": True}, None))
+        self.assertEqual(result[0], 0)
+
+    def test_stream_overflow_stops_owned_work_before_delayed_continuation(self):
+        runner = interop.Runner(self.root, Path("overflow-control"))
+        marker = self.root / "overflow-continuation"
+        code = (
+            "import os,time,pathlib; "
+            f"os.write(1,b'x'*{interop.MAX_DOCUMENT + 1}); "
+            f"time.sleep(1); pathlib.Path({str(marker)!r}).write_text('unexpected')"
+        )
+        with self.assertRaisesRegex(interop.InteropError, "command-output-size"):
+            runner.call("overflow", [sys.executable, "-I", "-S", "-B", "-c", code])
+        self.assertFalse(marker.exists(), "overflow-was-only-checked-after-exit")
+        self.assertTrue(all(record[name]["path"] is None for record in runner.records
+                            for name in ("stdout", "stderr")), "overflow-must-be-hash-only")
+
+    def test_concurrent_streams_have_an_aggregate_limit(self):
+        runner = interop.Runner(self.root, Path("aggregate-control"))
+        code = (
+            "import os,threading; "
+            f"threads=[threading.Thread(target=os.write,args=(fd,b'x'*{interop.MAX_DOCUMENT // 2 + 1})) for fd in (1,2)]; "
+            "[thread.start() for thread in threads]; [thread.join() for thread in threads]"
+        )
+        with self.assertRaisesRegex(interop.InteropError, "command-output-size"):
+            runner.call("aggregate", [sys.executable, "-I", "-S", "-B", "-c", code])
+
+    def test_old_dependency_caches_are_not_executed_as_readiness_probes(self):
+        producer = self.root / interop.AREA / "producer"
+        requirement = Path("smoke/python/requirements.txt")
+        interop.write_file(self.root, interop.AREA / "producer" / requirement,
+                           interop.read_file(ROOT / interop.AREA / "inputs" / requirement))
+        interpreter = self.root / interop.AREA / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_bytes(b"untrusted-cache-control")
+        compiler = producer / "node_modules/typescript/bin/tsc"
+        compiler.parent.mkdir(parents=True)
+        compiler.write_bytes(b"untrusted-cache-control")
+
+        class TrustedRestoreReached(Exception):
+            pass
+
+        def guard(label, argv, **_kwargs):
+            self.assertNotEqual(Path(argv[0]), interpreter, "untrusted-python-cache-was-probed")
+            self.assertFalse(any(str(compiler) == str(arg) for arg in argv), "untrusted-compiler-cache-was-probed")
+            if label == "python-probe":
+                self.assertEqual(Path(argv[0]), Path(sys.executable))
+                return 3, b"", b""
+            if label == "python-venv":
+                self.assertEqual(Path(argv[0]), Path(sys.executable))
+                raise TrustedRestoreReached
+            self.fail("unexpected-readiness-command")
+
+        with self.assertRaises(TrustedRestoreReached):
+            interop.runtime_dependencies(
+                self.root, Path(self.run_id), mock.Mock(call=guard), producer,
+                interop.read_json(ROOT / interop.AREA / "inputs/toolchain/versions.json"),
+            )
+        self.assertEqual(interpreter.read_bytes(), b"untrusted-cache-control")
+        self.assertEqual(compiler.read_bytes(), b"untrusted-cache-control")
+
+
 class ExecutionEvidenceTest(InteropTest):
     def records(self):
         return [
@@ -342,6 +945,7 @@ class ExecutionEvidenceTest(InteropTest):
                 "exit_code": 1 if label.endswith("-refuse-disagreement") else 0,
                 "expected_exit": 1 if label.endswith("-refuse-disagreement") else 0,
                 "argv": ["synthetic-command"], "cwd": str(self.root),
+                "environment": {},
                 "stdout": {"path": "synthetic.stdout.txt", "bytes": 0, "sha256": interop.digest(b"")},
                 "stderr": {"path": "synthetic.stderr.txt", "bytes": 0, "sha256": interop.digest(b"")},
             }
@@ -395,6 +999,8 @@ class ExecutionEvidenceTest(InteropTest):
             interop.validate_commands(records)
 
     def test_a_self_consistent_digest_cannot_hide_zero_or_skipped_runtime_receipts(self):
+        interop.write_json(self.root, interop.AREA / "inputs/toolchain/versions.json",
+                           {"typescript": {"version": "7.0.2"}})
         for change in ({"case_count": 0}, {"case_count": 10030.0}, {"status": "skipped"}, {"run_id": "b" * 32}, {"extra": "field"}):
             with self.subTest(field=next(iter(change))):
                 directory = Path("probe-" + str(len(list(self.root.iterdir()))))
@@ -403,6 +1009,10 @@ class ExecutionEvidenceTest(InteropTest):
                     prefix = directory / "commands" / f"{index:02d}-{record['label']}"
                     for name in ("stdout", "stderr"):
                         content = b""
+                        if record["label"] == "python-ready" and name == "stdout":
+                            content = interop.json_bytes({"missing": 0, "wrong": 0})
+                        if record["label"] == "typescript-ready" and name == "stdout":
+                            content = b"Version 7.0.2\n"
                         if record["label"] == "backend-emit" and name == "stdout":
                             value = {**interop.receipt("backend", "emit", interop.COUNT, self.run_id), **change}
                             content = interop.json_bytes(value)
@@ -436,7 +1046,7 @@ class ExecutionEvidenceTest(InteropTest):
         runner = interop.Runner(self.root, Path("run"))
         secret = b"synthetic-must-not-appear-in-evidence"
         result = subprocess.CompletedProcess(["bridge"], 1, secret, secret)
-        with mock.patch.object(interop.subprocess, "run", return_value=result):
+        with mock.patch.object(interop.process_budget, "run", return_value=result):
             with self.assertRaisesRegex(interop.InteropError, "command-protocol"):
                 runner.call("conversion", ["bridge"], protocol=({"status": "passed"}, None))
         self.assertIsNone(runner.records[0]["stdout"]["path"])
@@ -448,7 +1058,7 @@ class ExecutionEvidenceTest(InteropTest):
 
     def test_a_missing_command_is_not_reported_as_executed_or_successful(self):
         runner = interop.Runner(self.root, Path("run"))
-        with mock.patch.object(interop.subprocess, "run", side_effect=FileNotFoundError):
+        with mock.patch.object(interop.process_budget, "run", side_effect=FileNotFoundError):
             with self.assertRaisesRegex(interop.InteropError, "command-failed-missing"):
                 runner.call("missing", ["not-an-installed-tool"])
         self.assertFalse(runner.records[0]["executed"])

@@ -62,9 +62,9 @@ Prepare the existing API Money provider using the repository's documented
 commands first. Then:
 
 ```text
-python scripts/money_client_interop.py prepare
-.\gradlew.bat --no-daemon --console=plain -Pkotlin.compiler.execution.strategy=in-process moneyClientInterop
-python scripts/money_client_interop.py verify
+python -I -S -B scripts/money_client_interop.py prepare
+.\gradlew.bat --no-daemon --console=plain -Pkotlin.compiler.execution.strategy=in-process "-PmoneyClientInteropPython=<approved absolute Python executable>" moneyClientInterop
+python -I -S -B scripts/money_client_interop.py verify
 python -m unittest discover -s scripts/tests -p test_money_client_interop.py
 python scripts/quality.py build
 python scripts/quality.py gate-self-test
@@ -79,22 +79,67 @@ its own existing, checksum-verified dependencies. An API-owned init script adds
 only test bridge/source/output wiring; it edits neither that project's sources
 nor generated files and adds no dependencies.
 
-Fresh normal builds have a reproducible preparation path. Acquisition reuses ten
-already-verified native provider inputs, then uses the existing native
-`ReadOnlyClient`, `GitSnapshot`, hash/blob, path and budget primitives for the
-remaining 29 files. Two fixed batches make 35 bounded, anonymous public Git-object
-GETs; repository/organization IDs, immutable commit/tree, byte count, SHA-256 and
-Git blob identity must agree. Each native request/response budget is unchanged,
-and an outer native deadline bounds the whole acquisition. This transport is
-distinct from personal authenticated metadata research; inherited tokens are
-not used. A refusal is not an invitation to bypass an authentication guard.
+The Gradle entry selects the approved **absolute** Python executable from
+`moneyClientInteropPython`, `PENNILOGIC_PYTHON` (set by the shared process-budget
+helper), or the hosted setup-python `pythonLocation`, in that order. It does not
+search the ambient PATH. Its environment is filtered before Python starts with
+`-I -S -B`. Node comes from the standard host installation or the explicit
+`moneyClientInteropNode` Gradle property (`--node` for a direct `run --java ...`).
+The paired npm CLI is resolved beside that installation or from the standard
+Linux npm package location. The accepted Node/npm versions must already be
+installed; the gate neither downloads a system runtime nor changes hosted setup.
+
+The original cold path exhausted the shared anonymous REST quota: Money
+preparation makes 17 requests and database preparation makes 28; adding 35
+per-blob interop requests required 80, exceeding one 60-request pool. The native
+[PR #102 failure](https://github.com/PenniLogic/api/actions/runs/37620907002)
+was a failure, not cross-language or full-build qualification.
+
+Acquisition now reuses ten already-verified native provider inputs, then makes
+three REST GETs with the existing `ReadOnlyClient` and `GitSnapshot` to verify
+the exact numeric repository/organization identities, immutable commit and
+reconstructed complete Git tree. One additional, credential-free GET to
+`https://codeload.github.com/PenniLogic/contracts/tar.gz/aa8d90cb98cec9b6dd08c91b3a4d869e47362662`
+supplies the remaining 29 cataloged files. The complete cold preparation
+pipeline therefore uses **48 REST requests plus one archive request**, not 80
+REST requests. This does not reserve quota against unrelated users or excuse
+actual exhaustion: there is no retry, backoff, proxy, token fallback or endpoint
+lottery.
+
+The API-owned binary reader reuses the native no-proxy/no-redirect opener,
+framing checks and budget primitives; the native reader itself decodes JSON and
+is unchanged. The archive is bounded to 2 MiB compressed and 4 MiB unpacked,
+within a single native 4 MiB response-byte/32-request/180-second budget and
+10-second per-request deadlines. Truncated, concatenated, trailing, oversized
+or malformed compressed data, unsafe/duplicate/unbound paths, links, sparse or
+special entries and invalid archive termination are refused. Nothing is
+extracted to disk. Selected members must match the verified tree's path, mode,
+size and blob identity, plus the unchanged catalog's SHA-256; only these
+verified bytes are subsequently staged. Unselected contents are never executed
+or published.
+
+GitHub's archive exports the pinned `smoke/kotlin/gradlew.bat` with CRLF rather
+than its canonical Git-blob LF bytes. Only that cataloged member may undergo
+this transport normalization, with at most twice its bound size before
+normalization. Its resulting bytes must still match the **unchanged** exact
+size, Git blob and SHA-256. No other file, line ending or hash check is relaxed.
+The raw archive hash remains bound and the receipt explicitly names any
+canonicalized member.
+
+The strict native acquisition `/2` receipt distinguishes the three metadata
+requests from the archive transfer and binds its compressed/unpacked sizes,
+member count, digest, canonicalized paths, aggregate response bytes and elapsed time. Old per-blob
+native receipts do not qualify as the new route. Explicit offline `/1`
+receipts remain honestly offline. This transport is distinct from personal
+authenticated metadata research; inherited tokens are not used. A refusal is
+not an invitation to bypass an authentication guard.
 Helper modules execute from source bytes, without reading or writing unbound
 Python bytecode caches beside immutable inputs.
 
 An exact, owned offline snapshot can be supplied explicitly:
 
 ```text
-python scripts/money_client_interop.py prepare --offline-source "<owned exact 39-file snapshot>"
+python -I -S -B scripts/money_client_interop.py prepare --offline-source "<owned exact 39-file snapshot>"
 ```
 
 It must contain exactly the cataloged files, with no links or extra executables.
@@ -102,16 +147,51 @@ Offline provenance is recorded as offline, not as a native network fetch. Partia
 changed or linked installations are preserved and refused, never blindly replaced.
 There is no workstation-specific path in the normal build.
 
-Tool readiness is checked before restoring missing dependencies. Restores use
-only the accepted generator/toolchain downloader, hashed binary-only Python
-requirements, `npm ci --ignore-scripts` with the accepted lock, and the accepted
-Gradle wrapper and verification metadata. Cached tool mismatches are refusals,
-not instructions to download an unpinned replacement. Existing default generated
-trees are checked against the accepted golden files before regeneration; partial
-or modified output is not silently healed. Node/npm must already be available
-and satisfy the accepted package's runtime requirements; this gate does not
-install an unpinned system runtime. No service, paid runner,
+The cold-pipeline regression calls the real Money materializer, provider,
+database preparer and interop preparer against a shared 60-request response
+fixture, starting with no outputs in its owned test root. Public immutable
+Git metadata is recorded in `acquisition-metadata.json`; blob response data is
+read and hash-verified from the separately prepared exact reference inputs.
+These tests require the documented Money/database/interop preparation first.
+The fixture uses the native identity/tree/blob/hash and wire-budget checks,
+not replacement materializers, and opens no sockets. Its simulated request
+counts and bytes are distinct from actual network acquisition evidence.
+
+Generator readiness is checked using the accepted toolchain helper and checksum
+pins. Cached generator mismatches are refusals, not instructions to download an
+unpinned replacement. Existing default generated trees are checked against the
+accepted golden files before regeneration; partial or modified output is not
+silently healed.
+
+Python and npm dependencies are reconstructed in new, run-specific owned
+storage on every invocation. A version response from an existing interpreter or
+compiler cache is **not** a trust check: the old `venv` and `producer/node_modules`
+are never probed or executed. A trusted isolated base-Python probe establishes
+the missing fresh paths before restoration. Python uses `venv --copies` and
+isolated pip with the existing hash-required, binary-only requirements, no
+dependency resolution, cache or bytecode compilation. npm uses the exact
+accepted package/lock/configuration with `ci --ignore-scripts --engine-strict`,
+no audit/funding requests, no executable links and a fresh owned package cache.
+Only after these restores are the interpreter's package versions and compiler
+version checked. Failed or partial fresh storage is preserved, never reused.
+
+The runtime inventory binds the freshly installed Python configuration,
+executables and packages, npm packages, and both selected and resolved approved
+host-tool paths. It is compared before/after client execution and during offline
+verification. Host-managed runtime aliases may resolve to their actual binary;
+this does not relax the no-link rule for owned inputs, packages or outputs.
+The accepted Gradle wrapper, dependency verification metadata and explicitly
+selected Gradle cache remain in use; compilation cache hits must still be
+reported honestly. No shared cache is cleaned and no service, paid runner,
 release, CI dispatch, publication or deployment is involved.
+
+Every child receives a positive, command-specific environment, not an inherited
+environment with a few secret names removed. It contains approved runtime/OS
+directories (including Windows PowerShell), the required Java/Gradle settings
+only for Java commands, and owned HOME/temp directories. Ambient PATH,
+Python/JVM/Node startup options, package-manager configuration and unrelated
+credentials are not forwarded. The Windows process-budget bootstrap itself
+uses `-I -S -B` and cannot spawn its child before its owned Job is attached.
 
 The separate `quality.py gate-self-test` command copies
 `scripts/money_client_interop.py`, `scripts/tests/fixtures/money_client_interop`,
@@ -122,12 +202,14 @@ are not copied; the scratch build uses the same verified preparation path.
 
 ## Evidence and limits
 
-Each invocation creates a fresh run under `build/money-client-interop/runs/`.
+Each invocation creates a fresh run under `build/money-client-interop/runs/`
+and fresh dependencies under `build/money-client-interop/runtimes/`.
 An exclusive `run.lock` prevents concurrent writers; an abandoned lock is
 refused rather than deleted or silently reused.
 `current.json` is invalidated before execution. A successful report binds the API
 bridge/build/source inputs, backend and generated-client classpaths, generated
-trees, scratch specification, commands, separate output streams, counts and
+trees, scratch specification, commands and their filtered environments, fresh
+dependency/tool inventories, separate output streams, counts and
 all run outputs. Offline `verify` checks those bindings again, rechecks actual
 runtime receipts against their counts and run identity, and validates every
 returned transport against the canonical corpus. A recomputed file digest alone
@@ -135,12 +217,29 @@ cannot make an empty, skipped or stale receipt qualify. Missing,
 truncated, duplicate-key, wrong-version/source, stale, modified, zero-case,
 unexecuted and skipped evidence fails closed. Old success cannot rescue a
 failed new attempt.
+The current report schema is `pennilogic.api-money-client-interop/2`; older
+reports cannot stand in for the strengthened execution boundary.
+
+Live and retained/offline transports compare nested values through the existing
+canonical JSON helper, not Python container equality: Boolean, integer and
+floating-point neighbors remain distinct. A shared negative-control validator
+requires exactly the first envelope's `total` to be replaced by the known valid
+second case's Money. Both time fields, every other first-case field and all
+later rows must remain exact. A date-only change, malformed/numeric Money or
+unchanged Money cannot substitute for the required backend
+`wire-disagreement` at `case-00000`; the real clean recovery remains mandatory.
 
 Wire files contain **synthetic fixtures only**. Runtime stdout contains bounded
 metadata receipts; errors use static causes and case IDs, never amounts or raw
 payloads. Unexpected runtime output is retained only as byte counts and hashes,
 not copied into logs or reports. The owned process-tree budget reuses the API's
 existing process-budget helper and never stops a shared service or daemon.
+Captured stdout and stderr are drained incrementally with a 4 MiB per-stream
+**and aggregate** limit. Exceeding either limit terminates the owned execution;
+it is not checked only after an unbounded `communicate()` allocation. An overflow
+or timeout retains static failure metadata and observed-prefix byte counts and
+hashes only, marks capture incomplete and cannot form a passing command receipt.
+Output exactly at the limit remains valid. Capture errors fail explicitly.
 The report's `elapsed_seconds` covers execution and binding collection before
 final verification; the success event and external command timing include that
 verification. Neither is hosted job/workflow timing.

@@ -1,4 +1,5 @@
 import org.gradle.api.artifacts.dsl.LockMode
+import java.io.File
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
@@ -254,19 +255,67 @@ val generatedClientInterop =
         outputs.cacheIf { false }
         val launcher = javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(21)) }
         val backendClasspath = sourceSets.test.get().runtimeClasspath
+        val configuredPython = providers.gradleProperty("moneyClientInteropPython")
+        val configuredNode = providers.gradleProperty("moneyClientInteropNode")
         doFirst {
+            val windows = System.getProperty("os.name").startsWith("Windows")
+            val pythonLocation = System.getenv("pythonLocation")
+            val python =
+                configuredPython.orNull
+                    ?: System.getenv("PENNILOGIC_PYTHON")
+                    ?: pythonLocation?.let { File(it).resolve(if (windows) "python.exe" else "bin/python").path }
+                    ?: error("Set moneyClientInteropPython to the approved absolute Python executable.")
+            val pythonFile = File(python)
+            require(pythonFile.isAbsolute && pythonFile.isFile) { "Approved Python executable is missing." }
+            val javaFile = launcher.get().executablePath.asFile
+            val approvedEnvironment =
+                System
+                    .getenv()
+                    .filterKeys {
+                        it in
+                            setOf(
+                                "HOME",
+                                "USERPROFILE",
+                                "TEMP",
+                                "TMP",
+                                "TMPDIR",
+                                "LANG",
+                                "LC_ALL",
+                                "JAVA_HOME",
+                                "GRADLE_USER_HOME",
+                                "CI",
+                                "GITHUB_ACTIONS",
+                                "SYSTEMROOT",
+                                "SystemRoot",
+                                "WINDIR",
+                            )
+                    }.toMutableMap()
+            val systemPaths =
+                if (windows) {
+                    val system = File(System.getenv("SystemRoot") ?: error("Windows system directory is missing.")).resolve("System32")
+                    listOf(system, system.resolve("WindowsPowerShell/v1.0"), system.resolve("Wbem"))
+                } else {
+                    listOf(File("/usr/local/bin"), File("/usr/bin"), File("/bin"))
+                }
+            approvedEnvironment["PATH"] =
+                (listOf(pythonFile.parentFile, javaFile.parentFile) + systemPaths)
+                    .joinToString(File.pathSeparator) { it.absolutePath }
+            approvedEnvironment["JAVA_HOME"] = javaFile.parentFile.parentFile.absolutePath
+            approvedEnvironment["PENNILOGIC_PYTHON"] = pythonFile.absolutePath
+            setEnvironment(approvedEnvironment)
             commandLine(
-                "python",
+                pythonFile.absolutePath,
+                "-I",
+                "-S",
                 "-B",
                 "scripts/money_client_interop.py",
                 "run",
                 "--java",
-                launcher
-                    .get()
-                    .executablePath.asFile.absolutePath,
+                javaFile.absolutePath,
                 "--classpath",
                 backendClasspath.filter { it.exists() }.asPath,
             )
+            configuredNode.orNull?.let { args("--node", it) }
         }
     }
 

@@ -3,18 +3,23 @@
 import argparse
 from contextlib import contextmanager
 import hashlib
+import http.client
 import importlib.util
+import io
 import json
 import math
 import os
 from pathlib import Path
 import re
-import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import time
+import urllib.error
+import urllib.request
 import uuid
+import zlib
 
 
 ROOT = Path(__file__).absolute().parents[1]
@@ -23,13 +28,14 @@ FIXTURES = Path("scripts") / "tests" / "fixtures" / "money_client_interop"
 BACKEND = Path("src/test/kotlin/com/pennilogic/money/MoneyClientInteropBridge.kt")
 SOURCE = "aa8d90cb98cec9b6dd08c91b3a4d869e47362662"
 SOURCE_TREE = "da0d17d9deaee9c049776d16c1511c5840fa16fe"
+ARCHIVE_URL = "https://codeload.github.com/PenniLogic/contracts/tar.gz/" + SOURCE
 CATALOG_SHA256 = "da45087cec04f9cdfee7cf880533b2e0527159a535c872f55f8d27c8b9e33016"
 CORPUS_SHA256 = "22ed8a8ff3204a8962c10c8fcfada7d20dd6ed147fc2a07f98edef827ea28efe"
 INVALID_SHA256 = "3c95a95c290fd1aad5d58300c301ab3c8c6b3b2883a95fbb586b58336ab1cf1d"
 CANONICAL_SHA256 = "6d3172f611bc69f7d529912f68539a1e66101a1c188710ff2400ceab4fbb1ef6"
 WIRE_SCHEMA = "pennilogic.api-money-client-wire/1"
 REJECTIONS_SCHEMA = "pennilogic.api-money-client-rejections/1"
-REPORT_SCHEMA = "pennilogic.api-money-client-interop/1"
+REPORT_SCHEMA = "pennilogic.api-money-client-interop/2"
 COUNT = 10030
 INVALID_COUNT = 41
 LANGUAGES = ("kotlin", "typescript", "python")
@@ -175,25 +181,159 @@ def verify_acquisition(root):
     value = read_json(owned(root, AREA / "acquisition.json"))
     common = {"schema", "source_ref", "source_tree", "catalog_sha256", "inputs", "mode", "requests", "reused_provider_inputs"}
     require(type(value) is dict and value.get("mode") in {
-        "native-public-git-object-get", "offline-hash-and-git-blob-verified",
+        "native-public-git-tree-and-archive-get", "offline-hash-and-git-blob-verified",
     }, "acquisition-mode")
-    native = value["mode"] == "native-public-git-object-get"
-    require(set(value) == common | ({"response_bytes", "elapsed_seconds"} if native else set()), "acquisition-shape")
-    require(value["schema"] == "pennilogic.api-money-client-acquisition/1"
+    native = value["mode"] == "native-public-git-tree-and-archive-get"
+    archive_fields = {"response_bytes", "elapsed_seconds", "api_requests", "archive_requests", "archive_bytes",
+                      "archive_unpacked_bytes", "archive_members", "archive_sha256", "archive_canonicalized_paths"}
+    require(set(value) == common | (archive_fields if native else set()), "acquisition-shape")
+    require(value["schema"] == "pennilogic.api-money-client-acquisition/" + ("2" if native else "1")
             and value["source_ref"] == SOURCE and value["source_tree"] == SOURCE_TREE
             and value["catalog_sha256"] == CATALOG_SHA256, "acquisition-source")
     require(all(type(value[key]) is int and value[key] == expected for key, expected in {
-        "inputs": 39, "requests": 35 if native else 0, "reused_provider_inputs": 10 if native else 0,
+        "inputs": 39, "requests": 4 if native else 0, "reused_provider_inputs": 10 if native else 0,
     }.items()), "acquisition-count")
     if native:
-        require(type(value["response_bytes"]) is int and 0 < value["response_bytes"] <= 2 * sources.MAX_TOTAL_BYTES,
+        require(all(type(value[key]) is int and value[key] == expected
+                    for key, expected in {"api_requests": 3, "archive_requests": 1}.items()), "acquisition-count")
+        require(all(type(value[key]) is int for key in
+                    ("response_bytes", "archive_bytes", "archive_unpacked_bytes", "archive_members"))
+                and 0 < value["archive_bytes"] <= min(value["response_bytes"], sources.MAX_RESPONSE_BYTES)
+                and value["response_bytes"] <= sources.MAX_TOTAL_BYTES
+                and 0 < value["archive_unpacked_bytes"] <= sources.MAX_TOTAL_BYTES
+                and 29 <= value["archive_members"] <= 4097,
                 "acquisition-size")
+        require(type(value["archive_sha256"]) is str and sources.DIGEST.fullmatch(value["archive_sha256"]),
+                "acquisition-archive")
+        require(type(value["archive_canonicalized_paths"]) is list
+                and value["archive_canonicalized_paths"] in ([], ["smoke/kotlin/gradlew.bat"]), "acquisition-archive")
         require(type(value["elapsed_seconds"]) in (int, float) and math.isfinite(value["elapsed_seconds"])
                 and 0 < value["elapsed_seconds"] < sources.DEADLINE_SECONDS, "acquisition-budget")
 
 
+def fetch_archive(client):
+    """One binary response; reuse the native no-proxy/no-redirect opener and every wire budget."""
+    require(not client.authenticated_local, "acquisition-authentication")
+    request = urllib.request.Request(ARCHIVE_URL, method="GET", headers={
+        "Accept": "application/gzip", "User-Agent": "PenniLogic-API-Money-client-interoperability",
+    })
+    started = client.budget.clock()
+    timeout = client.budget.request()
+    deadline = started + timeout
+    try:
+        with client.opener.open(request, timeout=timeout) as response:
+            client.budget.remaining(deadline)
+            require(response.status == 200, "source-http")
+            require(response.geturl() == request.full_url, "source-redirect")
+            length = sources.response_length(response)
+            encoding = response.headers.get_all("Content-Encoding", [])
+            require(not encoding or len(encoding) == 1 and encoding[0].strip().lower() == "identity",
+                    "source-protocol")
+            completion = None
+            if response.chunked:
+                completion = sources.ChunkedCompletion(response.fp)
+                response.fp = completion
+            parts, size = [], 0
+            while True:
+                client.budget.remaining(deadline)
+                part = response.read1(min(65536, sources.MAX_RESPONSE_BYTES + 1 - size))
+                client.budget.remaining(deadline)
+                if not part:
+                    break
+                size += len(part)
+                client.budget.bytes += len(part)
+                require(size <= sources.MAX_RESPONSE_BYTES and client.budget.bytes <= sources.MAX_TOTAL_BYTES,
+                        "source-size")
+                parts.append(part)
+            require(length is None or size == length, "source-protocol")
+            require(completion is None or completion.last_line in (b"\r\n", b"\n"), "source-protocol")
+        client.budget.remaining(deadline)
+        return b"".join(parts)
+    except urllib.error.HTTPError as error:
+        code = sources.http_refusal(error)
+        error.close()
+        raise InteropError(code) from None
+    except http.client.HTTPException:
+        raise InteropError("source-protocol") from None
+    except (urllib.error.URLError, OSError, TimeoutError):
+        raise InteropError("source-unavailable") from None
+
+
+def archive_contents(content, snapshot, bindings):
+    budget = snapshot.client.budget
+    budget.remaining()
+    require(0 < len(content) <= sources.MAX_RESPONSE_BYTES, "source-size")
+    try:
+        decoder = zlib.decompressobj(31)
+        unpacked = decoder.decompress(content, sources.MAX_TOTAL_BYTES + 1)
+    except zlib.error:
+        raise InteropError("archive-compression") from None
+    require(len(unpacked) <= sources.MAX_TOTAL_BYTES, "archive-size")
+    require(decoder.eof and not decoder.unused_data and not decoder.unconsumed_tail, "archive-completion")
+    budget.remaining()
+    prefix = "contracts-" + SOURCE + "/"
+    selected, seen, canonicalized, end, count = {}, set(), [], 0, 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(unpacked), mode="r:") as archive:
+            for member in archive:
+                budget.remaining()
+                count += 1
+                require(count <= min(4097, len(snapshot.entries) + 1), "archive-count")
+                name = member.name
+                require(0 < len(name) <= 1024 + len(prefix) and "\\" not in name
+                        and all(ord(char) >= 32 and char != "\x7f" for char in name)
+                        and all(part not in ("", ".", "..") for part in name.split("/")), "archive-path")
+                require(name.casefold() not in seen, "archive-duplicate")
+                seen.add(name.casefold())
+                directory = member.type == tarfile.DIRTYPE
+                require((directory or member.type in (tarfile.REGTYPE, tarfile.AREGTYPE))
+                        and member.sparse is None and not member.linkname
+                        and 0 <= member.mode <= 0o777 and member.size >= 0, "archive-kind")
+                require(set(member.pax_headers) <= {"path", "comment"}
+                        and member.pax_headers.get("comment", SOURCE) == SOURCE, "archive-metadata")
+                if name == prefix[:-1]:
+                    require(directory and member.size == 0, "archive-root")
+                else:
+                    require(name.startswith(prefix), "archive-root")
+                    relative = name[len(prefix):]
+                    entry = snapshot.entries.get(relative)
+                    require(entry is not None, "archive-unbound-member")
+                    require(entry["type"] == ("tree" if directory else "blob")
+                            and entry["mode"] in (("040000",) if directory else ("100644", "100755")),
+                            "archive-kind")
+                    exported_crlf = not directory and relative == "smoke/kotlin/gradlew.bat" and relative in bindings \
+                        and entry["size"] < member.size <= entry["size"] * 2
+                    require((member.size == (0 if directory else entry["size"]) or exported_crlf)
+                            and (directory or member.mode & 0o111 == int(entry["mode"], 8) & 0o111), "archive-binding")
+                    if relative in bindings:
+                        binding = bindings[relative]
+                        require(not directory and entry["mode"] == binding["mode"]
+                                and entry["sha"] == binding["git_blob"] and entry["size"] == binding["bytes"],
+                                "source-blob-binding")
+                        with archive.extractfile(member) as stream:
+                            value = stream.read(member.size + 1)
+                        if exported_crlf:
+                            # GitHub exports this batch wrapper with CRLF; require the unchanged canonical blob below.
+                            value = value.replace(b"\r\n", b"\n")
+                            canonicalized.append(relative)
+                        sources.check_bytes(value, binding)
+                        selected[relative] = value
+                end = member.offset_data + ((member.size + 511) // 512) * 512
+                require(end <= len(unpacked), "archive-completion")
+        require(len(unpacked) - end >= 1024 and not any(unpacked[end:]), "archive-completion")
+    except (tarfile.TarError, UnicodeError, ValueError, OverflowError) as error:
+        if isinstance(error, (InteropError, sources.MaterializationError)):
+            raise
+        raise InteropError("archive-format") from None
+    require(set(selected) == set(bindings), "archive-inputs")
+    budget.remaining()
+    return selected, {"archive_bytes": len(content), "archive_unpacked_bytes": len(unpacked),
+                      "archive_members": count, "archive_sha256": digest(content),
+                      "archive_canonicalized_paths": canonicalized}
+
+
 def acquire(data, root=ROOT):
-    """Reuse the native provider's verified files and bounded, non-redirecting Git-object reader."""
+    """Reuse verified provider inputs, then prove one bounded public archive against the native Git tree."""
     sources.verify_inputs(root)
     sources.verify_provider(root)
     accepted = sources.input_bindings(sources.validate_catalog(sources.CATALOG))
@@ -207,24 +347,17 @@ def acquire(data, root=ROOT):
         else:
             missing.append(entry)
     require(len(contents) == 10 and len(missing) == 29, "shared-input-inventory")
-    overall, requests, response_bytes = sources.Budget(), 0, 0
-    # Each independent native budget admits at most 32 GETs/4 MiB/180 seconds. Two
-    # fixed batches suffice; an outer native deadline bounds the complete acquisition.
-    for offset in range(0, len(missing), 28):
-        overall.remaining()
-        part = {**data["sources"][0], "files": missing[offset:offset + 28]}
-        client = sources.ReadOnlyClient({"sources": [part]})
-        snapshot = sources.GitSnapshot(client, part, 335295566)
-        require(snapshot.root == SOURCE_TREE, "source-tree-binding")
-        for entry in part["files"]:
-            overall.remaining()
-            contents[entry["path"]] = snapshot.blob(entry)
-        requests += client.budget.requests
-        response_bytes += client.budget.bytes
-    overall.remaining()
+    client = sources.ReadOnlyClient(data)
+    snapshot = sources.GitSnapshot(client, data["sources"][0], 335295566)
+    require(snapshot.root == SOURCE_TREE, "source-tree-binding")
+    downloaded, archive = archive_contents(fetch_archive(client), snapshot, {entry["path"]: entry for entry in missing})
+    contents.update(downloaded)
+    client.budget.remaining()
+    require(client.budget.requests == 4, "acquisition-count")
     return contents, {
-        "mode": "native-public-git-object-get", "requests": requests, "response_bytes": response_bytes,
-        "reused_provider_inputs": 10, "elapsed_seconds": round(time.monotonic() - overall.started, 3),
+        "mode": "native-public-git-tree-and-archive-get", "requests": client.budget.requests,
+        "api_requests": 3, "archive_requests": 1, "response_bytes": client.budget.bytes,
+        "reused_provider_inputs": 10, "elapsed_seconds": client.budget.clock() - client.budget.started, **archive,
     }
 
 
@@ -235,6 +368,7 @@ def prepare(root=ROOT, offline_source=None):
         verify_sources(root)
         verify_acquisition(root)
         return {"event": "money_client_inputs", "status": "verified_existing", "inputs": 39, "requests": 0}
+    require(not owned(root, AREA / "acquisition.json").exists(), "acquisition-output-partial")
     if offline_source is None:
         contents, provenance = acquire(data, root)
     else:
@@ -252,7 +386,7 @@ def prepare(root=ROOT, offline_source=None):
     owned(root, stage).rename(target)
     verify_sources(root)
     receipt = {
-        "schema": "pennilogic.api-money-client-acquisition/1", "source_ref": SOURCE,
+        "schema": "pennilogic.api-money-client-acquisition/" + ("1" if offline_source is not None else "2"), "source_ref": SOURCE,
         "source_tree": SOURCE_TREE, "catalog_sha256": CATALOG_SHA256, "inputs": 39, **provenance,
     }
     write_json(root, AREA / "acquisition.json", receipt)
@@ -316,7 +450,19 @@ def validate_transport(data, expected, *, compare_values=True, rejections=False)
         else:
             require(type(row["envelope"]) is dict and set(row["envelope"]) == {"total", "recorded_at", "booked_on"}, "envelope-shape")
             if compare_values:
-                require(row["envelope"] == expected["cases"][index]["envelope"], "wire-disagreement")
+                require(json_bytes(row["envelope"]) == json_bytes(expected["cases"][index]["envelope"]), "wire-disagreement")
+    return data
+
+
+def validate_disagreement(data, expected):
+    validate_transport(data, expected, compare_values=False)
+    require(expected["case_count"] >= 2, "fault-scope")
+    first = expected["cases"][0]["envelope"]
+    replacement = expected["cases"][1]["envelope"]["total"]
+    require(json_bytes(first["total"]) != json_bytes(replacement), "fault-not-planted")
+    planted = {**first, "total": replacement}
+    require(json_bytes(data["cases"][0]["envelope"]) == json_bytes(planted), "fault-not-planted")
+    require(json_bytes(data["cases"][1:]) == json_bytes(expected["cases"][1:]), "fault-scope")
     return data
 
 
@@ -388,11 +534,33 @@ def verify_default_outputs(root, source, pl):
 
 def backend_launch(root=ROOT):
     launch = read_json(owned(root, AREA / "backend-launch.json"))
-    require(type(launch) is dict and set(launch) == {"java", "classpath"}, "backend-launch-shape")
+    require(type(launch) is dict and set(launch) == {"java", "classpath", "python", "node", "npm"}, "backend-launch-shape")
     require(type(launch["java"]) is str and Path(launch["java"]).is_absolute()
             and Path(launch["java"]).name in {"java", "java.exe"} and Path(launch["java"]).is_file(), "backend-java")
+    require(launch["python"] == str(Path(sys.executable).absolute()), "backend-python")
+    for key in ("node", "npm"):
+        require(type(launch[key]) is str and Path(launch[key]).is_absolute()
+                and Path(launch[key]).is_file(), "backend-runtime")
     classpath(launch["classpath"])
     return launch
+
+
+def node_runtime(explicit=None):
+    if explicit is not None:
+        candidates = [explicit]
+    elif os.name == "nt":
+        candidates = [Path(process_budget.system_paths()[0].anchor) / "Program Files/nodejs/node.exe"]
+    else:
+        candidates = [Path("/usr/local/bin/node"), Path("/usr/bin/node")]
+    node = next((Path(path).absolute() for path in candidates if Path(path).is_absolute() and Path(path).is_file()), None)
+    require(node is not None and node.name in {"node", "node.exe"}, "node-missing")
+    candidates = [node.parent / "node_modules/npm/bin/npm-cli.js",
+                  node.parent.parent / "lib/node_modules/npm/bin/npm-cli.js"]
+    if os.name != "nt":
+        candidates.append(Path("/usr/share/nodejs/npm/bin/npm-cli.js"))
+    npm = next((path for path in candidates if path.is_file()), None)
+    require(npm is not None, "npm-missing")
+    return str(node), str(npm)
 
 
 def classpath(paths):
@@ -436,47 +604,75 @@ DISAGREEMENT = {"event": "money_client_backend", "status": "refused", "code": "w
 
 
 class Runner:
-    def __init__(self, root, directory):
+    def __init__(self, root, directory, *, runtime=None, inherit_tree=False):
         self.root, self.directory = root, directory
         self.started, self.records = time.monotonic(), []
+        self.runtime, self.inherit_tree = runtime or {}, inherit_tree
+
+    def child_environment(self, label):
+        support = {key: value for key, value in os.environ.items() if key in process_budget.ENVIRONMENT_KEYS}
+        java = label.startswith(("generator-", "backend-", "kotlin-")) or label in {"toolchain-probe", "compile-kotlin"}
+        if java and self.runtime.get("java"):
+            support["JAVA_HOME"] = str(Path(self.runtime["java"]).parent.parent)
+        elif not java:
+            support.pop("JAVA_HOME", None)
+            support.pop("GRADLE_USER_HOME", None)
+        if java and "GRADLE_USER_HOME" not in support:
+            support["GRADLE_USER_HOME"] = str(Path.home() / ".gradle")
+        home = owned(self.root, self.directory / "home")
+        temporary = owned(self.root, self.directory / "tmp")
+        home.mkdir(parents=True, exist_ok=True)
+        temporary.mkdir(parents=True, exist_ok=True)
+        support.update(HOME=str(home), USERPROFILE=str(home), TEMP=str(temporary),
+                       TMP=str(temporary), TMPDIR=str(temporary))
+        directories = []
+        if (label.startswith("typescript-") or label == "compile-typescript") and self.runtime.get("node"):
+            directories.append(Path(self.runtime["node"]).parent)
+        return process_budget.environment(support, runtime_dirs=directories)
 
     def call(self, label, argv, *, cwd=None, expected=0, protocol=None, readiness=False):
         require(label not in {record["label"] for record in self.records}, "command-identity")
         argv = [str(arg) for arg in argv]
         start = time.monotonic()
-        environment = dict(os.environ)
-        for name in ("GH_TOKEN", "GITHUB_TOKEN", "NODE_OPTIONS", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP"):
-            environment.pop(name, None)
+        environment = self.child_environment(label)
+        failure, observed = None, None
         try:
-            result = subprocess.run(
-                argv, cwd=cwd or self.root, env=environment, capture_output=True,
-                timeout=max(0.001, SECONDS - (start - self.started)), check=False,
+            result = process_budget.run(
+                argv, cwd or self.root, max(0.001, SECONDS - (start - self.started)), capture=True,
+                env=environment, separate=True, inherit_tree=self.inherit_tree,
             )
             executed, code, stdout, stderr = True, result.returncode, result.stdout, result.stderr
         except FileNotFoundError:
             executed, code, stdout, stderr = False, None, b"", b""
-        except subprocess.TimeoutExpired:
-            raise InteropError("process-budget") from None
+        except process_budget.BudgetExceeded as error:
+            executed, code, stdout, stderr = True, None, error.output or b"", error.stderr or b""
+            observed = error.streams
+            failure = "command-output-size" if isinstance(error, process_budget.OutputExceeded) else "process-budget"
         record = {
             "label": label, "argv": argv, "cwd": str(cwd or self.root), "executed": executed,
             "exit_code": code, "expected_exit": expected, "readiness_probe": readiness,
-            "elapsed_seconds": round(time.monotonic() - start, 6),
+            "elapsed_seconds": round(time.monotonic() - start, 6), "environment": environment,
         }
-        safe_protocol = protocol is None or (stdout == b"" if protocol[0] is None else self.matches(stdout, protocol[0]))
-        if protocol is not None:
+        safe_protocol = failure is None and (protocol is None or (stdout == b"" if protocol[0] is None else self.matches(stdout, protocol[0])))
+        if protocol is not None and safe_protocol:
             safe_protocol = safe_protocol and (stderr == b"" if protocol[1] is None else self.matches(stderr, protocol[1]))
         for name, content in (("stdout", stdout), ("stderr", stderr)):
-            stream = {"bytes": len(content), "sha256": digest(content), "path": None}
+            stream = {**(observed[name] if observed is not None else {"bytes": len(content), "sha256": digest(content)}),
+                      "path": None}
             # Unexpected runtime output is hash-only: even a broken bridge cannot log Money.
             if safe_protocol and len(content) <= MAX_DOCUMENT:
                 path = self.directory / "commands" / f"{len(self.records):02d}-{label}.{name}.txt"
                 write_file(self.root, path, content)
                 stream["path"] = path.as_posix()
             record[name] = stream
+        if failure is not None:
+            record.update(capture_complete=False, failure=failure)
         self.records.append(record)
         write_json(self.root, self.directory / "commands" / f"{len(self.records) - 1:02d}-{label}.json", record)
+        require(failure is None, failure)
         require(safe_protocol, "command-protocol")
-        require(len(stdout) <= MAX_DOCUMENT and len(stderr) <= MAX_DOCUMENT, "command-output-size")
+        require(len(stdout) <= MAX_DOCUMENT and len(stderr) <= MAX_DOCUMENT
+                and len(stdout) + len(stderr) <= MAX_DOCUMENT, "command-output-size")
         if not readiness:
             require(executed and code == expected, "command-failed-" + label)
         return code, stdout, stderr
@@ -504,16 +700,17 @@ def prepare_tools(root, runner, producer_dir):
         platform = "windows_amd64" if os.name == "nt" else "linux_amd64"
         require(record == {"binary_sha256": binding(binary)["sha256"],
                            "tarball_sha256": pins["oasdiff"]["assets"][platform]["sha256"]}, "tool-cache-tampered")
-    probe = runner.call("toolchain-probe", [sys.executable, "-I", "-B", producer_dir / "scripts/toolchain.py", "verify"], readiness=True)
+    probe = runner.call("toolchain-probe", [sys.executable, "-I", "-S", "-B", producer_dir / "scripts/toolchain.py", "verify"], readiness=True)
     require(probe[0] == 0 or not (jar.exists() and binary.exists()), "toolchain-refused")
     return pins
 
 
 def runtime_dependencies(root, directory, runner, producer_dir, pins):
-    interpreter = owned(root, AREA / "venv" / ("Scripts" if os.name == "nt" else "bin")) / ("python.exe" if os.name == "nt" else "python")
-    if interpreter.is_symlink():
-        require(os.name != "nt" and interpreter.resolve() == Path(sys.executable).resolve(), "python-runtime-link")
-    require(not interpreter.is_junction(), "python-runtime-link")
+    require(re.fullmatch(r"[0-9a-f]{32}", directory.name), "runtime-identity")
+    base = AREA / "runtimes" / directory.name
+    require(not owned(root, base).exists(), "runtime-storage-exists")
+    owned(root, base).mkdir(parents=True)
+    interpreter = owned(root, base / "venv" / ("Scripts" if os.name == "nt" else "bin")) / ("python.exe" if os.name == "nt" else "python")
     requirements = producer_dir / "smoke/python/requirements.txt"
     versions = re.findall(r"^([A-Za-z0-9_.-]+)==([A-Za-z0-9_.-]+)", read_file(requirements).decode("utf-8"), re.MULTILINE)
     require(versions and len(dict(versions)) == len(versions), "python-lock")
@@ -527,42 +724,61 @@ def runtime_dependencies(root, directory, runner, producer_dir, pins):
         "print(json.dumps({'missing':len(missing),'wrong':len(wrong)}))\n"
         "sys.exit(1 if wrong else (3 if missing else 0))\n"
     )
-    command = [interpreter, "-I", "-B", "-c", probe_code, json.dumps(versions)]
-    probe = runner.call("python-probe", command, readiness=True)
-    if probe[0] is None:
-        require(not owned(root, AREA / "venv").exists(), "python-runtime-partial")
-        runner.call("python-venv", [sys.executable, "-I", "-B", "-m", "venv", owned(root, AREA / "venv")])
-    if probe[0] in (None, 3):
-        runner.call("python-install", [
-            interpreter, "-I", "-B", "-m", "pip", "install", "--quiet", "--disable-pip-version-check",
-            "--require-hashes", "--no-deps", "--only-binary", ":all:", "-r", requirements,
-        ])
-        runner.call("python-ready", command, protocol=({"missing": 0, "wrong": 0}, None))
-    else:
-        require(probe[0] == 0 and Runner.matches(probe[1], {"missing": 0, "wrong": 0}), "python-runtime-refused")
-    node = shutil.which("node")
-    require(node is not None, "node-missing")
-    tsc = owned(root, AREA / "producer/node_modules/typescript/bin/tsc")
-    node_probe = runner.call("typescript-probe", [node, tsc, "--version"], readiness=True)
-    if node_probe[0] != 0:
-        require(not tsc.exists(), "typescript-runtime-refused")
-        npm = shutil.which("npm.cmd" if os.name == "nt" else "npm")
-        require(npm is not None, "npm-missing")
-        command = [os.environ.get("ComSpec", "cmd.exe"), "/c", npm] if os.name == "nt" else [npm]
-        runner.call("typescript-install", [*command, "ci", "--ignore-scripts", "--no-audit", "--no-fund", "--quiet"], cwd=producer_dir)
-        node_probe = runner.call("typescript-ready", [node, tsc, "--version"])
+    missing_probe = [sys.executable, "-I", "-S", "-B", "-c",
+                     "import pathlib,sys;sys.exit(0 if pathlib.Path(sys.argv[1]).exists() else 3)"]
+    probe = runner.call("python-probe", [*missing_probe, interpreter], readiness=True)
+    require(probe[0] == 3, "python-runtime-not-fresh")
+    runner.call("python-venv", [sys.executable, "-I", "-S", "-B", "-m", "venv", "--copies", owned(root, base / "venv")])
+    runner.call("python-install", [
+        interpreter, "-I", "-B", "-m", "pip", "--isolated", "install", "--quiet", "--disable-pip-version-check",
+        "--no-cache-dir", "--no-compile", "--require-hashes", "--no-deps", "--only-binary", ":all:", "-r", requirements,
+    ])
+    runner.call("python-ready", [interpreter, "-I", "-B", "-c", probe_code, json.dumps(versions)],
+                protocol=({"missing": 0, "wrong": 0}, None))
+    node, npm = runner.runtime["node"], runner.runtime["npm"]
+    project = owned(root, base / "node")
+    for name in ("package.json", "package-lock.json", ".npmrc"):
+        write_file(root, base / "node" / name, read_file(producer_dir / name))
+    tsc = owned(root, base / "node/node_modules/typescript/bin/tsc")
+    probe = runner.call("typescript-probe", [*missing_probe, tsc], readiness=True)
+    require(probe[0] == 3, "typescript-runtime-not-fresh")
+    runner.call("typescript-install", [
+        node, npm, "ci", "--ignore-scripts", "--no-audit", "--no-fund", "--quiet", "--bin-links=false",
+        "--engine-strict", "--userconfig", project / ".npmrc", "--cache", owned(root, base / "npm-cache"),
+    ], cwd=project)
+    node_probe = runner.call("typescript-ready", [node, tsc, "--version"])
     require(node_probe[1].decode("utf-8").strip() == "Version " + pins["typescript"]["version"], "typescript-version")
+    write_json(root, directory / "runtime-inputs.json", runtime_inputs(root, directory, runner.runtime))
     bridge = write_file(root, directory / "bridge/typescript.ts", read_file(owned(root, FIXTURES / "typescript.ts")))
     config = read_json(producer_dir / "smoke/typescript/tsconfig.json")
     config["compilerOptions"].update({
         "rootDir": str(owned(root, directory)), "outDir": str(owned(root, directory / "typescript")),
-        "typeRoots": [str(producer_dir / "node_modules/@types")],
+        "typeRoots": [str(project / "node_modules/@types")],
     })
     config["include"] = [str(owned(root, directory / "generated/typescript/src")) + "/**/*.ts", str(bridge)]
     config_path = write_json(root, directory / "tsconfig.json", config)
     runner.call("compile-typescript", [node, tsc, "-p", config_path])
     write_json(root, directory / "typescript/package.json", {"type": "module"})
     return interpreter, node
+
+
+def runtime_inputs(root, directory, runtime):
+    base = owned(root, AREA / "runtimes" / directory.name)
+    scripts = base / "venv" / ("Scripts" if os.name == "nt" else "bin")
+    library = base / "venv" / ("Lib" if os.name == "nt" else f"lib/python{sys.version_info.major}.{sys.version_info.minor}")
+    return {
+        "schema": "pennilogic.api-money-client-runtime-inputs/1",
+        "origin": "fresh-hash-required-wheels-and-npm-lock", "run_id": directory.name,
+        "python_config": binding(base / "venv/pyvenv.cfg"),
+        "python_scripts": inventory(scripts),
+        "python_packages": inventory(library / "site-packages", limit=16384),
+        "node_packages": inventory(base / "node", limit=16384),
+        "tools": {
+            key: {"path": runtime[key], "resolved_path": str(Path(runtime[key]).resolve(strict=True)),
+                  **binding(Path(runtime[key]).resolve(strict=True))}
+            for key in ("java", "python", "node", "npm")
+        },
+    }
 
 
 def compile_kotlin(root, directory, runner, producer_dir, java):
@@ -573,7 +789,7 @@ def compile_kotlin(root, directory, runner, producer_dir, java):
         "-Dinterop.root=" + str(owned(root, directory)), "-Dinterop.fixtures=" + str(owned(root, FIXTURES)),
         "moneyClientInteropCompile",
     ]
-    command = [os.environ.get("ComSpec", "cmd.exe"), "/c", project / "gradlew.bat"] if os.name == "nt" else ["sh", project / "gradlew"]
+    command = [process_budget.system_paths()[0] / "cmd.exe", "/c", project / "gradlew.bat"] if os.name == "nt" else ["/bin/sh", project / "gradlew"]
     runner.call("compile-kotlin", [*command, *arguments], cwd=project)
     launch = read_json(owned(root, directory / "kotlin-launch.json"))
     require(type(launch) is dict and set(launch) == {"classpath"}, "client-launch-shape")
@@ -581,7 +797,8 @@ def compile_kotlin(root, directory, runner, producer_dir, java):
 
 
 def required_commands():
-    labels = ["generator-golden", "generator-models", "compile-typescript", "compile-kotlin", "backend-emit", "backend-reject"]
+    labels = ["generator-golden", "generator-models", "python-venv", "python-install", "python-ready",
+              "typescript-install", "typescript-ready", "compile-typescript", "compile-kotlin", "backend-emit", "backend-reject"]
     for language in LANGUAGES:
         labels.extend(language + "-" + operation for operation in (
             "convert", "consume", "reject", "disagree", "refuse-disagreement", "recover", "consume-recovery",
@@ -604,8 +821,10 @@ def validate_commands(records):
     for record in records:
         require(set(record) == {
             "label", "argv", "cwd", "executed", "exit_code", "expected_exit", "readiness_probe",
-            "elapsed_seconds", "stdout", "stderr",
+            "elapsed_seconds", "environment", "stdout", "stderr",
         }, "commands-shape")
+        require(type(record["environment"]) is dict and set(record["environment"]) <= process_budget.ENVIRONMENT_KEYS
+                and all(type(value) is str for value in record["environment"].values()), "commands-environment")
         require(type(record["argv"]) is list and record["argv"]
                 and all(type(arg) is str and arg for arg in record["argv"]), "commands-argv")
         require(type(record["cwd"]) is str and Path(record["cwd"]).is_absolute(), "commands-cwd")
@@ -630,6 +849,7 @@ def validate_commands(records):
 def verify_commands(root, directory, records, run_id):
     validate_commands(records)
     protocols = {
+        "python-ready": ({"missing": 0, "wrong": 0}, None),
         "backend-emit": (receipt("backend", "emit", COUNT, run_id), None),
         "backend-reject": (receipt("backend", "reject", INVALID_COUNT, run_id), None),
     }
@@ -651,6 +871,9 @@ def verify_commands(root, directory, records, run_id):
             if record["label"] in protocols:
                 expected = protocols[record["label"]][offset]
                 require(content == b"" if expected is None else Runner.matches(content, expected), "command-receipt")
+            if record["label"] == "typescript-ready":
+                expected = ("Version " + read_json(owned(root, AREA / "inputs/toolchain/versions.json"))["typescript"]["version"]).encode("ascii")
+                require(content.strip() == expected if name == "stdout" else content == b"", "command-receipt")
 
 
 def verify_transports(root, directory, run_id):
@@ -662,10 +885,7 @@ def verify_transports(root, directory, run_id):
         for suffix in (".json", "-recovered.json"):
             validate_transport(read_json(owned(root, directory / (language + suffix))), expected)
         validate_transport(read_json(owned(root, directory / (language + "-rejected.json"))), invalid, rejections=True)
-        disagree = validate_transport(read_json(owned(root, directory / (language + "-disagreement.json"))),
-                                     expected, compare_values=False)
-        require(disagree["cases"][0]["envelope"] != expected["cases"][0]["envelope"], "fault-not-planted")
-        require(disagree["cases"][1:] == expected["cases"][1:], "fault-scope")
+        validate_disagreement(read_json(owned(root, directory / (language + "-disagreement.json"))), expected)
 
 
 def run_gate(root, run_id):
@@ -676,17 +896,19 @@ def run_gate(root, run_id):
     directory = AREA / "runs" / run_id
     require(not owned(root, directory).exists(), "run-reused")
     owned(root, directory).mkdir(parents=True)
-    runner = Runner(root, directory)
+    runner = Runner(root, directory, inherit_tree=True)
     prepare(root)
     sources.verify_provider(root)
     source = producer(root)
     pl = module_at("interop_accepted_pl", source / "scripts/pl_contracts.py")
     launch = backend_launch(root)
+    # The worker's outer budget owns the process group; inner commands must not escape it.
+    runner.runtime = launch
     initial_inputs = api_inputs(root)
     backend_bindings = classpath_bindings(launch["classpath"])
     pins = prepare_tools(root, runner, source)
     verify_default_outputs(root, source, pl)
-    generator = [sys.executable, "-I", "-B", source / "scripts/generate_clients.py"]
+    generator = [sys.executable, "-I", "-S", "-B", source / "scripts/generate_clients.py"]
     runner.call("generator-golden", [*generator, "--verify"], cwd=source)
     require(all(not (source / "build/generated" / language / MODELS[language]).exists() for language in LANGUAGES),
             "default-is-not-scratch")
@@ -738,9 +960,7 @@ def run_gate(root, run_id):
         validate_transport(read_json(rejected), invalid, rejections=True)
         disagreement = owned(root, directory / (language + "-disagreement.json"))
         convert("disagree", "disagree", emitted, disagreement, COUNT)
-        disagree = validate_transport(read_json(disagreement), expected, compare_values=False)
-        require(disagree["cases"][0]["envelope"] != expected["cases"][0]["envelope"], "fault-not-planted")
-        require(disagree["cases"][1:] == expected["cases"][1:], "fault-scope")
+        validate_disagreement(read_json(disagreement), expected)
         runner.call(language + "-refuse-disagreement", [*backend, "consume", corpus_file, disagreement, run_id],
                     expected=1, protocol=(None, DISAGREEMENT))
         recovered = owned(root, directory / (language + "-recovered.json"))
@@ -750,6 +970,8 @@ def run_gate(root, run_id):
                     protocol=(receipt("backend", "consume", COUNT, run_id), None))
         client.update({"round_trip": COUNT, "invalid_rejected": INVALID_COUNT, "disagreement_refused": True, "recovery": COUNT, "skipped": 0})
     require(api_inputs(root) == initial_inputs and classpath_bindings(launch["classpath"]) == backend_bindings, "inputs-changed-during-run")
+    require(json_bytes(read_json(owned(root, directory / "runtime-inputs.json"))) == json_bytes(runtime_inputs(root, directory, launch)),
+            "runtime-inputs-changed")
     producer(root)
     validate_commands(runner.records)
     report = {
@@ -813,6 +1035,8 @@ def verify(root=ROOT):
     require(report["inputs"] == api_inputs(root), "evidence-stale-inputs")
     require(report["backend_classpath"] == classpath_bindings(backend_launch(root)["classpath"]), "evidence-backend")
     require(report["client_classpath"] == classpath_bindings(read_json(owned(root, directory / "kotlin-launch.json"))["classpath"]), "evidence-client")
+    require(json_bytes(read_json(owned(root, directory / "runtime-inputs.json"))) == json_bytes(runtime_inputs(root, directory, backend_launch(root))),
+            "evidence-runtime-inputs")
     files = inventory(owned(root, directory))
     del files["report.json"]
     require(report["outputs"] == files, "evidence-outputs")
@@ -857,11 +1081,14 @@ def launch_run(root, args):
         write_json(root, AREA / "current.json", {"schema": REPORT_SCHEMA, "status": "running", "run_id": run_id}, replace=True)
         try:
             if args.java is not None:
+                node, npm = node_runtime(args.node)
                 write_json(root, AREA / "backend-launch.json", {
                     "java": args.java, "classpath": args.classpath.split(os.pathsep),
+                    "python": str(Path(sys.executable).absolute()), "node": node, "npm": npm,
                 }, replace=True)
-            completed = process_budget.run([sys.executable, "-I", "-B", str(Path(__file__).absolute()),
-                                            "_run", "--run-id", run_id], root, SECONDS)
+            completed = process_budget.run([sys.executable, "-I", "-S", "-B", str(Path(__file__).absolute()),
+                                            "_run", "--run-id", run_id], root, SECONDS,
+                                           env=process_budget.environment())
             require(completed.returncode == 0, "gate-refused")
             # The owned worker already verified every binding before returning. Recheck its
             # exact completion, not the entire inventory a second time outside the process budget.
@@ -878,12 +1105,14 @@ def main():
     parser.add_argument("--offline-source", type=Path)
     parser.add_argument("--backend-input-file", type=Path)
     parser.add_argument("--java")
+    parser.add_argument("--node", type=Path)
     parser.add_argument("--classpath")
     parser.add_argument("--run-id")
     args = parser.parse_args()
     try:
         require(args.offline_source is None or args.command == "prepare", "argument-mode")
         require(args.run_id is None or args.command == "_run", "argument-mode")
+        require(args.node is None or args.command == "run" and args.java is not None, "argument-mode")
         if args.java is not None or args.classpath is not None:
             require(args.command == "run" and args.java is not None and args.classpath is not None
                     and args.backend_input_file is None, "argument-mode")
