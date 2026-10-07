@@ -128,6 +128,91 @@ class MoneySourceGuardTest(unittest.TestCase):
         ])
         self.assertEqual([], guard.analyze("ContextualYield.java", source))
 
+    def test_java_contextual_package_qualifiers_preserve_shared_types(self):
+        for name_index, name in enumerate(("ordinary", "record", "sealed", "permits", "yield")):
+            for position, prefix in enumerate((name, f"fixture.{name}")):
+                for form, (type_name, declarators, names, unsafe) in enumerate((
+                    ("{package}.Holder<Double>", "temperature, amount", ["temperature", "amount"], ["amount"]),
+                    (
+                        "{package}.Holder<java.lang.Float>", "record = null, amount = null, balance = null",
+                        ["record", "amount", "balance"], ["amount", "balance"],
+                    ),
+                    (
+                        "{package}.Holder<java.util.Map<String, java.math.BigDecimal>>",
+                        "temperature = null, distance = null, amount = null, balance = null",
+                        ["temperature", "distance", "amount", "balance"], ["amount", "balance"],
+                    ),
+                    (
+                        "{package}.Holder<Double>[]", "temperature = null, amount = null",
+                        ["temperature", "amount"], ["amount"],
+                    ),
+                    (
+                        "{package}.Holder<Double>", "temperature[] = null, amount[] = null",
+                        ["temperature", "amount"], ["amount"],
+                    ),
+                    ("{package}.Holder<Long>", "temperature, amount, balance", ["temperature", "amount", "balance"], []),
+                    ("{package}.Money", "temperature = null, amount = null", ["temperature", "amount"], []),
+                    (
+                        "{package}.Holder<{package}.Money>", "temperature = null, amount = null",
+                        ["temperature", "amount"], [],
+                    ),
+                    ("{package}.Holder<Double>", "temperature, distance", ["temperature", "distance"], []),
+                )):
+                    package = f"{prefix}.case{form}"
+                    type_name = type_name.format(package=package)
+                    class_name = f"QualifiedContext{name_index}_{position}_{form}"
+                    source = (
+                        f"package {package}; final class Holder<T> {{}} final class Money {{}} "
+                        f"final class {class_name} {{ private {type_name} {declarators}; }}"
+                    )
+                    with self.subTest(package=package, type_name=type_name, declarators=declarators):
+                        self.assertEqual([("MG001", field) for field in unsafe], [
+                            (finding.rule, finding.field) for finding in guard.analyze(f"{class_name}.java", source)
+                        ])
+                        tokens = guard.tokenize(source)
+                        types = {token.text for token in guard.tokenize(type_name)}
+                        self.assertEqual([(field, types) for field in names], [
+                            (tokens[index].text, value)
+                            for index, value in guard.java_declaration_types(tokens).items()
+                        ])
+
+    def test_java_qualified_contextual_types_keep_nested_boundaries(self):
+        for name_index, name in enumerate(("record", "sealed", "permits", "yield")):
+            for form, body in enumerate((
+                "private {type} temperature = sample(1, 2), amount; "
+                "private static {type} sample(int left, int right) {{ return null; }}",
+                "private {type} @Marker({{1, 2}}) [] temperature = null, amount = null;",
+                "private {type} temperature @Marker(1) [] = null, amount @Marker({{1, 2}}) [] = null;",
+                "private {type} temperature = null, amount = null; "
+                "private {package}.Holder<Long> distance = null, balance = null;",
+                "private {package}.Holder<Long>.Nested<Double> temperature, amount;",
+                "int read(int mode) {{ return switch (mode) {{ default -> {{ "
+                "{type} temperature = null, amount = null; yield mode; }} }}; }}",
+            )):
+                package = f"{name}.edge{form}"
+                class_name = f"QualifiedBoundary{name_index}_{form}"
+                body = body.format(type=f"{package}.Holder<Double>", package=package)
+                source = (
+                    f"package {package}; final class Holder<T> {{ final class Nested<U> {{}} }} "
+                    f"final class {class_name} {{ "
+                    "@java.lang.annotation.Target(java.lang.annotation.ElementType.TYPE_USE) "
+                    "@interface Marker { int[] value(); } "
+                    f"{body} }}"
+                )
+                with self.subTest(package=package, body=body):
+                    self.assertEqual([("MG001", "amount")], [
+                        (finding.rule, finding.field) for finding in guard.analyze(f"{class_name}.java", source)
+                    ])
+                    tokens = guard.tokenize(source)
+                    declared = {
+                        tokens[index].text: types
+                        for index, types in guard.java_declaration_types(tokens).items()
+                    }
+                    self.assertIn("Double", declared["amount"])
+                    if form == 3:
+                        self.assertIn("Long", declared["balance"])
+                        self.assertNotIn("Double", declared["balance"])
+
     def test_java_later_declarators_survive_nested_initializers_and_array_dimensions(self):
         for declaration in (
             "double temperature = choose(1.0, choose(2.0, 3.0)), amount;",

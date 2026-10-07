@@ -198,7 +198,8 @@ Only a complete type at a declaration boundary supplies that shared type: shift 
 generic method calls in an initializer cannot replace it. Type-use annotation arguments are
 excluded from the type without losing the primitive, qualified or container type around them.
 Contextual keywords follow Java identifier rules: they may name variables even when they
-cannot start a declaration's type.
+cannot name a simple type. Segments qualifying a type follow package-name identifier rules,
+so a contextual package name does not discard the declaration's shared type.
 
 Money value-type operator dispatch is allowed: `left + right` when both values are Money is not
 raw integer arithmetic. The authoritative wrapper's own implementation remains the exact

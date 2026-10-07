@@ -335,10 +335,16 @@ def java_declaration_types(tokens):
         index = start
         while index < len(code) and code[index].text in JAVA_MODIFIERS:
             index += 1
-        if index >= len(code) or code[index].kind != "identifier" or code[index].text in JAVA_NON_TYPES:
+        if index >= len(code) or code[index].kind != "identifier":
             continue
         end = index + 1
+        valid_type = True
         while end < len(code):
+            # A qualifier may name a package rather than a restricted simple type.
+            non_types = JAVA_RESERVED_WORDS if code[end].text == "." else JAVA_NON_TYPES
+            if code[end - 1].text in non_types:
+                valid_type = False
+                break
             if code[end].text == "<":
                 following = java_group_end(code, end)
                 if following is None:
@@ -348,6 +354,8 @@ def java_declaration_types(tokens):
                 end += 2
             else:
                 break
+        if not valid_type:
+            continue
         while end + 1 < len(code) and code[end].text == "[" and code[end + 1].text == "]":
             end += 2
         if end >= len(code) or code[end].kind != "identifier" or code[end].text in JAVA_RESERVED_WORDS:
