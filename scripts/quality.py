@@ -39,7 +39,12 @@ MONEY_PRIMITIVE_TESTS = {
 def run(command, root=ROOT, capture=False, budget=None):
     print("+ " + subprocess.list2cmdline([str(part) for part in command]), flush=True)
     if budget is not None:
-        result = script_module("process_budget").run(command, root, budget, capture)
+        helper = script_module("process_budget")
+        directories = (
+            [Path(helper.system_paths()[0].anchor) / "Program Files/Docker/Docker/resources/bin"]
+            if os.name == "nt" else []
+        )
+        result = helper.run(command, root, budget, capture, env=helper.environment(runtime_dirs=directories))
     else:
         result = subprocess.run(
             command, cwd=root, text=True, encoding="utf-8", errors="replace",

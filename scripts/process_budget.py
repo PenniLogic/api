@@ -215,7 +215,11 @@ def run(command, root, seconds, capture=False, *, env=None, separate=False, inhe
 
     def terminate():
         if job is not None:
-            job.close()
+            try:
+                job.close()
+            finally:
+                if process.poll() is None:
+                    process.kill()
         elif inherit_tree:
             if process.poll() is None:
                 process.kill()
@@ -281,11 +285,16 @@ def run(command, root, seconds, capture=False, *, env=None, separate=False, inhe
     finally:
         if captured is not None:
             captured.stop.set()
-        if job is not None:
-            job.close()
-        if process is not None:
-            terminate()
-            process.wait(timeout=10)
-            for stream in (process.stdin, process.stdout, process.stderr):
-                if stream is not None:
-                    stream.close()
+        try:
+            if process is not None:
+                try:
+                    terminate()
+                finally:
+                    process.wait(timeout=10)
+            elif job is not None:
+                job.close()
+        finally:
+            if process is not None:
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()

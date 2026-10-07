@@ -94,6 +94,18 @@ absolute executable first. The budgeted normal `quality.py build` supplies it
 through the shared helper; this requires no global PATH, hook or configuration
 change.
 
+The budgeted quality caller also admits the standard Windows Docker Desktop CLI
+directory on the approved system drive (`Program Files\Docker\Docker\resources\bin`).
+It does not inherit arbitrary ambient PATH entries or startup/credential options.
+If Windows Job attachment fails before release, the helper terminates and reaps
+the exact owned bootstrap and closes its pipes; the interop launcher records a
+refusal rather than leaving completion `running`.
+
+Retained command exit metadata uses exact integers, including readiness probes.
+Only a genuinely unexecuted optional probe may have a null actual exit; its
+expected exit must still be an integer. A fresh missing-path probe's actual
+exit 3 with expected exit 0 remains valid and triggers preparation, not success.
+
 The accepted package requires Node `>=24.14.0 <25` and npm `>=11`.
 Configuring only Python/JDK, or prepending an arbitrary Node executable to PATH,
 does not satisfy the explicit runtime boundary above. The published

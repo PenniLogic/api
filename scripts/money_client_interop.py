@@ -848,10 +848,12 @@ def validate_commands(records):
         require(type(record.get("executed")) is bool and type(record.get("readiness_probe")) is bool, "commands-shape")
         duration = record.get("elapsed_seconds")
         require(type(duration) in (int, float) and math.isfinite(duration) and 0 <= duration < SECONDS, "commands-duration")
+        require(type(record["expected_exit"]) is int
+                and (type(record["exit_code"]) is int if record["executed"]
+                     else record["readiness_probe"] and record["exit_code"] is None), "commands-failed")
         if not record["readiness_probe"]:
             expected = 1 if record["label"].endswith("-refuse-disagreement") else 0
-            require(record["executed"] and type(record.get("exit_code")) is int
-                    and type(record["expected_exit"]) is int
+            require(record["executed"]
                     and record["exit_code"] == record["expected_exit"] == expected, "commands-failed")
         require(record["label"] not in required or not record["readiness_probe"], "commands-skipped")
         require(record["readiness_probe"] == (record["label"] in {"toolchain-probe", "python-probe", "typescript-probe"}),

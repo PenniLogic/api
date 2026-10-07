@@ -1032,6 +1032,39 @@ class RunnerBoundaryTest(InteropTest):
 
 
 class ExecutionEvidenceTest(InteropTest):
+    def test_readiness_records_require_exact_exit_integer_types(self):
+        for label, field, value in (
+            ("toolchain-probe", "exit_code", False),
+            ("python-probe", "exit_code", 3.0),
+            ("typescript-probe", "expected_exit", False),
+            ("toolchain-probe", "expected_exit", 0.0),
+            ("python-probe", "exit_code", True),
+            ("typescript-probe", "exit_code", "3"),
+            ("toolchain-probe", "expected_exit", None),
+            ("python-probe", "exit_code", None),
+        ):
+            records = self.records()
+            records.append({**records[0], "label": label, "readiness_probe": True, field: value})
+            with self.subTest(label=label, field=field, value_type=type(value).__name__):
+                with self.assertRaisesRegex(interop.InteropError, "commands-failed"):
+                    interop.validate_commands(records)
+
+    def test_readiness_missing_paths_and_unexecuted_probes_have_coherent_metadata(self):
+        for label in ("toolchain-probe", "python-probe", "typescript-probe"):
+            for executed, code in ((True, 0), (True, 3), (False, None)):
+                records = self.records()
+                records.append({**records[0], "label": label, "readiness_probe": True,
+                                "executed": executed, "exit_code": code})
+                with self.subTest(label=label, executed=executed, code=code):
+                    interop.validate_commands(records)
+            for executed, code in ((False, 0), (False, 3), (True, None)):
+                records = self.records()
+                records.append({**records[0], "label": label, "readiness_probe": True,
+                                "executed": executed, "exit_code": code})
+                with self.subTest(label=label, executed=executed, code=code):
+                    with self.assertRaisesRegex(interop.InteropError, "commands-failed"):
+                        interop.validate_commands(records)
+
     def test_stored_command_records_preserve_boolean_and_numeric_types(self):
         records = self.records()
         directory = Path("typed-records")
