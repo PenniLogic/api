@@ -932,6 +932,23 @@ class MutationNativeConsoleTest(unittest.TestCase):
 
 
 class ProcessBudgetTest(unittest.TestCase):
+    def test_pipe_read_errors_cannot_become_successful_capture(self):
+        for error in (OSError, ValueError):
+            class BrokenStream:
+                def read(self, _count):
+                    raise error("synthetic-closed-stream")
+
+            class Process:
+                stdout, stderr = BrokenStream(), None
+
+            with self.subTest(error=error.__name__), patch.object(process_budget.threading, "excepthook") as diagnostic:
+                capture = process_budget.Capture(Process())
+                for thread in capture.threads:
+                    thread.join(timeout=1)
+                    self.assertFalse(thread.is_alive())
+                self.assertTrue(capture.failed, "read-error-was-not-recorded")
+                diagnostic.assert_not_called()
+
     def test_approved_system_shell_survives_without_inheriting_ambient_path(self):
         command = (["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Write-Output 'approved-shell'"]
                    if os.name == "nt" else ["/bin/sh", "-c", "printf 'approved-shell\\n'"])

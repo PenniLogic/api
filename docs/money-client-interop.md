@@ -88,6 +88,11 @@ search the ambient PATH. Its environment is filtered before Python starts with
 The paired npm CLI is resolved beside that installation or from the standard
 Linux npm package location. The accepted Node/npm versions must already be
 installed; the gate neither downloads a system runtime nor changes hosted setup.
+For a standalone workstation `quality.py gate-self-test` without setup-python's
+`pythonLocation`, set the process-local `PENNILOGIC_PYTHON` to that approved
+absolute executable first. The budgeted normal `quality.py build` supplies it
+through the shared helper; this requires no global PATH, hook or configuration
+change.
 
 The original cold path exhausted the shared anonymous REST quota: Money
 preparation makes 17 requests and database preparation makes 28; adding 35
@@ -181,8 +186,11 @@ host-tool paths. It is compared before/after client execution and during offline
 verification. Host-managed runtime aliases may resolve to their actual binary;
 this does not relax the no-link rule for owned inputs, packages or outputs.
 The accepted Gradle wrapper, dependency verification metadata and explicitly
-selected Gradle cache remain in use; compilation cache hits must still be
-reported honestly. No shared cache is cleaned and no service, paid runner,
+selected dependency cache remain in use. The generated Kotlin model compiles
+in each new run with `--no-build-cache --rerun-tasks`; both live and retained
+evidence require the real compiler task execution, not `FROM-CACHE`,
+`UP-TO-DATE`, `NO-SOURCE` or a skipped task. Historical cache-restored model
+runs remain labeled as such. No shared cache is cleaned and no service, paid runner,
 release, CI dispatch, publication or deployment is involved.
 
 Every child receives a positive, command-specific environment, not an inherited
@@ -222,7 +230,10 @@ reports cannot stand in for the strengthened execution boundary.
 
 Live and retained/offline transports compare nested values through the existing
 canonical JSON helper, not Python container equality: Boolean, integer and
-floating-point neighbors remain distinct. A shared negative-control validator
+floating-point neighbors remain distinct. Retained source/classpath/output
+binding maps and each on-disk command record use the same type-preserving
+comparison; rehashing malformed byte counts or numeric execution flags cannot
+make them match their correctly typed counterparts. A shared negative-control validator
 requires exactly the first envelope's `total` to be replaced by the known valid
 second case's Money. Both time fields, every other first-case field and all
 later rows must remain exact. A date-only change, malformed/numeric Money or
@@ -240,6 +251,8 @@ it is not checked only after an unbounded `communicate()` allocation. An overflo
 or timeout retains static failure metadata and observed-prefix byte counts and
 hashes only, marks capture incomplete and cannot form a passing command receipt.
 Output exactly at the limit remains valid. Capture errors fail explicitly.
+The same aggregate stream-size constraint is enforced on retained command
+receipts; independently bounded streams cannot combine into oversized evidence.
 The report's `elapsed_seconds` covers execution and binding collection before
 final verification; the success event and external command timing include that
 verification. Neither is hosted job/workflow timing.

@@ -133,7 +133,7 @@ class Capture:
                         self.exceeded = True
                         self.stop.set()
                 self.changed.set()
-        except OSError:
+        except (OSError, ValueError):
             if not self.stop.is_set():
                 self.failed = True
         finally:

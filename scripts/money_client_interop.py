@@ -784,13 +784,15 @@ def runtime_inputs(root, directory, runtime):
 def compile_kotlin(root, directory, runner, producer_dir, java):
     project = producer_dir / "smoke/kotlin"
     arguments = [
-        "--no-daemon", "--no-configuration-cache", "--console=plain", "-Pkotlin.compiler.execution.strategy=in-process",
+        "--no-daemon", "--no-configuration-cache", "--no-build-cache", "--rerun-tasks",
+        "--console=plain", "-Pkotlin.compiler.execution.strategy=in-process",
         "--project-cache-dir", owned(root, AREA / "kotlin-cache"), "--init-script", owned(root, FIXTURES / "kotlin.init.gradle"),
         "-Dinterop.root=" + str(owned(root, directory)), "-Dinterop.fixtures=" + str(owned(root, FIXTURES)),
         "moneyClientInteropCompile",
     ]
     command = [process_budget.system_paths()[0] / "cmd.exe", "/c", project / "gradlew.bat"] if os.name == "nt" else ["/bin/sh", project / "gradlew"]
-    runner.call("compile-kotlin", [*command, *arguments], cwd=project)
+    compiled = runner.call("compile-kotlin", [*command, *arguments], cwd=project)
+    require(compiled[1].splitlines().count(b"> Task :compileKotlin") == 1, "command-compiler-unexecuted")
     launch = read_json(owned(root, directory / "kotlin-launch.json"))
     require(type(launch) is dict and set(launch) == {"classpath"}, "client-launch-shape")
     return [java, "-cp", classpath(launch["classpath"]), "com.pennilogic.interop.MoneyClientInteropGenerated"]
@@ -827,6 +829,9 @@ def validate_commands(records):
                 and all(type(value) is str for value in record["environment"].values()), "commands-environment")
         require(type(record["argv"]) is list and record["argv"]
                 and all(type(arg) is str and arg for arg in record["argv"]), "commands-argv")
+        if record["label"] == "compile-kotlin":
+            require("--no-build-cache" in record["argv"] and "--rerun-tasks" in record["argv"],
+                    "commands-compiler-cache")
         require(type(record["cwd"]) is str and Path(record["cwd"]).is_absolute(), "commands-cwd")
         require(type(record.get("executed")) is bool and type(record.get("readiness_probe")) is bool, "commands-shape")
         duration = record.get("elapsed_seconds")
@@ -844,6 +849,7 @@ def validate_commands(records):
             require(type(stream) is dict and set(stream) == {"path", "bytes", "sha256"}, "commands-stream")
             require(type(stream["path"]) is str and type(stream["bytes"]) is int and 0 <= stream["bytes"] <= MAX_DOCUMENT
                     and type(stream["sha256"]) is str and sources.DIGEST.fullmatch(stream["sha256"]), "commands-stream")
+        require(record["stdout"]["bytes"] + record["stderr"]["bytes"] <= MAX_DOCUMENT, "commands-stream")
 
 
 def verify_commands(root, directory, records, run_id):
@@ -861,7 +867,8 @@ def verify_commands(root, directory, records, run_id):
         protocols[language + "-refuse-disagreement"] = (None, DISAGREEMENT)
     for index, record in enumerate(records):
         prefix = directory / "commands" / f"{index:02d}-{record['label']}"
-        require(read_json(owned(root, Path(str(prefix) + ".json"))) == record, "command-record-binding")
+        require(json_bytes(read_json(owned(root, Path(str(prefix) + ".json")))) == json_bytes(record),
+                "command-record-binding")
         for offset, name in enumerate(("stdout", "stderr")):
             path = Path(str(prefix) + "." + name + ".txt")
             stream = record[name]
@@ -874,6 +881,8 @@ def verify_commands(root, directory, records, run_id):
             if record["label"] == "typescript-ready":
                 expected = ("Version " + read_json(owned(root, AREA / "inputs/toolchain/versions.json"))["typescript"]["version"]).encode("ascii")
                 require(content.strip() == expected if name == "stdout" else content == b"", "command-receipt")
+            if record["label"] == "compile-kotlin" and name == "stdout":
+                require(content.splitlines().count(b"> Task :compileKotlin") == 1, "command-receipt")
 
 
 def verify_transports(root, directory, run_id):
@@ -1032,14 +1041,16 @@ def verify(root=ROOT):
         "case_count": COUNT, "generated_count": 10000, "boundary_count": 30, "invalid_count": INVALID_COUNT,
     }.items()), "evidence-count")
     require(report["currencies"] == ["INR", "JPY", "KWD"] and report["default_money_model_emitted"] is False, "evidence-scope")
-    require(report["inputs"] == api_inputs(root), "evidence-stale-inputs")
-    require(report["backend_classpath"] == classpath_bindings(backend_launch(root)["classpath"]), "evidence-backend")
-    require(report["client_classpath"] == classpath_bindings(read_json(owned(root, directory / "kotlin-launch.json"))["classpath"]), "evidence-client")
+    require(json_bytes(report["inputs"]) == json_bytes(api_inputs(root)), "evidence-stale-inputs")
+    require(json_bytes(report["backend_classpath"]) == json_bytes(classpath_bindings(backend_launch(root)["classpath"])),
+            "evidence-backend")
+    require(json_bytes(report["client_classpath"]) == json_bytes(classpath_bindings(
+        read_json(owned(root, directory / "kotlin-launch.json"))["classpath"])), "evidence-client")
     require(json_bytes(read_json(owned(root, directory / "runtime-inputs.json"))) == json_bytes(runtime_inputs(root, directory, backend_launch(root))),
             "evidence-runtime-inputs")
     files = inventory(owned(root, directory))
     del files["report.json"]
-    require(report["outputs"] == files, "evidence-outputs")
+    require(json_bytes(report["outputs"]) == json_bytes(files), "evidence-outputs")
     verify_commands(root, directory, report["commands"], report["run_id"])
     verify_transports(root, directory, report["run_id"])
     require(type(report["languages"]) is list and [client["target"] for client in report["languages"]] == list(LANGUAGES), "evidence-languages")

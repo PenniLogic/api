@@ -205,12 +205,37 @@ concrete shared type. Known Money aliases remain allowed; numeric and unresolved
 initializers retain the existing refusals. Legal variable or package names `var` stay supported.
 Raw minor-unit aliases still feed the arithmetic, conversion and numeric-serialization rules.
 
+Recognized Java declaration type positions are separate from money-named value identifiers.
+The same declaration boundaries distinguish imported `Money` type tokens in fields, locals,
+parameters and method returns, including annotated arrays, containers and generic methods.
+This is a positional distinction, not an exemption for the name `Money`: actual money-named
+values, initializers and annotation arguments retain their refusals and raw-alias tracking.
+The imported-type regression controls use the genuine Contracts type, not a replacement class.
+
+Java class/interface/record, generic-method and generic-constructor type parameters retain
+their declaration scopes and individual bounds. Legal method modifiers, including
+`synchronized`, `strictfp`, `abstract`, `native` and `default`, do not discard the generic
+scope. Constructors register their parameters without requiring a return type; the
+constructor's name is not a monetary value declaration. A simple parameter shadowing
+`Money` is not the imported wrapper: floating bounds refuse monetary declarations with `MG001`, and
+unbounded or unresolved monetary types retain `MG005`. Referenced bounds follow local
+chains, including forward references, in the bound's declaration environment; unrelated
+parameters do not taint a genuine Money return. Nested shadows end with their declarations.
+Qualified type names remain distinct from local parameters, and varargs dots are not a
+package qualifier. Shared declarators, arrays, parameters and raw aliases keep their rules.
+The regression controls include real compiler-valid shadows beside genuinely imported
+Money fields and safe bounds, including modifier-prefixed methods, constructor-local fields,
+constructor shadows of safe outer bounds and unresolved/raw-alias refusals. Recursive bounds
+cannot recover the wrapper by spelling alone.
+
 Money value-type operator dispatch is allowed: `left + right` when both values are Money is not
 raw integer arithmetic. The authoritative wrapper's own implementation remains the exact
 upstream source dependency, not a locally invented exception or duplicate type.
 
-This is a conservative lexical guard, not Kotlin compiler type resolution or complete
-interprocedural taint analysis. Naming rules and local aliases are tested; arbitrary indirect
+This is a conservative lexical guard, not JVM compiler type resolution or complete
+interprocedural taint analysis. Full inheritance/member and value-identifier scope resolution
+are outside this model; the recognized declaration shapes do not certify every Java grammar.
+Naming rules and local aliases are tested; arbitrary indirect
 factory return types and externally defined serializers still require the accepted provider,
 compiler checks and independent review. Neither scanned-file counts nor planted local failures
 prove native protected CI enforcement, cross-language interoperability or completion of API #1.

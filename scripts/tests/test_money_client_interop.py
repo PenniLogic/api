@@ -827,6 +827,26 @@ class RetainedTransportTest(InteropTest):
 
 
 class RunnerBoundaryTest(InteropTest):
+    def test_generated_kotlin_is_compiled_not_restored_from_an_executable_build_cache(self):
+        directory = Path(self.run_id)
+        interop.write_json(self.root, directory / "kotlin-launch.json", {"classpath": [str(self.root)]})
+        runner = mock.Mock()
+        runner.call.return_value = (0, b"> Task :compileKotlin\n", b"")
+        interop.compile_kotlin(self.root, directory, runner, self.root / "producer", "approved-java")
+        self.assertEqual(runner.call.call_args.args[0], "compile-kotlin")
+        arguments = runner.call.call_args.args[1]
+        self.assertIn("--no-build-cache", arguments)
+        self.assertIn("--rerun-tasks", arguments)
+
+    def test_zero_exit_without_actual_kotlin_compilation_is_refused(self):
+        directory = Path(self.run_id)
+        runner = mock.Mock()
+        for suffix in (b" FROM-CACHE", b" UP-TO-DATE", b" SKIPPED", b" NO-SOURCE"):
+            runner.call.return_value = (0, b"> Task :compileKotlin" + suffix + b"\n", b"")
+            with self.subTest(state=suffix.decode("ascii")):
+                with self.assertRaisesRegex(interop.InteropError, "command-compiler-unexecuted"):
+                    interop.compile_kotlin(self.root, directory, runner, self.root / "producer", "approved-java")
+
     def test_exact_stream_and_aggregate_limits_preserve_separate_bytes_and_recover(self):
         runner = interop.Runner(self.root, Path("exact-output-control"))
         for label, stdout, stderr in (("stdout-bound", interop.MAX_DOCUMENT, 0),
@@ -937,6 +957,67 @@ class RunnerBoundaryTest(InteropTest):
 
 
 class ExecutionEvidenceTest(InteropTest):
+    def test_stored_command_records_preserve_boolean_and_numeric_types(self):
+        records = self.records()
+        directory = Path("typed-records")
+        for name in ("stdout", "stderr"):
+            records[0][name]["path"] = (directory / "commands" / f"00-generator-golden.{name}.txt").as_posix()
+        for field, value in (("executed", 1), ("readiness_probe", 0), ("exit_code", 0.0)):
+            changed = {**records[0], field: value}
+            with self.subTest(field=field), \
+                    mock.patch.object(interop, "read_json", return_value=changed), \
+                    mock.patch.object(interop, "read_file", side_effect=AssertionError("untyped-record-reached-streams")):
+                with self.assertRaisesRegex(interop.InteropError, "command-record-binding"):
+                    interop.verify_commands(self.root, directory, records, self.run_id)
+
+    def test_retained_binding_maps_preserve_json_numeric_types(self):
+        bound = {"fixture": {"bytes": 0, "sha256": interop.digest(b"")}}
+        baseline = {
+            "scope": "api-test-only-generated-model-round-trip", "release_consumed": False,
+            "source_ref": interop.SOURCE, "source_tree": interop.SOURCE_TREE,
+            "catalog_sha256": interop.CATALOG_SHA256, "spec_version": "0.1.0",
+            "corpus_sha256": interop.CORPUS_SHA256, "canonical_sha256": interop.CANONICAL_SHA256,
+            "case_count": interop.COUNT, "generated_count": 10000, "boundary_count": 30,
+            "invalid_count": interop.INVALID_COUNT, "currencies": ["INR", "JPY", "KWD"],
+            "default_money_model_emitted": False, "run_id": self.run_id, "commands": [],
+            **{field: copy.deepcopy(bound) for field in ("inputs", "backend_classpath", "client_classpath", "outputs")},
+        }
+        causes = {
+            "inputs": "evidence-stale-inputs", "backend_classpath": "evidence-backend",
+            "client_classpath": "evidence-client", "outputs": "evidence-outputs",
+        }
+        for field, cause in causes.items():
+            for value in (False, 0.0):
+                report = copy.deepcopy(baseline)
+                report[field]["fixture"]["bytes"] = value
+                with self.subTest(field=field, replacement_type=type(value).__name__), contextlib.ExitStack() as stack:
+                    replacements = {
+                        "verify_sources": None, "completion": (Path("typed-bindings"), report),
+                        "api_inputs": bound, "backend_launch": {"classpath": ["fixture"]},
+                        "classpath_bindings": bound, "runtime_inputs": {},
+                        "inventory": {"report.json": {}, **bound},
+                    }
+                    for name, result in replacements.items():
+                        stack.enter_context(mock.patch.object(interop, name, return_value=result))
+                    stack.enter_context(mock.patch.object(interop.sources, "verify_provider"))
+                    stack.enter_context(mock.patch.object(
+                        interop, "read_json",
+                        side_effect=lambda path: {"classpath": ["fixture"]} if path.name == "kotlin-launch.json" else {},
+                    ))
+                    stack.enter_context(mock.patch.object(
+                        interop, "verify_commands", side_effect=AssertionError("untyped-bindings-reached-commands"),
+                    ))
+                    with self.assertRaisesRegex(interop.InteropError, cause):
+                        interop.verify(self.root)
+
+    def test_retained_command_streams_obey_the_same_aggregate_output_limit(self):
+        records = self.records()
+        records[0]["stdout"]["bytes"] = records[0]["stderr"]["bytes"] = interop.MAX_DOCUMENT // 2
+        interop.validate_commands(records)
+        records[0]["stderr"]["bytes"] += 1
+        with self.assertRaisesRegex(interop.InteropError, "commands-stream"):
+            interop.validate_commands(records)
+
     def records(self):
         return [
             {
@@ -944,7 +1025,7 @@ class ExecutionEvidenceTest(InteropTest):
                 "elapsed_seconds": 0.01,
                 "exit_code": 1 if label.endswith("-refuse-disagreement") else 0,
                 "expected_exit": 1 if label.endswith("-refuse-disagreement") else 0,
-                "argv": ["synthetic-command"], "cwd": str(self.root),
+                "argv": ["synthetic-command", "--no-build-cache", "--rerun-tasks"], "cwd": str(self.root),
                 "environment": {},
                 "stdout": {"path": "synthetic.stdout.txt", "bytes": 0, "sha256": interop.digest(b"")},
                 "stderr": {"path": "synthetic.stderr.txt", "bytes": 0, "sha256": interop.digest(b"")},
@@ -1013,6 +1094,8 @@ class ExecutionEvidenceTest(InteropTest):
                             content = interop.json_bytes({"missing": 0, "wrong": 0})
                         if record["label"] == "typescript-ready" and name == "stdout":
                             content = b"Version 7.0.2\n"
+                        if record["label"] == "compile-kotlin" and name == "stdout":
+                            content = b"> Task :compileKotlin\n"
                         if record["label"] == "backend-emit" and name == "stdout":
                             value = {**interop.receipt("backend", "emit", interop.COUNT, self.run_id), **change}
                             content = interop.json_bytes(value)
