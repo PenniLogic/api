@@ -132,6 +132,11 @@ preservation, absent-marker idempotence and malformed/failed-removal refusals.
 Its additional containers are create-only storage fixtures, not a second
 database harness.
 
+The cleanup test launcher follows `scripts\quality.py`: explicit `ComSpec` on
+Windows and `sh` for the non-executable POSIX wrapper. A native portability
+regression checks argument and exit-code preservation using its own wrapper
+fixture (mode `0644` on POSIX), without changing the tracked wrapper or its mode.
+
 Existing `test` and `integrationTest` selections execute all the new tests;
 `build` still invokes both. The existing `moneyTest`/PIT qualification inventory
 is unchanged: the new non-ledger consumer is in `com.pennilogic.testing`, not a

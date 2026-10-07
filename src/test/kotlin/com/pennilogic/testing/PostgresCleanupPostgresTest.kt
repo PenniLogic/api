@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.attribute.PosixFilePermissions
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.TimeUnit
@@ -102,6 +103,31 @@ class PostgresCleanupPostgresTest {
         assertTrue(Files.readString(marker) == missing, "failed-removal-retains-marker")
     }
 
+    @Test
+    fun `wrapper launcher preserves arguments and exit codes without requiring POSIX execute permission`() {
+        val fixture = Files.createDirectory(directory.resolve("wrapper"))
+        val windows = System.getProperty("os.name").startsWith("Windows")
+        val wrapper = fixture.resolve(if (windows) "gradlew.bat" else "gradlew")
+        val script =
+            if (windows) {
+                "@echo off\r\necho %~1\r\nexit /b %~2\r\n"
+            } else {
+                "#!/bin/sh\nprintf '%s\\n' \"\$1\"\nexit \"\$2\"\n"
+            }
+        Files.writeString(wrapper, script)
+        if (!windows) {
+            Files.setPosixFilePermissions(wrapper, PosixFilePermissions.fromString("rw-r--r--"))
+            assertTrue(!Files.isExecutable(wrapper), "fixture-wrapper-not-executable")
+        }
+        for (expected in listOf(0, 7)) {
+            val (exit, output) = run(wrapperLauncher(fixture) + listOf("argument with spaces", expected.toString()), 30)
+            assertTrue(exit == expected, "wrapper-exit-preserved")
+            assertTrue(output.trim() == "argument with spaces", "wrapper-argument-preserved")
+        }
+        assertTrue(Files.readString(wrapper) == script, "fixture-wrapper-unchanged")
+        if (!windows) assertTrue(!Files.isExecutable(wrapper), "fixture-wrapper-still-not-executable")
+    }
+
     private fun copyBuild() {
         for (name in listOf(
             "build.gradle.kts",
@@ -135,17 +161,18 @@ class PostgresCleanupPostgresTest {
     }
 
     private fun cleanup(expected: Int): String {
-        val launcher =
-            if (System.getProperty("os.name").startsWith("Windows")) {
-                listOf(requireNotNull(System.getenv("ComSpec")), "/d", "/c", root.resolve("gradlew.bat").toString())
-            } else {
-                listOf(root.resolve("gradlew").toString())
-            }
-        val command = launcher + listOf("--no-daemon", "--offline", "--console=plain", "stopMigrationTestPostgres")
+        val command = wrapperLauncher(root) + listOf("--no-daemon", "--offline", "--console=plain", "stopMigrationTestPostgres")
         val (exit, output) = run(command, 120)
         assertTrue(exit == expected, "native-cleanup-exit")
         return output
     }
+
+    private fun wrapperLauncher(directory: Path): List<String> =
+        if (System.getProperty("os.name").startsWith("Windows")) {
+            listOf(requireNotNull(System.getenv("ComSpec")), "/d", "/c", directory.resolve("gradlew.bat").toString())
+        } else {
+            listOf("sh", directory.resolve("gradlew").toString())
+        }
 
     private fun docker(vararg arguments: String): String {
         val (exit, output) = run(listOf("docker") + arguments, 30)
