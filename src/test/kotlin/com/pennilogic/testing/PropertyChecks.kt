@@ -80,6 +80,7 @@ internal fun <T> propertyCheck(
         clock,
         onObservation,
         inputsComparable = { samples?.comparable() ?: true },
+        inputBinding = samples?.let { { it.binding() } },
     ) { attempt ->
         samples?.begin(attempt)
         val arbitrary =
@@ -120,6 +121,9 @@ private class PropertySamples(
     }
 
     fun comparable(): Boolean = verified && original.isNotEmpty() && (!retry || position >= original.size)
+
+    fun binding(): List<String>? =
+        if (original.isEmpty() || original.any { it == null }) null else original.map { requireNotNull(it) { "property-sample-binding" } }
 
     private fun fingerprint(case: FixtureCase<*>): String? {
         val value =
@@ -290,13 +294,22 @@ private fun <T> checkPropertyAttempt(
     } finally {
         val elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
         val execution = PropertyExecution(id, seed, primary, passed, evaluations, families.toMap(), elapsed, completed)
+        var reported = false
         try {
             onResult(execution)
-        } catch (_: AssertionError) {
-            throw incomplete()
-        } finally {
-            println(execution.json())
+            reported = true
+        } catch (_: Throwable) {
+            // Reporter errors cannot replace callback assertions or expose their own payload.
         }
+        var emitted = false
+        try {
+            val output = System.out
+            output.println(execution.json())
+            emitted = !output.checkError()
+        } catch (_: Throwable) {
+            // Both throwing and PrintStream-swallowed output failures are incomplete execution.
+        }
+        if (!reported || !emitted) throw incomplete()
     }
 }
 

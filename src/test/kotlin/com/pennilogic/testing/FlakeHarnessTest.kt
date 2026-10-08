@@ -491,6 +491,81 @@ class FlakeHarnessTest {
     }
 
     @Test
+    fun `reporting failure cannot credit history before a later genuine flake`() {
+        var engines = 0
+        var reporterFails = true
+        val observations = mutableListOf<FlakeObservation>()
+        val runner =
+            propertyCheck(
+                "synthetic-reporting-history",
+                1,
+                {
+                    engines++
+                    fixture()
+                },
+                setOf("api_service"),
+                onObservation = {
+                    if (reporterFails) throw TestAbortedException("synthetic-private-reporter")
+                    observations.add(it)
+                },
+            ) { case -> case.verify("synthetic-original-assertion", engines % 2 == 0) }
+        val (failure, output) = capturePropertyOutput { assertThrows(AssertionError::class.java) { runner.run() } }
+        assertTrue(failure.message.orEmpty().contains("synthetic-original-assertion"))
+        assertTrue(failure.suppressed.any { it.message == "flake-observation-reporting-failed" })
+        val failedReport = event(output)
+        println(failedReport)
+        assertTrue(failedReport.contains("\"classification\":\"incomplete\""), "reporting-must-complete-before-credit")
+        assertTrue(failedReport.contains("\"flakes_in_window\":0"))
+        assertFalse((output + failure.stackTraceToString()).contains("synthetic-private-reporter"))
+        reporterFails = false
+        repeat(2) { index ->
+            val (_, recovered) = capturePropertyOutput { assertThrows(AssertionError::class.java) { runner.run() } }
+            println(event(recovered))
+            assertEquals(index + 1, observations.last().flakesInWindow)
+            assertEquals(index == 1, observations.last().quarantineAdvisory)
+        }
+        assertEquals(6, engines)
+    }
+
+    @Test
+    fun `changed samples between executions cannot accumulate comparable history`() {
+        var input = 0
+        var fail = true
+        var engines = 0
+        val observations = mutableListOf<FlakeObservation>()
+        val runner =
+            propertyCheck(
+                "synthetic-history-input-binding",
+                1,
+                {
+                    engines++
+                    Arb.constant(FixtureCase("synthetic-same-label", input, ExpectedInvariant.HARNESS_STABILITY))
+                },
+                setOf("api_service"),
+                onObservation = { observations.add(it) },
+            ) { case ->
+                val passed = !fail
+                fail = false
+                case.verify("synthetic-original-assertion", passed)
+            }
+        for (value in listOf(0, 1, 0)) {
+            input = value
+            fail = true
+            val (failure, output) = capturePropertyOutput { assertThrows(AssertionError::class.java) { runner.run() } }
+            assertTrue(failure.message.orEmpty().contains("synthetic-original-assertion"))
+            println(event(output))
+        }
+        assertEquals(FlakeClassification.NON_DETERMINISTIC, observations[0].classification)
+        assertEquals(FlakeClassification.NOT_COMPARABLE, observations[1].classification)
+        assertEquals(1, observations[1].attempts.size, "changed-history-input-is-not-retried")
+        assertEquals(1, observations[1].flakesInWindow)
+        assertFalse(observations[1].quarantineAdvisory)
+        assertEquals(2, observations[2].flakesInWindow)
+        assertTrue(observations[2].quarantineAdvisory)
+        assertEquals(5, engines)
+    }
+
+    @Test
     fun `different actual samples from fresh factories never count as comparable flakes`() {
         var factories = 0
         val evaluated = mutableListOf<Int>()

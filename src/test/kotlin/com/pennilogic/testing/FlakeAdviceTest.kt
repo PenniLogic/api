@@ -261,6 +261,48 @@ class FlakeAdviceTest {
     }
 
     @Test
+    fun `preview and incomplete reporting do not commit flake credit or input bindings`() {
+        val history = history()
+        val inputs = mutableListOf("e".repeat(64))
+        val proposed = history.preview(1, now, flaky(), inputs = inputs)
+        assertEquals(1, proposed.flakesInWindow)
+        assertEquals(1, history.nextExecution(identity, now), "preview-is-not-retention")
+        val interrupted = history.record(1, now, flaky(), reportingComplete = false, inputs)
+        assertEquals(FlakeClassification.INCOMPLETE, interrupted.classification)
+        assertEquals(0, interrupted.flakesInWindow)
+        assertFalse(interrupted.quarantineAdvisory)
+        assertFalse(interrupted.reportingComplete)
+        assertTrue(history.comparableInputs(listOf("f".repeat(64))), "incomplete-report-has-no-input-binding")
+        assertEquals(1, history.record(2, now, flaky(), inputs = inputs).flakesInWindow)
+        inputs[0] = "f".repeat(64)
+        assertFalse(history.comparableInputs(inputs), "stored-input-binding-is-an-immutable-copy")
+        val changed = history.record(3, now, flaky(), inputs = inputs)
+        assertEquals(FlakeClassification.NOT_COMPARABLE, changed.classification)
+        assertEquals(1, changed.flakesInWindow)
+        assertFalse(changed.quarantineAdvisory)
+    }
+
+    @Test
+    fun `malformed private input bindings and closed histories cannot be reused`() {
+        val history = history()
+        for (inputs in listOf(emptyList(), listOf("synthetic-private-sample"), List(513) { "e".repeat(64) })) {
+            val failure = assertThrows(IllegalArgumentException::class.java) { history.record(1, now, flaky(), inputs = inputs) }
+            assertEquals("flake-history-input-binding", failure.message)
+            assertEquals(1, history.nextExecution(identity, now))
+        }
+        history.enter()
+        assertEquals("flake-history-active-close", assertThrows(IllegalStateException::class.java) { history.close() }.message)
+        history.leave()
+        history.close()
+        assertEquals("flake-history-closed", assertThrows(IllegalStateException::class.java) { history.enter() }.message)
+        assertEquals(
+            "flake-history-closed",
+            assertThrows(IllegalStateException::class.java) { history.nextExecution(identity, now) }.message,
+        )
+        assertThrows(IllegalStateException::class.java) { history.record(1, now, flaky()) }
+    }
+
+    @Test
     fun `diagnostic metadata is bounded ASCII and rejects untrusted identifiers`() {
         for (id in listOf("", "x".repeat(65), "synthetic-private-marker\n", "\u001b[31mfixture", "fixture/../path", "fixture\u00e9")) {
             val error = assertThrows(IllegalArgumentException::class.java) { identity.copy(test = id) }

@@ -16,6 +16,7 @@ import java.time.DateTimeException
 import java.time.Duration
 import java.time.Instant
 import java.util.Collections
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -190,6 +191,8 @@ internal class FlakeObservation(
     val flakesInWindow: Int,
     val quarantineAdvisory: Boolean,
     private val policy: FlakePolicy,
+    val reportingComplete: Boolean,
+    private val historyContext: UUID?,
 ) {
     val attempts: List<FlakeAttempt> = Collections.unmodifiableList(attempts.toList())
     val blocked: Boolean get() = classification != FlakeClassification.STABLE_SUCCESS
@@ -227,7 +230,9 @@ internal class FlakeObservation(
             put("quarantine_advisory", quarantineAdvisory)
             put("quarantined", false)
             put("skipped", false)
-            put("history_scope", "runner_instance")
+            put("reporting_complete", reportingComplete)
+            put("history_scope", if (historyContext == null) "runner_instance" else "junit_test_class")
+            historyContext?.let { put("history_context_id", it.toString()) }
             put("quarantine_inventory_gates", "not_implemented")
             put("quarantine_rate_ceiling_percent", policy.quarantineCeilingPercent)
             put("quarantine_max_age_days", policy.quarantineMaxAgeDays)
@@ -239,15 +244,58 @@ internal class FlakeHistory(
     val identity: FlakeIdentity,
     classes: Set<String>,
     requestedRetries: Int? = null,
+    private val historyContext: UUID? = null,
 ) {
     val retries: Int = policy.retries(classes, requestedRetries)
+    private val classes = classes.toSet()
     private val observations = mutableListOf<FlakeObservation>()
+    private val active = AtomicBoolean(false)
+    private var closed = false
+    private var inputBinding: List<String>? = null
+
+    fun sameEnvironment(other: FlakeHistory): Boolean =
+        identity.source == other.identity.source &&
+            identity.task == other.identity.task &&
+            identity.seed == other.identity.seed &&
+            identity.category == other.identity.category &&
+            policy.digest == other.policy.digest
+
+    fun accepts(other: FlakeHistory): Boolean =
+        identity == other.identity && policy.digest == other.policy.digest && classes == other.classes && retries == other.retries
+
+    @Synchronized
+    fun forTestClass(context: UUID): FlakeHistory {
+        check(!closed && observations.isEmpty() && !active.get()) { "flake-history-not-empty" }
+        return FlakeHistory(policy, identity, classes, retries, context)
+    }
+
+    @Synchronized
+    fun comparableInputs(inputs: List<String>?): Boolean = inputBinding == null || inputBinding == inputs
+
+    @Synchronized
+    fun enter() {
+        check(!closed) { "flake-history-closed" }
+        check(active.compareAndSet(false, true)) { "flake-concurrent-execution" }
+    }
+
+    fun leave() {
+        check(active.compareAndSet(true, false)) { "flake-execution-not-active" }
+    }
+
+    @Synchronized
+    fun close() {
+        check(!active.get()) { "flake-history-active-close" }
+        closed = true
+        observations.clear()
+        inputBinding = null
+    }
 
     @Synchronized
     fun nextExecution(
         current: FlakeIdentity,
         at: Instant,
     ): Int {
+        check(!closed) { "flake-history-closed" }
         require(current == identity) { "flake-history-binding" }
         require(observations.size < MAX_OBSERVATIONS) { "flake-history-capacity" }
         require(observations.lastOrNull()?.at?.let { at >= it } != false) { "flake-history-time" }
@@ -255,11 +303,16 @@ internal class FlakeHistory(
     }
 
     @Synchronized
-    fun record(
+    fun preview(
         execution: Int,
         at: Instant,
         attempts: List<FlakeAttempt>,
+        reportingComplete: Boolean = true,
+        inputs: List<String>? = null,
     ): FlakeObservation {
+        if (inputs != null) {
+            require(inputs.size in 1..512 && inputs.all { Regex("[0-9a-f]{64}").matches(it) }) { "flake-history-input-binding" }
+        }
         val recorded = attempts.toList()
         require(execution == nextExecution(identity, at)) { "flake-history-sequence" }
         require(recorded.size in 1..retries + 1) { "flake-attempt-count" }
@@ -268,7 +321,9 @@ internal class FlakeHistory(
         }
         val classification =
             when {
+                !reportingComplete -> FlakeClassification.INCOMPLETE
                 recorded.any { !it.comparableTo(identity) } -> FlakeClassification.NOT_COMPARABLE
+                recorded.first().outcome == AttemptOutcome.FAILED && !comparableInputs(inputs) -> FlakeClassification.NOT_COMPARABLE
                 recorded.last().outcome == AttemptOutcome.INCOMPLETE -> FlakeClassification.INCOMPLETE
                 recorded.first().outcome == AttemptOutcome.PASSED -> FlakeClassification.STABLE_SUCCESS
                 recorded.size != retries + 1 -> FlakeClassification.INCOMPLETE
@@ -285,18 +340,33 @@ internal class FlakeHistory(
             observations.count { it.at >= lower && it.classification == FlakeClassification.NON_DETERMINISTIC } +
                 if (classification == FlakeClassification.NON_DETERMINISTIC) 1 else 0
         val comparable = classification != FlakeClassification.NOT_COMPARABLE && classification != FlakeClassification.INCOMPLETE
-        val result =
-            FlakeObservation(
-                execution,
-                at,
-                identity,
-                recorded,
-                classification,
-                flakes,
-                comparable && flakes >= policy.quarantineAfterFlakes,
-                policy,
-            )
+        return FlakeObservation(
+            execution,
+            at,
+            identity,
+            recorded,
+            classification,
+            flakes,
+            comparable && flakes >= policy.quarantineAfterFlakes,
+            policy,
+            reportingComplete,
+            historyContext,
+        )
+    }
+
+    @Synchronized
+    fun record(
+        execution: Int,
+        at: Instant,
+        attempts: List<FlakeAttempt>,
+        reportingComplete: Boolean = true,
+        inputs: List<String>? = null,
+    ): FlakeObservation {
+        val result = preview(execution, at, attempts, reportingComplete, inputs)
         observations.add(result)
+        if (result.classification == FlakeClassification.NON_DETERMINISTIC && inputs != null) {
+            inputBinding = inputs.toList()
+        }
         return result
     }
 
@@ -313,19 +383,20 @@ internal class AdvisoryCheck(
     private val clock: Clock = Clock.systemUTC(),
     private val onObservation: (FlakeObservation) -> Unit = {},
     private val inputsComparable: () -> Boolean = { true },
+    private val inputBinding: (() -> List<String>?)? = null,
     private val action: (Int) -> Unit,
 ) {
-    private val history = FlakeHistory(policy, currentIdentity(), classes, requestedRetries)
-    private val active = AtomicBoolean(false)
+    val history = FlakeHistory(policy, currentIdentity(), classes, requestedRetries)
 
-    fun run() {
-        check(active.compareAndSet(false, true)) { "flake-concurrent-execution" }
+    fun run(history: FlakeHistory = this.history) {
+        require(history.accepts(this.history)) { "flake-history-binding" }
+        history.enter()
+        var firstFailure: AssertionError? = null
+        var interruption: Throwable? = null
         try {
             val began = clock.instant()
             val execution = history.nextExecution(currentIdentity(), began)
             val attempts = mutableListOf<FlakeAttempt>()
-            var firstFailure: AssertionError? = null
-            var interruption: Throwable? = null
             var result: FlakeObservation
             try {
                 while (attempts.size <= history.retries) {
@@ -354,7 +425,7 @@ internal class AdvisoryCheck(
                                 TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started),
                                 outcome == AttemptOutcome.INCOMPLETE ||
                                     (attempts.isEmpty() && outcome == AttemptOutcome.PASSED) ||
-                                    inputsComparable(),
+                                    (inputsComparable() && history.comparableInputs(inputBinding?.invoke())),
                             ),
                         )
                     }
@@ -368,12 +439,27 @@ internal class AdvisoryCheck(
             } finally {
                 val ended = clock.instant()
                 require(ended >= began) { "flake-history-time" }
-                result = history.record(execution, ended, attempts)
+                val inputs = inputBinding?.invoke()
+                val proposed = history.preview(execution, ended, attempts, inputs = inputs)
+                var callbackComplete = false
                 try {
-                    println(result.json())
-                    onObservation(result)
+                    onObservation(proposed)
+                    callbackComplete = true
                 } catch (_: Throwable) {
-                    // A reporter must not replace a test failure or leak its own exception payload.
+                    // Reporting is part of completion, but its exception payload is not safe evidence.
+                }
+                val reported =
+                    if (callbackComplete) proposed else history.preview(execution, ended, attempts, reportingComplete = false, inputs)
+                var outputComplete = false
+                try {
+                    val output = System.out
+                    output.println(reported.json())
+                    outputComplete = !output.checkError()
+                } catch (_: Throwable) {
+                    // The blocking reporting diagnostic below also covers a failed output stream.
+                }
+                result = history.record(execution, ended, attempts, callbackComplete && outputComplete, inputs)
+                if (!result.reportingComplete) {
                     val reportingFailure = IllegalStateException("flake-observation-reporting-failed")
                     val original = interruption ?: firstFailure ?: throw reportingFailure
                     original.addSuppressed(reportingFailure)
@@ -381,8 +467,13 @@ internal class AdvisoryCheck(
             }
             firstFailure?.let { throw it }
             check(!result.blocked) { "flake-execution-incomplete" }
+        } catch (error: Throwable) {
+            val failure = if (error is TestAbortedException) IllegalStateException("flake-execution-aborted") else error
+            val original = interruption ?: firstFailure
+            if (original != null && original !== failure) failure.addSuppressed(original)
+            throw failure
         } finally {
-            active.set(false)
+            history.leave()
         }
     }
 }
