@@ -7,6 +7,9 @@ import io.kotest.property.EdgeConfig
 import io.kotest.property.PropTestConfig
 import io.kotest.property.PropTestListener
 import io.kotest.property.PropertyContext
+import io.kotest.property.RTree
+import io.kotest.property.RandomSource
+import io.kotest.property.Sample
 import io.kotest.property.ShrinkingMode
 import io.kotest.property.checkAll
 import kotlinx.coroutines.runBlocking
@@ -48,6 +51,8 @@ internal fun <T> propertyCheck(
     val policy = FlakePolicy.accepted()
     val classes = changeClasses.toSet()
     val seed = SharedFixtures.corpus.seed
+    val retries = policy.retries(classes, requestedRetries)
+    val samples = if (retries > 0) PropertySamples(cases) else null
     val configuration =
         buildJsonObject {
             put("property", id)
@@ -55,7 +60,7 @@ internal fun <T> propertyCheck(
             put("seed", seed)
             put("fixtures", flakeDigest(SharedFixtures.resource().toByteArray(Charsets.UTF_8)))
             put("policy", policy.digest)
-            put("retries", policy.retries(classes, requestedRetries))
+            put("retries", retries)
             put("change_classes", classes.sorted().joinToString(","))
         }.toString()
     return AdvisoryCheck(
@@ -74,14 +79,103 @@ internal fun <T> propertyCheck(
         requestedRetries,
         clock,
         onObservation,
-    ) {
+        inputsComparable = { samples?.comparable() ?: true },
+    ) { attempt ->
+        samples?.begin(attempt)
         val arbitrary =
             try {
                 generator()
             } catch (_: AssertionError) {
                 throw IllegalStateException("property-execution-incomplete")
             }
-        checkPropertyAttempt(id, cases, arbitrary, onResult, check)
+        checkPropertyAttempt(id, cases, arbitrary, samples, onResult, check)
+    }
+}
+
+private class PropertySamples(
+    private val cases: Int,
+) {
+    private val original = mutableListOf<String?>()
+    private var retry = false
+    private var position = 0
+    private var verified = true
+
+    fun begin(attempt: Int) {
+        if (attempt == 0) original.clear()
+        retry = attempt != 0
+        position = 0
+        verified = true
+    }
+
+    fun primary(case: FixtureCase<*>) {
+        check(position < cases) { "property-sample-count" }
+        val fingerprint = fingerprint(case)
+        if (fingerprint == null) verified = false
+        if (!retry) {
+            original.add(fingerprint)
+        } else if (position < original.size && fingerprint != original[position]) {
+            verified = false
+        }
+        position++
+    }
+
+    fun comparable(): Boolean = verified && original.isNotEmpty() && (!retry || position >= original.size)
+
+    private fun fingerprint(case: FixtureCase<*>): String? {
+        val value =
+            when (val input = case.input) {
+                null -> "null"
+                is Unit -> "unit"
+                is Boolean -> "boolean:$input"
+                is Byte -> "byte:$input"
+                is Short -> "short:$input"
+                is Int -> "int:$input"
+                is Long -> "long:$input"
+                is Char -> "char:${input.code}"
+                is String -> if (input.length <= 4096) "string:$input" else return null
+                else -> return null
+            }
+        val digest = MessageDigest.getInstance("SHA-256")
+        for (part in listOf(case.id, case.expectedInvariant.id, value)) {
+            digest.update(part.length.toString().toByteArray(Charsets.US_ASCII))
+            digest.update(0.toByte())
+            // Hash exact UTF-16 code units, including unpaired surrogates, without lossy encoding.
+            for (character in part) {
+                digest.update((character.code ushr 8).toByte())
+                digest.update(character.code.toByte())
+            }
+        }
+        return digest.digest().toHexString()
+    }
+}
+
+private class PropertyGenerator<T>(
+    private val delegate: Arb<FixtureCase<T>>,
+) : Arb<FixtureCase<T>>() {
+    var interrupted = false
+        private set
+
+    override fun edgecase(rs: RandomSource): Sample<FixtureCase<T>>? = guard { delegate.edgecase(rs)?.let(::guardSample) }
+
+    override fun sample(rs: RandomSource): Sample<FixtureCase<T>> = guard { guardSample(delegate.sample(rs)) }
+
+    private fun guardSample(sample: Sample<FixtureCase<T>>): Sample<FixtureCase<T>> = Sample(sample.value, guardTree(sample.shrinks))
+
+    private fun guardTree(tree: RTree<FixtureCase<T>>): RTree<FixtureCase<T>> =
+        RTree(
+            { guard { tree.value() } },
+            lazy { guard { tree.children.value.map(::guardTree) } },
+        )
+
+    private inline fun <R> guard(action: () -> R): R {
+        var completed = false
+        try {
+            val result = action()
+            completed = true
+            return result
+        } finally {
+            if (!completed) interrupted = true
+        }
     }
 }
 
@@ -90,6 +184,7 @@ private fun <T> checkPropertyAttempt(
     id: String,
     cases: Int,
     generator: Arb<FixtureCase<T>>,
+    samples: PropertySamples?,
     onResult: (PropertyExecution) -> Unit,
     check: (FixtureCase<T>) -> Unit,
 ) {
@@ -102,6 +197,12 @@ private fun <T> checkPropertyAttempt(
     var completed = false
     var interrupted = false
     val callbackAssertions = mutableListOf<AssertionError>()
+    val guardedGenerator = PropertyGenerator(generator)
+
+    fun incomplete(): IllegalStateException =
+        IllegalStateException("property-execution-incomplete").also { failure ->
+            callbackAssertions.firstOrNull()?.let { failure.addSuppressed(it) }
+        }
     var primaryPending = false
     val families = mutableMapOf<ExpectedInvariant, Int>()
     val listener =
@@ -129,10 +230,11 @@ private fun <T> checkPropertyAttempt(
                         edgeConfig = EdgeConfig(0.0),
                         listeners = listOf(listener),
                     ),
-                    generator,
+                    guardedGenerator,
                 ) { case ->
                     evaluations++
                     if (primaryPending) {
+                        samples?.primary(case)
                         families.merge(case.expectedInvariant, 1, Int::plus)
                         primaryPending = false
                     }
@@ -169,7 +271,7 @@ private fun <T> checkPropertyAttempt(
                     }
                 }
             }
-        if (interrupted) throw IllegalStateException("property-execution-incomplete")
+        if (interrupted || guardedGenerator.interrupted) throw incomplete()
         assertTrue(context.evals() == cases && context.successes() == cases && context.failures() == 0, "property=$id exact-execution")
         completed = true
     } catch (error: AssertionError) {
@@ -178,17 +280,20 @@ private fun <T> checkPropertyAttempt(
             generateSequence<Throwable>(error) { it.cause }.take(16).any { cause ->
                 callbackAssertions.any { it === cause }
             }
-        if (interrupted || !callbackFailure) throw IllegalStateException("property-execution-incomplete")
+        if (interrupted || guardedGenerator.interrupted || !callbackFailure) throw incomplete()
         throw error
     } catch (_: TestAbortedException) {
-        throw IllegalStateException("property-execution-incomplete")
+        throw incomplete()
+    } catch (error: Throwable) {
+        if (guardedGenerator.interrupted) throw incomplete()
+        throw error
     } finally {
         val elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
         val execution = PropertyExecution(id, seed, primary, passed, evaluations, families.toMap(), elapsed, completed)
         try {
             onResult(execution)
         } catch (_: AssertionError) {
-            throw IllegalStateException("property-execution-incomplete")
+            throw incomplete()
         } finally {
             println(execution.json())
         }

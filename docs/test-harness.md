@@ -1,4 +1,4 @@
-# Shared property fixtures and advisory flake classification
+# Shared property fixtures and preparatory flake classifier
 
 This increment belongs to the existing [#3](https://github.com/PenniLogic/api/issues/3).
 It is not whole-issue acceptance or a readiness change. The original dependency
@@ -162,7 +162,15 @@ again. These are per-suite measurements, not end-to-end workflow timing;
 property-backed PostgreSQL classes retain their `integrationTest` task
 attribution.
 
-## Advisory flake classification
+## Preparatory advisory classifier infrastructure
+
+**Normal-use unreliable-test rollout remains unfinished.** This increment is
+preparatory classifier infrastructure, not acceptance of the original issue's
+quarantine mechanism. Every normal `checkProperty` invocation creates a fresh
+runner, and existing Money/ledger consumers correctly have zero retries.
+Only the explicitly reused ordinary runners in the controls demonstrate the
+after-two advisory threshold. That demonstration is not normal invocation
+history integration or native cross-run retention.
 
 Every existing `checkProperty` call now executes through `AdvisoryCheck`, including
 the shared Money codec and PostgreSQL ledger consumers. These existing consumers
@@ -182,9 +190,29 @@ For an explicitly ordinary synthetic property, `propertyCheck` accepts the
 strategy's declared change-class IDs and a **fresh arbitrary factory**. Each
 attempt uses the same seed, case count, fixture corpus and callback; the factory
 restarts the arbitrary's seed prefix rather than continuing its mutable cursor.
+Seed, labels and configuration alone do not prove that actual inputs match.
 The factory and callback belong to one runner instance. A mixed set containing
 `money_path` still receives zero re-executions. Callers must classify their actual
 change correctly; this is not a repository-wide changed-file classifier.
+
+For retry-eligible properties, the adapter privately fingerprints each actual
+primary case before the assertion runs. A passing retry must match the entire
+executed primary prefix, in order, through the original failed primary case:
+case ID, invariant and typed input. Its remaining primary cases still execute;
+shrink candidates cannot replace the original prefix. Fingerprints use exact
+length-framed UTF-16 code units, so even unpaired surrogates are not silently
+normalized. No input or input fingerprint is written to diagnostics or history.
+
+Comparison supports immutable `null`, `Unit`, Boolean, Byte, Short, Int, Long,
+Char and String inputs (at most 4096 UTF-16 code units). Other objects, mutable
+records and longer strings are explicitly unverifiable; their `equals`,
+`hashCode` and `toString` are never used as evidence. An unverifiable failed
+primary is blocked as `not_comparable` without a retry. A changed retry prefix
+also receives no flake credit and still throws the original assertion.
+A primary pass remains a pass without requiring retry equivalence. Existing
+zero-retry Money/ledger properties do not require this comparison or change
+their typed generators. At most the configured case count (already capped at
+512) of private fingerprints is retained per runner, reset at each execution.
 
 The accepted policy permits one ordinary re-execution, only after an assertion
 failure. Configuring more than the permitted count fails before the fixture runs.
@@ -194,9 +222,9 @@ The result is never an automatic green retry:
 | --- | --- | --- |
 | Pass | `stable_success` | Returns normally |
 | Failure with no retry permitted, or failure then failure | `stable_failure` | Throws the first assertion; retains the second assertion when distinct |
-| Failure then pass | `non_deterministic` | Records one flake event and still throws the first assertion |
+| Failure then pass with a verified matching primary prefix | `non_deterministic` | Records one flake event and still throws the first assertion |
 | Interrupted execution, or a missing permitted retry result | `incomplete` | Blocking; not proof of a flake |
-| Different source/configuration bindings | `not_comparable` or a pre-execution refusal | Blocking; not proof of a flake |
+| Unverifiable failed inputs, changed primary samples or different source/configuration bindings | `not_comparable` or a pre-execution refusal | Blocking; not proof of a flake |
 
 Non-assertion exceptions do not authorize a classification retry. Kotest also
 wraps non-assertion callback exceptions as `AssertionFailedError`; the shared
@@ -206,11 +234,23 @@ to call it a completed assertion failure. Such interrupted properties fail with
 not propagated as test skips. Assertions in fixture construction, sampling,
 shrinking, result reporting or execution-count validation also do not establish
 a completed callback failure. The engine's propagated assertion must retain an
-actual callback assertion by identity in its bounded cause chain; an earlier
-callback failure does not turn an unrelated shrinking interruption into a flake.
-If the classification attempt is interrupted, its exception propagates and the
-event retains both the original failed outcome and the incomplete outcome. A
-clock moving backwards is an explicit history error, not a new observation.
+actual callback assertion by identity in its bounded cause chain, but that alone
+does not prove completion: an interrupted shrinker can itself retain that cause.
+A pass-through arbitrary wrapper separately tracks completion of sampling and
+lazy shrink-tree value/children evaluation, without changing samples, order or
+shrink limits. A failure in those operations remains `incomplete` even if its
+assertion type/cause resembles the engine's completed-failure wrapper. The
+original callback assertion is retained as suppressed provenance, not the
+shrinker exception payload. Neither a first-attempt interruption nor an
+interrupted classification attempt receives flake credit.
+If the classification attempt is interrupted, its exception propagates with
+the first assertion retained as a suppressed failure; the event retains both
+the original failed outcome and the incomplete outcome. Observation reporters
+cannot replace those failures: any reporter abort/error becomes a static
+`flake-observation-reporting-failed` suppressed diagnostic on the original
+failure. Without an existing failure, reporting fails with that non-abort
+exception. The reporter's exception contents are not retained or logged.
+A clock moving backwards is an explicit history error, not a new observation.
 This is a classifier for this shared assertion/property harness, not a universal
 JUnit exception interceptor.
 
@@ -263,6 +303,8 @@ After the existing source preparation, run:
 .\gradlew.bat --no-daemon --console=plain '-Pkotlin.compiler.execution.strategy=in-process' test --tests 'com.pennilogic.testing.Flake*'
 .\gradlew.bat --no-daemon --console=plain '-Pkotlin.compiler.execution.strategy=in-process' test --tests 'com.pennilogic.testing.*'
 .\gradlew.bat --no-daemon --console=plain '-Pkotlin.compiler.execution.strategy=in-process' -PflakeAdviceNegativeControl=true test --tests '*FlakeHarnessTest.the real varying fixture*'
+.\gradlew.bat --no-daemon --console=plain '-Pkotlin.compiler.execution.strategy=in-process' -PflakeAdviceNegativeControl=true test --tests '*FlakeHarnessTest.observation reporter abort*' --tests '*FlakeHarnessTest.different actual samples*'
+.\gradlew.bat --no-daemon --console=plain '-Pkotlin.compiler.execution.strategy=in-process' -PflakeAdviceNegativeControl=true test --tests '*FlakeHarnessTest.caused shrinking*'
 .\gradlew.bat --no-daemon --console=plain '-Pkotlin.compiler.execution.strategy=in-process' integrationTest --tests 'com.pennilogic.ledger.LedgerPropertyPostgresTest'
 ```
 
@@ -275,15 +317,28 @@ flags the second pair under the accepted policy, confirms the third still runs,
 and checks a separate stable recovery control. It catches its deliberate
 assertions only to test the harness; the negative-control command propagates
 the next original assertion to JUnit/Gradle. It does not mutate ledger logic.
+The fourth command must also fail: three actual Jupiter tests expose ordinary,
+Money-only and mixed-class failures despite observation-reporter aborts, with
+zero skips, plus the changed-input control's original blocking assertion with
+zero flake credit. Running those same selectors without the negative-control
+property checks failure provenance, safe reporter diagnostics and runner recovery.
+The fifth command exposes blocking incomplete executions in four actual Jupiter
+methods: first/classification attempts, Money/mixed classes and lazy shrink-tree
+values. It must fail without skips. Without the flag, those methods verify
+incomplete classification, exact retry limits, failure provenance and recovery;
+the separate completed-shrinking control still permits a genuine same-input flake.
 
 The other controls cover exact threshold/window boundaries, zero-money and mixed
 change-class retries, persistent real failure, incomplete/changed executions,
-policy/history/input refusal, bounded ASCII output and concurrent-instance
+policy/history/input refusal, changed fresh-factory samples, ordered primary
+prefixes, shrinking, unverifiable inputs, exact scalar/String comparison,
+bounded ASCII output and concurrent-instance
 refusal/recovery. They are not whole-suite timing or native CI qualification.
 
 ## Remaining original requirements
 
-Live API/OpenAPI and currently generated-client contract stages, Testcontainers
+Normal-use unreliable-test advisory rollout, live API/OpenAPI and currently
+generated-client contract stages, Testcontainers
 adoption (the existing harness uses the pinned Docker CLI), repository-wide
 quarantine inventory/rate/expiry gates and native history retention, broader
 realistic product generators and full original

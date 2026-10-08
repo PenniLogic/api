@@ -192,6 +192,36 @@ class FlakeAdviceTest {
     }
 
     @Test
+    fun `unverified actual inputs never contribute to the flake threshold or permit another retry`() {
+        val history = history()
+        val changed = attempt(AttemptOutcome.PASSED).copy(inputsComparable = false)
+        for (execution in 1..2) {
+            val result = history.record(execution, now, listOf(attempt(AttemptOutcome.FAILED), changed))
+            assertEquals(FlakeClassification.NOT_COMPARABLE, result.classification)
+            assertEquals(0, result.flakesInWindow)
+            assertFalse(result.quarantineAdvisory)
+            assertTrue(result.blocked)
+            val json = Json.parseToJsonElement(result.json()).jsonObject
+            assertFalse(
+                json
+                    .getValue("attempts")
+                    .jsonArray
+                    .last()
+                    .jsonObject
+                    .getValue("comparable")
+                    .jsonPrimitive.boolean,
+            )
+        }
+        val proven = history.record(3, now, flaky())
+        assertEquals(1, proven.flakesInWindow)
+        assertFalse(proven.quarantineAdvisory)
+        val unverified = attempt(AttemptOutcome.FAILED).copy(inputsComparable = false)
+        assertThrows(IllegalArgumentException::class.java) {
+            history().record(1, now, listOf(unverified, attempt(AttemptOutcome.PASSED)))
+        }
+    }
+
+    @Test
     fun `malformed missing repeated out of order and over limit history is refused`() {
         val history = history()
         assertThrows(IllegalArgumentException::class.java) { history.record(1, now, emptyList()) }

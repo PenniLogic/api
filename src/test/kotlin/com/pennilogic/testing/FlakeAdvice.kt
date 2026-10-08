@@ -162,10 +162,13 @@ internal data class FlakeAttempt(
     val after: FlakeIdentity,
     val outcome: AttemptOutcome,
     val elapsedMs: Long,
+    val inputsComparable: Boolean = true,
 ) {
     init {
         require(elapsedMs >= 0) { "flake-attempt-duration" }
     }
+
+    fun comparableTo(identity: FlakeIdentity): Boolean = inputsComparable && before == identity && after == identity
 }
 
 internal enum class FlakeClassification(
@@ -212,7 +215,7 @@ internal class FlakeObservation(
                             put("attempt", index + 1)
                             put("outcome", attempt.outcome.id)
                             put("elapsed_ms", attempt.elapsedMs)
-                            put("comparable", attempt.before == identity && attempt.after == identity)
+                            put("comparable", attempt.comparableTo(identity))
                         },
                     )
                 }
@@ -260,12 +263,12 @@ internal class FlakeHistory(
         val recorded = attempts.toList()
         require(execution == nextExecution(identity, at)) { "flake-history-sequence" }
         require(recorded.size in 1..retries + 1) { "flake-attempt-count" }
-        require(recorded.dropLast(1).all { it.outcome == AttemptOutcome.FAILED && it.before == identity && it.after == identity }) {
+        require(recorded.dropLast(1).all { it.outcome == AttemptOutcome.FAILED && it.comparableTo(identity) }) {
             "flake-reexecution-without-failure"
         }
         val classification =
             when {
-                recorded.any { it.before != identity || it.after != identity } -> FlakeClassification.NOT_COMPARABLE
+                recorded.any { !it.comparableTo(identity) } -> FlakeClassification.NOT_COMPARABLE
                 recorded.last().outcome == AttemptOutcome.INCOMPLETE -> FlakeClassification.INCOMPLETE
                 recorded.first().outcome == AttemptOutcome.PASSED -> FlakeClassification.STABLE_SUCCESS
                 recorded.size != retries + 1 -> FlakeClassification.INCOMPLETE
@@ -309,7 +312,8 @@ internal class AdvisoryCheck(
     requestedRetries: Int? = null,
     private val clock: Clock = Clock.systemUTC(),
     private val onObservation: (FlakeObservation) -> Unit = {},
-    private val action: () -> Unit,
+    private val inputsComparable: () -> Boolean = { true },
+    private val action: (Int) -> Unit,
 ) {
     private val history = FlakeHistory(policy, currentIdentity(), classes, requestedRetries)
     private val active = AtomicBoolean(false)
@@ -321,6 +325,7 @@ internal class AdvisoryCheck(
             val execution = history.nextExecution(currentIdentity(), began)
             val attempts = mutableListOf<FlakeAttempt>()
             var firstFailure: AssertionError? = null
+            var interruption: Throwable? = null
             var result: FlakeObservation
             try {
                 while (attempts.size <= history.retries) {
@@ -329,7 +334,7 @@ internal class AdvisoryCheck(
                     var outcome = AttemptOutcome.INCOMPLETE
                     val started = System.nanoTime()
                     try {
-                        action()
+                        action(attempts.size)
                         outcome = AttemptOutcome.PASSED
                     } catch (_: TestAbortedException) {
                         throw IllegalStateException("flake-execution-aborted")
@@ -347,17 +352,32 @@ internal class AdvisoryCheck(
                                 currentIdentity(),
                                 outcome,
                                 TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started),
+                                outcome == AttemptOutcome.INCOMPLETE ||
+                                    (attempts.isEmpty() && outcome == AttemptOutcome.PASSED) ||
+                                    inputsComparable(),
                             ),
                         )
                     }
-                    if (outcome != AttemptOutcome.FAILED || attempts.last().after != history.identity) break
+                    if (outcome != AttemptOutcome.FAILED || !attempts.last().comparableTo(history.identity)) break
                 }
+            } catch (error: Throwable) {
+                val failure = if (error is TestAbortedException) IllegalStateException("flake-execution-aborted") else error
+                interruption = failure
+                firstFailure?.let { if (it !== failure) failure.addSuppressed(it) }
+                throw failure
             } finally {
                 val ended = clock.instant()
                 require(ended >= began) { "flake-history-time" }
                 result = history.record(execution, ended, attempts)
-                println(result.json())
-                onObservation(result)
+                try {
+                    println(result.json())
+                    onObservation(result)
+                } catch (_: Throwable) {
+                    // A reporter must not replace a test failure or leak its own exception payload.
+                    val reportingFailure = IllegalStateException("flake-observation-reporting-failed")
+                    val original = interruption ?: firstFailure ?: throw reportingFailure
+                    original.addSuppressed(reportingFailure)
+                }
             }
             firstFailure?.let { throw it }
             check(!result.blocked) { "flake-execution-incomplete" }

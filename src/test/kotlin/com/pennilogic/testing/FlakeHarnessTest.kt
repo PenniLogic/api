@@ -1,6 +1,7 @@
 package com.pennilogic.testing
 
 import io.kotest.property.Arb
+import io.kotest.property.RTree
 import io.kotest.property.RandomSource
 import io.kotest.property.Sample
 import io.kotest.property.Shrinker
@@ -17,6 +18,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.parallel.Isolated
 import org.junit.jupiter.api.parallel.ResourceLock
 import org.junit.jupiter.api.parallel.Resources
+import org.opentest4j.AssertionFailedError
 import org.opentest4j.TestAbortedException
 import java.time.Clock
 import java.time.Instant
@@ -406,6 +408,530 @@ class FlakeHarnessTest {
         assertEquals(1, calls)
     }
 
+    @Test
+    fun `observation reporter abort cannot replace an ordinary assertion`() {
+        reporterAbort(setOf("api_service"), "synthetic-ordinary-reporter")
+    }
+
+    @Test
+    fun `observation reporter abort cannot replace a money assertion`() {
+        reporterAbort(setOf("money_path"), "synthetic-money-reporter")
+    }
+
+    @Test
+    fun `observation reporter abort cannot replace a mixed class assertion`() {
+        reporterAbort(setOf("api_service", "money_path"), "synthetic-mixed-reporter")
+    }
+
+    @Test
+    fun `observation reporter errors retain original failure objects without their own payload`() {
+        for (reporter in listOf(
+            AssertionError("synthetic-private-reporter"),
+            IllegalStateException("synthetic-private-reporter"),
+            LinkageError("synthetic-private-reporter"),
+        )) {
+            val first = AssertionError("synthetic-first-assertion")
+            var calls = 0
+            val runner =
+                AdvisoryCheck(
+                    FlakePolicy.accepted(),
+                    ::identity,
+                    setOf("api_service"),
+                    onObservation = { throw reporter },
+                ) {
+                    calls++
+                    if (calls == 1) throw first
+                }
+            val (failure, output) = capturePropertyOutput { assertThrows(AssertionError::class.java) { runner.run() } }
+            assertSame(first, failure)
+            assertEquals("flake-observation-reporting-failed", failure.suppressed.single().message)
+            assertFalse((failure.stackTraceToString() + output).contains("synthetic-private-reporter"))
+            assertEquals(2, calls)
+            println(event(output))
+        }
+    }
+
+    @Test
+    fun `reporter abort after success is blocking and after interruption preserves both failures`() {
+        val successful =
+            AdvisoryCheck(
+                FlakePolicy.accepted(),
+                ::identity,
+                setOf("api_service"),
+                onObservation = { throw TestAbortedException("synthetic-private-reporter") },
+            ) {}
+        val (reportFailure, successOutput) =
+            capturePropertyOutput { assertThrows(IllegalStateException::class.java) { successful.run() } }
+        assertEquals("flake-observation-reporting-failed", reportFailure.message)
+        assertEquals(null, reportFailure.cause)
+        assertFalse((reportFailure.stackTraceToString() + successOutput).contains("synthetic-private-reporter"))
+
+        val first = AssertionError("synthetic-first-assertion")
+        val interruption = IllegalStateException("synthetic-execution-interrupted")
+        var calls = 0
+        val interrupted =
+            AdvisoryCheck(
+                FlakePolicy.accepted(),
+                ::identity,
+                setOf("api_service"),
+                onObservation = { throw TestAbortedException("synthetic-private-reporter") },
+            ) {
+                calls++
+                if (calls == 1) throw first
+                throw interruption
+            }
+        val (failure, output) =
+            capturePropertyOutput { assertThrows(IllegalStateException::class.java) { interrupted.run() } }
+        assertSame(interruption, failure)
+        assertSame(first, failure.suppressed.first())
+        assertEquals("flake-observation-reporting-failed", failure.suppressed.last().message)
+        assertFalse((failure.stackTraceToString() + output).contains("synthetic-private-reporter"))
+        assertTrue(event(output).contains("\"classification\":\"incomplete\""))
+        println(event(output))
+    }
+
+    @Test
+    fun `different actual samples from fresh factories never count as comparable flakes`() {
+        var factories = 0
+        val evaluated = mutableListOf<Int>()
+        val observations = mutableListOf<FlakeObservation>()
+        val runner =
+            propertyCheck(
+                "synthetic-changing-samples",
+                1,
+                {
+                    val input = factories++ % 2
+                    Arb.constant(FixtureCase("synthetic-same-label", input, ExpectedInvariant.HARNESS_STABILITY))
+                },
+                setOf("api_service"),
+                onObservation = { observations.add(it) },
+            ) { case ->
+                evaluated.add(case.input)
+                case.verify("deterministic-input-predicate", case.input == 1)
+            }
+        repeat(2) {
+            val (failure, output) = capturePropertyOutput { assertThrows(AssertionError::class.java) { runner.run() } }
+            assertTrue(failure.message.orEmpty().contains("deterministic-input-predicate"), "original-failure-retained")
+            println(event(output))
+        }
+        assertTrue(evaluated == listOf(0, 1, 0, 1), "actual-inputs-vary-with-identical-seed-and-label")
+        assertEquals(4, factories)
+        assertTrue(observations.all { it.classification == FlakeClassification.NOT_COMPARABLE }, "changed-inputs-not-flakes")
+        assertTrue(observations.all { it.flakesInWindow == 0 && !it.quarantineAdvisory && it.blocked })
+        assertTrue(
+            observations.all {
+                it.attempts.map { attempt ->
+                    attempt.outcome
+                } == listOf(AttemptOutcome.FAILED, AttemptOutcome.PASSED)
+            },
+        )
+        if (System.getProperty("pennilogic.testing.flakeNegativeControl") == "true") {
+            runner.run()
+            error("changed-input-negative-control-did-not-fail")
+        }
+    }
+
+    @Test
+    fun `classification compares the whole primary prefix through the original failure`() {
+        for (changePrefix in listOf(false, true)) {
+            var factories = 0
+            var evaluations = 0
+            val observations = mutableListOf<FlakeObservation>()
+            val runner =
+                propertyCheck(
+                    "synthetic-primary-prefix",
+                    3,
+                    {
+                        factories++
+                        sequenceFixture(if (changePrefix && factories == 2) listOf(2, 1, 3) else listOf(0, 1, 3))
+                    },
+                    setOf("api_service"),
+                    onObservation = { observations.add(it) },
+                ) { case ->
+                    evaluations++
+                    case.verify("synthetic-prefix-predicate", factories != 1 || case.input != 1)
+                }
+            val (_, output) = capturePropertyOutput { assertThrows(AssertionError::class.java) { runner.run() } }
+            assertEquals(2, factories)
+            assertEquals(5, evaluations, "retry-reaches-failed-primary-and-completes-remaining-cases")
+            val result = observations.single()
+            assertEquals(
+                if (changePrefix) FlakeClassification.NOT_COMPARABLE else FlakeClassification.NON_DETERMINISTIC,
+                result.classification,
+            )
+            assertEquals(if (changePrefix) 0 else 1, result.flakesInWindow)
+            assertEquals(!changePrefix, result.attempts.last().comparableTo(result.identity))
+            println(event(output))
+        }
+    }
+
+    @Test
+    fun `shrinking cannot substitute a different passing input for the failed primary`() {
+        var factories = 0
+        val evaluated = mutableListOf<Int>()
+        val observations = mutableListOf<FlakeObservation>()
+        val runner =
+            propertyCheck(
+                "synthetic-shrunk-input",
+                1,
+                {
+                    factories++
+                    val input = if (factories == 1) 2 else 1
+                    object : Arb<FixtureCase<Int>>() {
+                        override fun edgecase(rs: RandomSource): Sample<FixtureCase<Int>>? = null
+
+                        override fun sample(rs: RandomSource): Sample<FixtureCase<Int>> =
+                            sampleOf(
+                                FixtureCase("synthetic-same-label", input, ExpectedInvariant.HARNESS_STABILITY),
+                                Shrinker { case ->
+                                    if (case.input == 2) {
+                                        listOf(FixtureCase("synthetic-same-label", 1, ExpectedInvariant.HARNESS_STABILITY))
+                                    } else {
+                                        emptyList()
+                                    }
+                                },
+                            )
+                    }
+                },
+                setOf("api_service"),
+                onObservation = { observations.add(it) },
+            ) { case ->
+                evaluated.add(case.input)
+                case.verify("deterministic-shrink-predicate", case.input == 1)
+            }
+        val (_, output) = capturePropertyOutput { assertThrows(AssertionError::class.java) { runner.run() } }
+        assertTrue(evaluated == listOf(2, 1, 1), "real-shrink-and-retry-executed")
+        assertEquals(FlakeClassification.NOT_COMPARABLE, observations.single().classification)
+        assertEquals(0, observations.single().flakesInWindow)
+        println(event(output))
+    }
+
+    @Test
+    fun `unverifiable mutable inputs cannot spoof comparison or authorize a retry`() {
+        val input = UnverifiableInput()
+        var factories = 0
+        val observations = mutableListOf<FlakeObservation>()
+        val runner =
+            propertyCheck(
+                "synthetic-unverifiable-input",
+                1,
+                {
+                    factories++
+                    Arb.constant(FixtureCase("synthetic-opaque-input", input, ExpectedInvariant.HARNESS_STABILITY))
+                },
+                setOf("api_service"),
+                onObservation = { observations.add(it) },
+            ) { case -> case.verify("synthetic-opaque-predicate", case.input.succeeds) }
+        val (_, output) = capturePropertyOutput { assertThrows(AssertionError::class.java) { runner.run() } }
+        assertEquals(1, factories, "unverifiable-failed-input-is-not-reexecuted")
+        val failed = observations.single()
+        assertEquals(FlakeClassification.NOT_COMPARABLE, failed.classification)
+        assertFalse(failed.attempts.single().comparableTo(failed.identity))
+        assertEquals(0, failed.flakesInWindow)
+        assertEquals(0, input.comparisons)
+        println(event(output))
+
+        input.succeeds = true
+        runner.run()
+        assertEquals(2, factories)
+        assertEquals(FlakeClassification.STABLE_SUCCESS, observations.last().classification)
+        assertEquals(0, observations.last().flakesInWindow)
+        assertEquals(0, input.comparisons)
+    }
+
+    @Test
+    fun `input comparison distinguishes scalar types and exact UTF16 code units`() {
+        val changed = listOf<Pair<Any, Any>>(0 to 0L, '0' to "0", "\uD800" to "\uD801")
+        for ((first, second) in changed) {
+            var factories = 0
+            val observations = mutableListOf<FlakeObservation>()
+            val runner =
+                propertyCheck(
+                    "synthetic-typed-inputs",
+                    1,
+                    {
+                        val input = if (factories++ == 0) first else second
+                        Arb.constant(FixtureCase("synthetic-same-label", input, ExpectedInvariant.HARNESS_STABILITY))
+                    },
+                    setOf("api_service"),
+                    onObservation = { observations.add(it) },
+                ) { case -> case.verify("deterministic-typed-predicate", case.input == second) }
+            val (_, output) = capturePropertyOutput { assertThrows(AssertionError::class.java) { runner.run() } }
+            assertEquals(2, factories)
+            assertEquals(FlakeClassification.NOT_COMPARABLE, observations.single().classification)
+            assertEquals(0, observations.single().flakesInWindow)
+            println(event(output))
+        }
+    }
+
+    @Test
+    fun `immutable sample comparison is bounded private and preserves genuine same input flakes`() {
+        val inputs =
+            listOf(null, Unit, true, 1.toByte(), 1.toShort(), 1, 1L, 'x', "synthetic-private-sample", "x".repeat(4096), "x".repeat(4097))
+        for (input in inputs) {
+            var factories = 0
+            val observations = mutableListOf<FlakeObservation>()
+            val runner =
+                propertyCheck(
+                    "synthetic-immutable-input",
+                    1,
+                    {
+                        factories++
+                        Arb.constant(FixtureCase("synthetic-same-label", input, ExpectedInvariant.HARNESS_STABILITY))
+                    },
+                    setOf("api_service"),
+                    onObservation = { observations.add(it) },
+                ) { case -> case.verify("synthetic-varying-assertion", factories == 2) }
+            val (failure, output) = capturePropertyOutput { assertThrows(AssertionError::class.java) { runner.run() } }
+            val supported = input !is String || input.length <= 4096
+            assertEquals(if (supported) 2 else 1, factories)
+            val result = observations.single()
+            assertEquals(
+                if (supported) FlakeClassification.NON_DETERMINISTIC else FlakeClassification.NOT_COMPARABLE,
+                result.classification,
+            )
+            assertEquals(if (supported) 1 else 0, result.flakesInWindow)
+            assertFalse((failure.stackTraceToString() + output).contains("synthetic-private-sample"))
+            assertFalse(output.contains("x".repeat(4096)))
+            println(event(output))
+        }
+    }
+
+    @Test
+    fun `caused shrinking interruption in the first attempt is incomplete without retry`() {
+        for (engineAssertionType in listOf(false, true)) {
+            causedShrinking(setOf("api_service"), 1, engineAssertionType)
+        }
+    }
+
+    @Test
+    fun `caused shrinking interruption in the classification attempt retains both failures`() {
+        for (engineAssertionType in listOf(false, true)) {
+            causedShrinking(setOf("api_service"), 2, engineAssertionType)
+        }
+    }
+
+    @Test
+    fun `caused shrinking interruption remains incomplete for money and mixed classes`() {
+        for (classes in listOf(setOf("money_path"), setOf("api_service", "money_path"))) {
+            causedShrinking(classes, 1, false)
+        }
+    }
+
+    @Test
+    fun `caused shrinking value interruption is incomplete in either ordinary attempt`() {
+        for (attempt in 1..2) {
+            causedShrinking(setOf("api_service"), attempt, false, treeValue = true)
+        }
+    }
+
+    @Test
+    fun `completed shrinking still permits a genuine same input classification attempt`() {
+        var factories = 0
+        val evaluated = mutableListOf<Int>()
+        val observations = mutableListOf<FlakeObservation>()
+        val runner =
+            propertyCheck(
+                "synthetic-completed-shrinking",
+                1,
+                {
+                    factories++
+                    object : Arb<FixtureCase<Int>>() {
+                        override fun edgecase(rs: RandomSource): Sample<FixtureCase<Int>>? = null
+
+                        override fun sample(rs: RandomSource): Sample<FixtureCase<Int>> =
+                            sampleOf(
+                                FixtureCase("synthetic-same-input", 2, ExpectedInvariant.HARNESS_STABILITY),
+                                Shrinker { case ->
+                                    if (case.input == 2) {
+                                        listOf(FixtureCase("synthetic-same-input", 1, ExpectedInvariant.HARNESS_STABILITY))
+                                    } else {
+                                        emptyList()
+                                    }
+                                },
+                            )
+                    }
+                },
+                setOf("api_service"),
+                onObservation = { observations.add(it) },
+            ) { case ->
+                evaluated.add(case.input)
+                case.verify("synthetic-varying-assertion", factories == 2 || case.input == 1)
+            }
+        val (failure, output) = capturePropertyOutput { assertThrows(AssertionError::class.java) { runner.run() } }
+        assertTrue(evaluated == listOf(2, 1, 2), "completed-shrink-preserves-original-primary-for-retry")
+        assertTrue(failure.message.orEmpty().contains("synthetic-varying-assertion"))
+        assertEquals(2, factories)
+        assertEquals(FlakeClassification.NON_DETERMINISTIC, observations.single().classification)
+        assertEquals(1, observations.single().flakesInWindow)
+        println(event(output))
+    }
+
+    private fun causedShrinking(
+        classes: Set<String>,
+        interruptedAttempt: Int,
+        engineAssertionType: Boolean,
+        treeValue: Boolean = false,
+    ) {
+        var factories = 0
+        var fail = true
+        val callback = AssertionError("synthetic-original-callback")
+        val earlier = AssertionError("synthetic-earlier-attempt")
+        val shrinker =
+            if (engineAssertionType) {
+                AssertionFailedError("synthetic-private-shrinker").apply { initCause(callback) }
+            } else {
+                AssertionError("synthetic-private-shrinker").apply { initCause(callback) }
+            }
+        val observations = mutableListOf<FlakeObservation>()
+        val runner =
+            propertyCheck(
+                "synthetic-caused-shrinking",
+                1,
+                {
+                    factories++
+                    object : Arb<FixtureCase<Unit>>() {
+                        override fun edgecase(rs: RandomSource): Sample<FixtureCase<Unit>>? = null
+
+                        override fun sample(rs: RandomSource): Sample<FixtureCase<Unit>> {
+                            val case = FixtureCase("synthetic-same-input", Unit, ExpectedInvariant.HARNESS_STABILITY)
+                            if (treeValue) {
+                                return Sample(
+                                    case,
+                                    RTree(
+                                        { case },
+                                        lazy {
+                                            listOf(
+                                                RTree({
+                                                    if (fail && factories == interruptedAttempt) throw shrinker
+                                                    case
+                                                }),
+                                            )
+                                        },
+                                    ),
+                                )
+                            }
+                            return sampleOf(
+                                case,
+                                Shrinker {
+                                    if (fail && factories == interruptedAttempt) throw shrinker
+                                    emptyList()
+                                },
+                            )
+                        }
+                    }
+                },
+                classes,
+                onObservation = { observations.add(it) },
+            ) {
+                if (fail) {
+                    if (factories == interruptedAttempt) throw callback
+                    if (factories < interruptedAttempt) throw earlier
+                }
+            }
+        if (System.getProperty("pennilogic.testing.flakeNegativeControl") == "true") {
+            runner.run()
+            error("caused-shrink-negative-control-did-not-fail")
+        }
+        val (failure, output) = capturePropertyOutput { assertThrows(IllegalStateException::class.java) { runner.run() } }
+        assertEquals("property-execution-incomplete", failure.message)
+        assertEquals(interruptedAttempt, factories, "interrupted-shrink-does-not-authorize-reexecution")
+        assertTrue(failure.suppressed.any { it === callback }, "interrupted-callback-provenance")
+        if (interruptedAttempt == 2) {
+            assertTrue(
+                failure.suppressed.any { suppressed ->
+                    generateSequence(suppressed) { it.cause }.take(16).any { it === earlier }
+                },
+                "first-attempt-provenance",
+            )
+        }
+        assertFalse((failure.stackTraceToString() + output).contains("synthetic-private-shrinker"))
+        val observation = observations.single()
+        assertEquals(FlakeClassification.INCOMPLETE, observation.classification)
+        assertEquals(AttemptOutcome.INCOMPLETE, observation.attempts.last().outcome)
+        assertEquals(interruptedAttempt, observation.attempts.size)
+        assertEquals(0, observation.flakesInWindow)
+        assertFalse(observation.quarantineAdvisory)
+        println(event(output))
+
+        fail = false
+        runner.run()
+        assertEquals(interruptedAttempt + 1, factories)
+        assertEquals(FlakeClassification.STABLE_SUCCESS, observations.last().classification)
+        assertEquals(0, observations.last().flakesInWindow)
+    }
+
+    private class UnverifiableInput {
+        var succeeds = false
+        var comparisons = 0
+
+        override fun equals(other: Any?): Boolean {
+            comparisons++
+            return true
+        }
+
+        override fun hashCode(): Int = error("synthetic-untrusted-hash")
+
+        override fun toString(): String = error("synthetic-untrusted-string")
+    }
+
+    private fun <T> sequenceFixture(inputs: List<T>): Arb<FixtureCase<T>> =
+        object : Arb<FixtureCase<T>>() {
+            private var position = 0
+
+            override fun edgecase(rs: RandomSource): Sample<FixtureCase<T>>? = null
+
+            override fun sample(rs: RandomSource): Sample<FixtureCase<T>> =
+                sampleOf(
+                    FixtureCase("synthetic-same-label", inputs[position++ % inputs.size], ExpectedInvariant.HARNESS_STABILITY),
+                    Shrinker { emptyList() },
+                )
+        }
+
+    private fun reporterAbort(
+        classes: Set<String>,
+        id: String,
+    ) {
+        var factories = 0
+        var abortReporter = true
+        val original = AssertionError("synthetic-original-callback")
+        val observations = mutableListOf<FlakeObservation>()
+        val runner =
+            propertyCheck(
+                id,
+                1,
+                {
+                    factories++
+                    fixture()
+                },
+                classes,
+                onObservation = {
+                    observations.add(it)
+                    if (abortReporter) throw TestAbortedException("synthetic-private-reporter")
+                },
+            ) {
+                if (factories == 1) throw original
+            }
+        if (System.getProperty("pennilogic.testing.flakeNegativeControl") == "true") {
+            runner.run()
+            error("reporter-negative-control-did-not-fail")
+        }
+        val (failure, output) = capturePropertyOutput { assertThrows(AssertionError::class.java) { runner.run() } }
+        assertTrue(generateSequence<Throwable>(failure) { it.cause }.take(16).any { it === original }, "original-assertion-provenance")
+        assertEquals("flake-observation-reporting-failed", failure.suppressed.single().message)
+        assertFalse((failure.stackTraceToString() + output).contains("synthetic-private-reporter"))
+        val expectedAttempts = if ("money_path" in classes) 1 else 2
+        assertEquals(expectedAttempts, factories)
+        assertEquals(expectedAttempts, observations.single().attempts.size)
+        assertTrue(observations.single().blocked)
+        println(event(output))
+
+        abortReporter = false
+        runner.run()
+        assertEquals(expectedAttempts + 1, factories, "reporter-failure-releases-runner")
+        assertEquals(FlakeClassification.STABLE_SUCCESS, observations.last().classification)
+    }
+
     private fun fixture(): Arb<FixtureCase<Unit>> =
         Arb.constant(FixtureCase("synthetic-fixed-input", Unit, ExpectedInvariant.HARNESS_STABILITY))
 
@@ -420,7 +946,7 @@ class FlakeHarnessTest {
     ): AdvisoryCheck =
         AdvisoryCheck(FlakePolicy.accepted(), ::identity, setOf("api_service"), clock = clock(), onObservation = {
             observations.add(it)
-        }, action = action)
+        }) { action() }
 
     private fun event(output: String): String {
         val line = output.lineSequence().single { it.startsWith("{\"event\":\"flaky_test_observation\"") }
