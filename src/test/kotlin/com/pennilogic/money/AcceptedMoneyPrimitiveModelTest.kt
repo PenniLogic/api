@@ -403,7 +403,7 @@ class AcceptedMoneyPrimitiveModelTest {
             assertThrows(AssertionFailedError::class.java) {
                 checks.compare("primitive-redaction-values", { sensitive }, { Any() })
             }
-        assertTrue(failure.message == "primitive-redaction-values")
+        assertTrue(failure.message == "primitive-redaction-values " + MoneyDiagnostic.failed(MoneyOperation.COMPARE).fields())
         assertFalse(failure.isExpectedDefined)
         assertFalse(failure.isActualDefined)
         assertFalse(failure.stackTraceToString().contains(marker))
@@ -417,7 +417,7 @@ class AcceptedMoneyPrimitiveModelTest {
                         { if (side == 1) throw Error(marker, IllegalStateException(marker)) else sensitive },
                     )
                 }
-            assertTrue(thrown.message == id)
+            assertTrue(thrown.message == id + " " + MoneyDiagnostic.failed(MoneyOperation.COMPARE).fields())
             assertTrue(thrown.cause == null)
             assertFalse(thrown.stackTraceToString().contains(marker))
         }
@@ -433,7 +433,7 @@ class AcceptedMoneyPrimitiveModelTest {
             assertThrows(AssertionFailedError::class.java) {
                 checks.compare("primitive-redaction-equality", { throwingEquality }, { Any() })
             }
-        assertTrue(equalityFailure.message == "primitive-redaction-equality")
+        assertTrue(equalityFailure.message == "primitive-redaction-equality " + MoneyDiagnostic.failed(MoneyOperation.COMPARE).fields())
         assertFalse(equalityFailure.stackTraceToString().contains(marker))
         val duplicate =
             assertThrows(AssertionFailedError::class.java) {
@@ -461,16 +461,18 @@ class AcceptedMoneyPrimitiveModelTest {
             assertTrue(caseId.matches(caseIdPattern), "primitive-static-case-id")
             if (!identities.add(caseId)) throw AssertionFailedError("primitive-duplicate-case-id")
             // Both calculations and equality are inside the redaction boundary; no throwable is retained.
+            var failure: MoneyDiagnostic? = null
             val agrees =
                 try {
                     expected() == actual()
-                } catch (_: Throwable) {
+                } catch (error: Throwable) {
+                    failure = MoneyDiagnostic.failed(MoneyOperation.COMPARE, error)
                     false
                 }
             comparisons += 1
             if (!agrees) {
                 disagreements += 1
-                throw AssertionFailedError(caseId)
+                throw AssertionFailedError("$caseId ${(failure ?: MoneyDiagnostic.failed(MoneyOperation.COMPARE)).fields()}")
             }
         }
 
