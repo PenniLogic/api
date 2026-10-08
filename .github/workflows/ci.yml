@@ -42,6 +42,13 @@
           }
         },
         {
+          "name": "Node",
+          "uses": "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+          "with": {
+            "node-version-file": ".nvmrc"
+          }
+        },
+        {
           "name": "JDK",
           "uses": "actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6",
           "with": {
@@ -50,15 +57,19 @@
           }
         },
         {
+          "name": "Prepare API Node SDK",
+          "run": "set -o pipefail\nif ! /usr/bin/env -0 2>/dev/null | while IFS= read -r -d '' setting; do\n  name=\"${setting%%=*}\"\n  case \"${name^^}\" in\n    NODE_OPTIONS|NODE_PATH|NPM_CONFIG_NODE_OPTIONS|NPM_CONFIG_NODE-OPTIONS) exit 1 ;;\n  esac\ndone; then\n  echo \"::error::API Node SDK startup environment check failed.\" >&2\n  exit 1\nfi\ncase \"${RUNNER_TOOL_CACHE-}\" in\n  /*) ;;\n  *) echo \"::error::API runner tool cache must be absolute.\" >&2; exit 1 ;;\nesac\ncase \"$RUNNER_TOOL_CACHE\" in\n  *$'\\n'*|*$'\\r'*) echo \"::error::API runner tool cache must be one line.\" >&2; exit 1 ;;\nesac\nsdk=\"$RUNNER_TOOL_CACHE/node/24.14.0/x64\"\nnode=\"$sdk/bin/node\"\nnpm=\"$sdk/lib/node_modules/npm/bin/npm-cli.js\"\nif [ ! -f \"$node\" ] || [ ! -x \"$node\" ] || [ ! -f \"$npm\" ]; then\n  echo \"::error::API Node SDK or bundled npm is missing.\" >&2\n  exit 1\nfi\nif ! version=\"$(\"$node\" --version)\" || [ \"$version\" != \"v24.14.0\" ]; then\n  echo \"::error::API Node SDK version check failed.\" >&2\n  exit 1\nfi\nif ! version=\"$(\"$node\" \"$npm\" --version)\" || [ \"$version\" != \"11.9.0\" ]; then\n  echo \"::error::API bundled npm version check failed.\" >&2\n  exit 1\nfi\nprintf 'MONEY_CLIENT_INTEROP_NODE=%s\\n' \"$node\" >> \"${GITHUB_ENV:?GitHub step environment is missing}\"\n"
+        },
+        {
           "name": "Run checks",
-          "run": "python scripts/check_repository.py\npython scripts/materialize_money_sources.py\npython scripts/money_provider.py --source-root \"build/source-materialization/contracts-aa8d90cb98cec9b6dd08c91b3a4d869e47362662\" --strategy-file \"build/source-materialization/docs-a700e639585c61a4610e7b99dbd02b2dab28bdcc/governance/test-strategy.json\"\npython scripts/money_provider.py --verify\npython scripts/materialize_money_sources.py --verify\npython -I -S -B scripts/prepare_database_admission.py prepare --fetch\npython -I -S -B scripts/prepare_database_admission.py verify\npython scripts/quality.py build\npython -m unittest discover -s scripts/tests"
+          "run": "python scripts/check_repository.py\npython scripts/materialize_money_sources.py\npython scripts/money_provider.py --source-root \"build/source-materialization/contracts-aa8d90cb98cec9b6dd08c91b3a4d869e47362662\" --strategy-file \"build/source-materialization/docs-a700e639585c61a4610e7b99dbd02b2dab28bdcc/governance/test-strategy.json\"\npython scripts/money_provider.py --verify\npython scripts/materialize_money_sources.py --verify\npython -I -S -B scripts/prepare_database_admission.py prepare --fetch\npython -I -S -B scripts/prepare_database_admission.py verify\npython scripts/quality.py build --money-client-interop-node \"${MONEY_CLIENT_INTEROP_NODE:?API Node SDK was not prepared}\"\npython -m unittest discover -s scripts/tests"
         },
         {
           "name": "Coverage against explicit base",
           "env": {
             "BASE_SHA": "${{ github.event.pull_request.base.sha || github.sha }}"
           },
-          "run": "python scripts/quality.py coverage --base \"$BASE_SHA\""
+          "run": "python scripts/quality.py coverage --base \"$BASE_SHA\" --money-client-interop-node \"${MONEY_CLIENT_INTEROP_NODE:?API Node SDK was not prepared}\""
         }
       ]
     }

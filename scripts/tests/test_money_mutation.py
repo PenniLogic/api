@@ -932,6 +932,176 @@ class MutationNativeConsoleTest(unittest.TestCase):
 
 
 class ProcessBudgetTest(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "Windows Docker Desktop executable boundary")
+    def test_budgeted_quality_admits_only_the_approved_docker_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            approved, ambient = root / "approved", root / "ambient"
+            approved.mkdir()
+            ambient.mkdir()
+            system = process_budget.system_paths()[0]
+            binary = (system / "cmd.exe").read_bytes()
+            (approved / "docker.exe").write_bytes(binary)
+            (ambient / "ambient-only.exe").write_bytes(binary)
+            marker = root / "unexpected-startup"
+            (ambient / "sitecustomize.py").write_text(
+                f"__import__('pathlib').Path({str(marker)!r}).write_text('unexpected')", encoding="utf-8",
+            )
+            injected = {
+                "PYTHONPATH": str(ambient), "JAVA_TOOL_OPTIONS": "synthetic-options",
+                "NODE_OPTIONS": "synthetic-options", "AWS_SECRET_ACCESS_KEY": "synthetic-noncredential",
+            }
+            docker = Path(system.anchor) / "Program Files/Docker/Docker/resources/bin"
+            environment = process_budget.environment
+            admissions = []
+
+            def controlled_environment(supplied=None, *, runtime_dirs=()):
+                directories = list(runtime_dirs)
+                if directories == [docker]:
+                    admissions.append(docker)
+                    directories = [approved]
+                return environment(supplied, runtime_dirs=directories)
+
+            code = (
+                "import json,os,pathlib,shutil,subprocess,sys;"
+                "tool=shutil.which('docker.exe');"
+                "approved=bool(tool) and pathlib.Path(tool).resolve()==pathlib.Path("
+                + repr(str(approved / "docker.exe")) + ").resolve();"
+                "clean=not any(name in os.environ for name in " + repr(tuple(injected)) + ");"
+                "clean=clean and shutil.which('ambient-only.exe') is None;"
+                "status=subprocess.call([tool,'/d','/c','exit','0']) if approved else 23;"
+                "print(json.dumps({'approved':status==0,'isolated':clean}));"
+                "sys.exit(status if status else (0 if clean else 24))"
+            )
+            with (
+                patch.dict(os.environ, {**injected, "PATH": str(ambient)}),
+                patch.object(quality, "script_module", return_value=process_budget),
+                patch.object(process_budget, "environment", side_effect=controlled_environment),
+                patch("sys.stdout", new_callable=io.StringIO),
+            ):
+                result = quality.run(
+                    [sys.executable, "-I", "-S", "-B", "-c", code], root=root, capture=True, budget=10,
+                )
+            self.assertEqual(json.loads(result), {"approved": True, "isolated": True})
+            self.assertEqual(admissions, [docker])
+            self.assertFalse(marker.exists())
+            self.assertEqual((approved / "docker.exe").read_bytes(), binary)
+
+    @unittest.skipUnless(sys.platform == "win32", "Native Windows failed Job assignment cleanup")
+    def test_failed_native_attachment_reaps_bootstrap_and_refuses_interop_evidence(self):
+        interop = quality.script_module("money_client_interop")
+        for label, module in (("helper", process_budget), ("interop", interop.process_budget)):
+            with self.subTest(caller=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                marker = root / "unexpected-command"
+                worker = root / "owned-worker.py"
+                worker.write_text(
+                    f"__import__('pathlib').Path({str(marker)!r}).write_text('unexpected')", encoding="utf-8",
+                )
+                spawned = []
+                popen, attach = subprocess.Popen, module.WindowsJob.attach
+
+                def remember(*args, **kwargs):
+                    process = popen(*args, **kwargs)
+                    spawned.append(process)
+                    return process
+
+                def invalid_owned_job(job, process):
+                    self.assertTrue(job.api.CloseHandle(job.handle))
+                    try:
+                        attach(job, process)
+                    finally:
+                        job.handle = None
+
+                error = None
+                started = time.monotonic()
+                try:
+                    with (
+                        patch.object(module.subprocess, "Popen", side_effect=remember),
+                        patch.object(module.WindowsJob, "attach", invalid_owned_job),
+                    ):
+                        try:
+                            if label == "helper":
+                                module.run([sys.executable, "-I", "-S", "-B", str(worker)],
+                                           root, 2, capture=True, separate=True)
+                            else:
+                                with patch.object(interop, "__file__", str(worker)), patch.object(interop, "SECONDS", 2):
+                                    interop.launch_run(root, Mock(java=None))
+                        except (OSError, subprocess.TimeoutExpired) as failure:
+                            error = failure
+                    self.assertIsInstance(error, OSError)
+                    self.assertEqual(str(error), "Cannot attach the launched process to its budget job")
+                    self.assertLess(time.monotonic() - started, 2)
+                    self.assertEqual(len(spawned), 1)
+                    self.assertIsNotNone(spawned[0].poll())
+                    self.assertTrue(all(stream.closed for stream in (
+                        spawned[0].stdin, spawned[0].stdout, spawned[0].stderr,
+                    ) if stream is not None))
+                    self.assertFalse(marker.exists())
+                    if label == "interop":
+                        self.assertEqual(interop.read_json(root / interop.AREA / "current.json")["status"], "refused")
+                        self.assertFalse((root / interop.AREA / "run.lock").exists())
+                finally:
+                    for process in spawned:
+                        if process.poll() is None:
+                            process.kill()
+                        process.wait(timeout=10)
+                        for stream in (process.stdin, process.stdout, process.stderr):
+                            if stream is not None:
+                                stream.close()
+        self.assertEqual(process_budget.run(
+            [sys.executable, "-I", "-S", "-B", "-c", "pass"], SCRIPTS, 10, capture=True,
+        ).returncode, 0)
+
+    def test_pipe_read_errors_cannot_become_successful_capture(self):
+        for error in (OSError, ValueError):
+            class BrokenStream:
+                def read(self, _count):
+                    raise error("synthetic-closed-stream")
+
+            class Process:
+                stdout, stderr = BrokenStream(), None
+
+            with self.subTest(error=error.__name__), patch.object(process_budget.threading, "excepthook") as diagnostic:
+                capture = process_budget.Capture(Process())
+                for thread in capture.threads:
+                    thread.join(timeout=1)
+                    self.assertFalse(thread.is_alive())
+                self.assertTrue(capture.failed, "read-error-was-not-recorded")
+                diagnostic.assert_not_called()
+
+    def test_approved_system_shell_survives_without_inheriting_ambient_path(self):
+        command = (["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Write-Output 'approved-shell'"]
+                   if os.name == "nt" else ["/bin/sh", "-c", "printf 'approved-shell\\n'"])
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"PATH": temporary}):
+            result = process_budget.run(command, SCRIPTS, 10, capture=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), "approved-shell")
+
+    def test_bootstrap_and_worker_exclude_startup_hooks_and_ambient_credentials(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            marker = root / "unexpected-startup"
+            (root / "sitecustomize.py").write_text(
+                f"__import__('pathlib').Path({str(marker)!r}).write_text('synthetic-startup')",
+                encoding="utf-8",
+            )
+            injected = {
+                "PYTHONPATH": str(root), "JAVA_TOOL_OPTIONS": "synthetic-options",
+                "NODE_OPTIONS": "synthetic-options", "AWS_SECRET_ACCESS_KEY": "synthetic-noncredential",
+            }
+            code = (
+                "import os,json; print(json.dumps({'clean':not any(name in os.environ for name in "
+                + repr(tuple(injected)) + ")}))"
+            )
+            with patch.dict(os.environ, injected):
+                result = process_budget.run(
+                    [sys.executable, "-I", "-S", "-B", "-c", code], root, 10, capture=True,
+                )
+            self.assertEqual(result.returncode, 0)
+            self.assertFalse(marker.exists(), "unbound-startup-hook-ran")
+            self.assertEqual(json.loads(result.stdout), {"clean": True})
+
     @unittest.skipUnless(sys.platform == "win32", "Windows Job Object startup ordering")
     def test_actual_command_waits_until_its_job_is_attached(self):
         with tempfile.TemporaryDirectory() as temporary:
