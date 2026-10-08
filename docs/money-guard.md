@@ -153,6 +153,10 @@ Build, full `coverage` and focused `money-mutation` verify the latest mutation r
 the final input/output bytes before success. Full coverage refreshes mutation through the
 existing Gradle dependency graph after its forced Money tests: build followed by coverage
 performs two real PIT runs, within each command's remaining at-most-600-second budget.
+The optional [combined `build --base` path](money-mutation.md#combined-build-and-reviewed-base-coverage)
+applies both reviewed-base coverage checks before that build's final mutation readback,
+without requesting another Gradle graph. It does not weaken standalone coverage or
+change the generated CI caller.
 The coverage-only commands do not qualify mutation and can stale an earlier result;
 `money-mutation-report` only reads and verifies, never repairs it. See the
 [terminal-freshness correction](money-mutation.md#terminal-freshness-after-full-coverage).
@@ -180,7 +184,8 @@ the generated baseline changes its provider reference, not its counters or ratch
 
 `quality/money-coverage-baseline.json` is generated from this actual report. The native package
 gate refuses a decline from that recorded baseline even above the floors. The documented
-reviewed-base `coverage --base <full SHA>` command additionally compares the committed base's
+reviewed-base `coverage --base <full SHA>` and combined `build --base <full SHA>` commands
+additionally compare the committed base's
 Money baseline, when it exists. This is the first Money-package baseline; `04f9701` had none,
 which is reported explicitly rather than using its unrelated own-main coverage.
 Regeneration uses `money-coverage --write-baseline --base <full reviewed SHA>` and still refuses

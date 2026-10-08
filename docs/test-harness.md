@@ -429,6 +429,10 @@ The original **full local and CI suite under five minutes** requirement remains
 unchanged and must be demonstrated on the actual complete executions. A
 targeted run or sum of class durations does not prove it. Native job and
 whole-workflow under 600 seconds are additional outer ceilings, not substitutes.
+The optional [combined build/base qualification](money-mutation.md#combined-build-and-reviewed-base-coverage)
+reuses the existing build graph and coverage guards before final mutation verification.
+It needs canonical Infra caller adoption to avoid the separate coverage invocation;
+this API CLI change alone is neither a measured speedup nor under-five-minute evidence.
 Independent Core/QA/Money-risk review, current-base native CI, publication and
 protected integration remain the coordinator's work. This increment closes
 none of #1, #2, #3 or #22.

@@ -829,6 +829,8 @@ class FullMoneyCommandTest(unittest.TestCase):
     def setUp(self):
         self.clock = 1000
         self.calls = Mock()
+        self.real_check_coverage = quality.check_coverage
+        self.real_check_money_coverage = quality.check_money_coverage
         for name in ("gradle", "test_metrics", "check_coverage", "check_money_coverage"):
             self.enterContext(patch.object(quality, name, getattr(self.calls, name)))
         self.loader = self.enterContext(patch.object(
@@ -846,7 +848,11 @@ class FullMoneyCommandTest(unittest.TestCase):
 
     def expected_calls(self, command, write_baseline=False):
         checks = {
-            "build": [call.test_metrics()],
+            "build": [
+                call.test_metrics(),
+                call.check_coverage(self.base, write_baseline),
+                call.check_money_coverage(self.base, write_baseline),
+            ],
             "coverage": [
                 call.check_coverage(self.base, write_baseline),
                 call.check_money_coverage(self.base, write_baseline),
@@ -863,6 +869,29 @@ class FullMoneyCommandTest(unittest.TestCase):
                 self.assertEqual(0, self.invoke(command))
                 self.assertEqual(self.expected_calls(command), self.calls.mock_calls)
                 self.loader.assert_called_once_with("money_mutation")
+
+    def test_build_without_base_preserves_its_graph_and_does_not_infer_an_environment_base(self):
+        with (
+            patch.dict(os.environ, {"BASE_SHA": self.base}),
+            patch.object(sys, "argv", ["quality.py", "build"]),
+        ):
+            self.assertEqual(0, quality.main())
+        self.assertEqual([
+            call.gradle("build", "installDist", budget=600), call.test_metrics(), call.check_latest(),
+        ], self.calls.mock_calls)
+
+    def test_invalid_combined_base_refuses_before_work_and_recovers(self):
+        for base in ("", "main", "--help", "a" * 39, "a" * 41, "g" * 40, "a" * 40 + "\n"):
+            with self.subTest(base=base):
+                self.calls.reset_mock()
+                self.assertEqual(1, self.invoke("build", "--base=" + base))
+                self.assertIn("full trusted base commit SHA", self.errors.getvalue())
+                self.assertEqual([], self.calls.mock_calls)
+                self.provider.assert_not_called()
+                self.budget.assert_not_called()
+                self.loader.assert_not_called()
+        self.assertEqual(0, self.invoke("build"))
+        self.assertEqual(self.expected_calls("build"), self.calls.mock_calls)
 
     def test_missing_or_stale_final_evidence_blocks_each_full_command_and_restores(self):
         for command in self.tasks:
@@ -895,7 +924,8 @@ class FullMoneyCommandTest(unittest.TestCase):
 
     def test_failed_test_or_coverage_checks_prevent_full_command_success(self):
         for command, failed_check in (
-            ("build", "test_metrics"), ("coverage", "check_coverage"), ("coverage", "check_money_coverage"),
+            ("build", "test_metrics"), ("build", "check_coverage"), ("build", "check_money_coverage"),
+            ("coverage", "check_coverage"), ("coverage", "check_money_coverage"),
         ):
             with self.subTest(command=command, failed_check=failed_check):
                 self.calls.reset_mock()
@@ -905,6 +935,98 @@ class FullMoneyCommandTest(unittest.TestCase):
                 self.calls.check_latest.assert_not_called()
                 self.calls.gradle.assert_called_once_with(*self.tasks[command], budget=600)
                 check.side_effect = None
+                self.calls.reset_mock()
+                self.assertEqual(0, self.invoke(command))
+                self.assertEqual(self.expected_calls(command), self.calls.mock_calls)
+
+    def test_combined_build_checks_actual_aggregate_report_then_recovers(self):
+        fixture = CoverageRefusalDiagnosticsTest()
+        fixture.base = self.base
+        counters = {kind: {"covered": 9, "total": 10} for kind in ("LINE", "BRANCH")}
+        self.calls.check_coverage.side_effect = self.real_check_coverage
+        for defect in ("LINE", "BRANCH", "missing", "malformed"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                target = fixture.fixture(root, counters, counters)
+                baseline_bytes = target.read_bytes()
+                report = root / quality.REPORT
+                original = report.read_bytes()
+                reviewed = dict(counters)
+                if defect in counters:
+                    reviewed[defect] = {"covered": 10, "total": 10}
+                elif defect == "missing":
+                    report.unlink()
+                else:
+                    report.write_text("<report", encoding="utf-8")
+                with (
+                    patch.object(quality, "ROOT", root),
+                    patch.object(quality, "run", side_effect=fixture.git(reviewed)),
+                ):
+                    self.calls.reset_mock()
+                    self.assertEqual(1, self.invoke("build"))
+                    self.calls.check_money_coverage.assert_not_called()
+                    self.calls.check_latest.assert_not_called()
+                    reviewed.update(counters)
+                    report.write_bytes(original)
+                    self.calls.reset_mock()
+                    self.assertEqual(0, self.invoke("build"))
+                    self.assertEqual(self.expected_calls("build"), self.calls.mock_calls)
+                self.assertEqual(baseline_bytes, target.read_bytes())
+
+    def test_combined_build_checks_actual_money_report_then_recovers(self):
+        counters = {"LINE": {"covered": 97, "total": 100}, "BRANCH": {"covered": 93, "total": 100}}
+        floors = {"LINE": 97, "BRANCH": 93, "MUTATION": 90}
+        provider = Mock(SOURCE_REF="b" * 40, DOCS_REF="c" * 40)
+        provider.verify_outputs.return_value = [Path("Money.kt"), Path("CurrencyRegistry.kt")]
+        self.provider.return_value = provider
+        self.calls.check_money_coverage.side_effect = self.real_check_money_coverage
+        baseline = {
+            "strategy_package": "api.money", "contracts_source_ref": provider.SOURCE_REF,
+            "source_file_count": 2, "compiled_class_count": 2, **counters,
+        }
+        for defect in ("LINE", "BRANCH", "missing", "malformed"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                report = MoneyCoverageQualificationTest().report(root)
+                original = report.read_bytes()
+                target = root / quality.MONEY_BASELINE
+                target.parent.mkdir(parents=True)
+                target.write_text(json.dumps(baseline), encoding="utf-8")
+                baseline_bytes = target.read_bytes()
+                reviewed = dict(baseline)
+                if defect in counters:
+                    reviewed[defect] = {"covered": counters[defect]["covered"] + 1, "total": 100}
+                elif defect == "missing":
+                    report.unlink()
+                else:
+                    report.write_text("<report", encoding="utf-8")
+
+                def git(command, **_kwargs):
+                    if command == ["git", "ls-tree", "-r", "--name-only", self.base]:
+                        return quality.MONEY_BASELINE
+                    if command == ["git", "show", f"{self.base}:{quality.MONEY_BASELINE}"]:
+                        return json.dumps(reviewed)
+                    raise AssertionError("Unexpected Git operation in synthetic Money coverage fixture")
+
+                with (
+                    patch.object(quality, "ROOT", root),
+                    patch.object(quality, "MONEY_REPORT", report.relative_to(root)),
+                    patch.object(quality, "run", side_effect=git),
+                    patch.object(quality, "money_class_inventory", return_value={
+                        f"{quality.MONEY_PACKAGE}/Money", f"{quality.MONEY_PACKAGE}/CurrencyRegistry",
+                    }),
+                    patch.object(quality, "money_policy", return_value=(floors, "d" * 64)),
+                    patch.object(quality, "money_test_metrics", return_value={}),
+                ):
+                    self.calls.reset_mock()
+                    self.assertEqual(1, self.invoke("build"))
+                    self.calls.check_latest.assert_not_called()
+                    reviewed.update(counters)
+                    report.write_bytes(original)
+                    self.calls.reset_mock()
+                    self.assertEqual(0, self.invoke("build"))
+                    self.assertEqual(self.expected_calls("build"), self.calls.mock_calls)
+                self.assertEqual(baseline_bytes, target.read_bytes())
 
     def test_each_full_command_passes_only_its_remaining_budget_to_gradle(self):
         def read_budget(_):
@@ -935,6 +1057,27 @@ class FullMoneyCommandTest(unittest.TestCase):
                 self.assertEqual(self.expected_calls(command), self.calls.mock_calls)
                 self.assertIn("exceeded its enforced elapsed budget", self.errors.getvalue())
 
+    def test_both_combined_coverage_checks_remain_inside_the_build_deadline(self):
+        def finish_native_work(*_, **__):
+            self.clock += 599
+
+        def check_report(*_):
+            self.clock += 2
+
+        self.calls.gradle.side_effect = finish_native_work
+        for name in ("check_coverage", "check_money_coverage"):
+            with self.subTest(check=name):
+                check = getattr(self.calls, name)
+                check.side_effect = check_report
+                self.calls.reset_mock()
+                self.assertEqual(1, self.invoke("build"))
+                self.assertEqual(self.expected_calls("build"), self.calls.mock_calls)
+                self.assertIn("exceeded its enforced elapsed budget", self.errors.getvalue())
+                check.side_effect = None
+                self.calls.reset_mock()
+                self.assertEqual(0, self.invoke("build"))
+                self.assertEqual(self.expected_calls("build"), self.calls.mock_calls)
+
     def test_missing_numeric_budget_refuses_before_any_native_work(self):
         self.budget.side_effect = ValueError("Synthetic missing numeric Money budget")
         for command in self.tasks:
@@ -952,8 +1095,11 @@ class FullMoneyCommandTest(unittest.TestCase):
         self.assertEqual([], self.calls.mock_calls)
 
     def test_writing_coverage_baselines_still_refreshes_and_verifies_mutation(self):
-        self.assertEqual(0, self.invoke("coverage", "--write-baseline"))
-        self.assertEqual(self.expected_calls("coverage", True), self.calls.mock_calls)
+        for command in ("build", "coverage"):
+            with self.subTest(command=command):
+                self.calls.reset_mock()
+                self.assertEqual(0, self.invoke(command, "--write-baseline"))
+                self.assertEqual(self.expected_calls(command, True), self.calls.mock_calls)
 
     def test_standalone_mutation_report_remains_readonly(self):
         self.assertEqual(0, self.invoke("money-mutation-report"))
