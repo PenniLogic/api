@@ -1,0 +1,18 @@
+// Reuse the accepted smoke compiler and verified dependencies without editing its sources.
+gradle.projectsEvaluated {
+    def project = gradle.rootProject
+    def root = new File(System.getProperty("interop.root"))
+    project.layout.buildDirectory.set(new File(root, "kotlin"))
+    project.sourceSets.main.kotlin.setSrcDirs([
+        new File(root, "generated/kotlin/src/main/kotlin"),
+        new File(System.getProperty("interop.fixtures"), "kotlin"),
+    ])
+    project.tasks.register("moneyClientInteropCompile") {
+        dependsOn(project.tasks.named("classes"))
+        doLast {
+            new File(root, "kotlin-launch.json").text = groovy.json.JsonOutput.toJson([
+                classpath: project.sourceSets.main.runtimeClasspath.files.findAll { it.exists() }.collect { it.absolutePath }.sort(),
+            ]) + "\n"
+        }
+    }
+}

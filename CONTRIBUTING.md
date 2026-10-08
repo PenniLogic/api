@@ -3,7 +3,7 @@
 
 Read [AGENTS.md](AGENTS.md). Kotlin/Ktor health-service scaffold from the reviewed initial import only; no authentication, ledger or product APIs are implemented.
 
-Install Python 3.14, Git, and JDK 21, then run:
+Install Python 3.14, Git, Node 24.14.0 (see `.nvmrc`), and JDK 21, then run:
 
 ```text
 python scripts/setup.py
