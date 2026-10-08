@@ -28,6 +28,7 @@ internal enum class ExpectedInvariant(
     TRANSACTION_UUID("transaction-uuid"),
     ZERO_SUM("ledger-zero-sum"),
     ZERO_ENTRY("ledger-zero-entry"),
+    HARNESS_STABILITY("harness-stability"),
 }
 
 // Not a data class: property printers must never traverse the input's records.

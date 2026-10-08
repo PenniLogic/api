@@ -2,9 +2,11 @@ import org.gradle.api.artifacts.dsl.LockMode
 import org.gradle.api.tasks.testing.TestDescriptor
 import org.gradle.api.tasks.testing.TestListener
 import org.gradle.api.tasks.testing.TestResult
+import org.gradle.language.jvm.tasks.ProcessResources
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.LinkOption
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
@@ -148,9 +150,50 @@ jacoco {
     toolVersion = "0.8.15"
 }
 
+tasks.named<ProcessResources>("processTestResources") {
+    dependsOn(prepareAcceptedSource)
+    from(layout.buildDirectory.file("contracts-money/strategy/governance/test-strategy.json")) {
+        into("testing/policy")
+    }
+}
+
+val sharedTestSources =
+    files(
+        sourceSets.main.get().allSource,
+        sourceSets.test.get().allSource,
+        acceptedSourceSet.allSource,
+        "build.gradle.kts",
+        "settings.gradle.kts",
+        "gradle.properties",
+        "gradle.lockfile",
+        "gradle/verification-metadata.xml",
+    )
+
 tasks.withType<Test>().configureEach {
     systemProperty("kotest.proptest.seed.write-failed", false)
     systemProperty("kotest.proptest.output.shrink-steps", true)
+    systemProperty("pennilogic.testing.task", name)
+    systemProperty(
+        "pennilogic.testing.flakeNegativeControl",
+        providers
+            .gradleProperty("flakeAdviceNegativeControl")
+            .map(String::toBooleanStrict)
+            .orElse(false)
+            .get(),
+    )
+    inputs.files(sharedTestSources)
+    doFirst {
+        val digest = MessageDigest.getInstance("SHA-256")
+        for (source in sharedTestSources.files.sortedBy { it.relativeTo(rootDir).invariantSeparatorsPath }) {
+            digest.update(source.relativeTo(rootDir).invariantSeparatorsPath.toByteArray(Charsets.UTF_8))
+            digest.update(0.toByte())
+            val content = source.readBytes()
+            digest.update(content.size.toString().toByteArray(Charsets.US_ASCII))
+            digest.update(0.toByte())
+            digest.update(content)
+        }
+        systemProperty("pennilogic.testing.source", digest.digest().joinToString("") { "%02x".format(it) })
+    }
     val taskName = name
     addTestListener(
         object : TestListener {

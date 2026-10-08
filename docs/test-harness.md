@@ -1,4 +1,4 @@
-# Shared property fixtures: bounded API3 source preparation
+# Shared property fixtures and advisory flake classification
 
 This increment belongs to the existing [#3](https://github.com/PenniLogic/api/issues/3).
 It is not whole-issue acceptance or a readiness change. The original dependency
@@ -162,11 +162,128 @@ again. These are per-suite measurements, not end-to-end workflow timing;
 property-backed PostgreSQL classes retain their `integrationTest` task
 attribution.
 
+## Advisory flake classification
+
+Every existing `checkProperty` call now executes through `AdvisoryCheck`, including
+the shared Money codec and PostgreSQL ledger consumers. These existing consumers
+are conservatively fixed to the accepted `money_path` change class: **zero
+re-executions**, including their deliberately failing controls. Assertions,
+shrinking, fixture seeds, coverage/mutation floors and process budgets are
+unchanged.
+
+`processTestResources` depends on the existing `prepareMoneyProvider` task. That
+task uses `money_provider.read_strategy` to verify the accepted Docs bytes before
+Gradle copies the strategy into the test classpath. `FlakePolicy` reads those
+bytes, not a second table of policy constants. Missing, malformed, duplicate-key,
+oversized or unsupported policy data fails; there is no permissive fallback.
+The existing source acquisition and offline verification commands are unchanged.
+
+For an explicitly ordinary synthetic property, `propertyCheck` accepts the
+strategy's declared change-class IDs and a **fresh arbitrary factory**. Each
+attempt uses the same seed, case count, fixture corpus and callback; the factory
+restarts the arbitrary's seed prefix rather than continuing its mutable cursor.
+The factory and callback belong to one runner instance. A mixed set containing
+`money_path` still receives zero re-executions. Callers must classify their actual
+change correctly; this is not a repository-wide changed-file classifier.
+
+The accepted policy permits one ordinary re-execution, only after an assertion
+failure. Configuring more than the permitted count fails before the fixture runs.
+The result is never an automatic green retry:
+
+| Complete attempt outcomes | Classification | Result of `run()` |
+| --- | --- | --- |
+| Pass | `stable_success` | Returns normally |
+| Failure with no retry permitted, or failure then failure | `stable_failure` | Throws the first assertion; retains the second assertion when distinct |
+| Failure then pass | `non_deterministic` | Records one flake event and still throws the first assertion |
+| Interrupted execution, or a missing permitted retry result | `incomplete` | Blocking; not proof of a flake |
+| Different source/configuration bindings | `not_comparable` or a pre-execution refusal | Blocking; not proof of a flake |
+
+Non-assertion exceptions do not authorize a classification retry. Kotest also
+wraps non-assertion callback exceptions as `AssertionFailedError`; the shared
+property adapter tracks the callback outcome before that wrapping and refuses
+to call it a completed assertion failure. Such interrupted properties fail with
+`property-execution-incomplete`. JUnit aborts are converted to blocking failures,
+not propagated as test skips. Assertions in fixture construction, sampling or
+execution-count validation also do not establish a completed callback failure.
+If the classification attempt is interrupted, its exception propagates and the
+event retains both the original failed outcome and the incomplete outcome. A
+clock moving backwards is an explicit history error, not a new observation.
+This is a classifier for this shared assertion/property harness, not a universal
+JUnit exception interceptor.
+
+A runner owns an initially empty, in-memory history of at most 256 observations,
+with at most the policy-permitted attempts per observation. It is not a shared
+cache, a file import, or retained native CI history. Reusing that same runner
+allows repeated observations; constructing another runner explicitly starts a
+new history. Duplicate/out-of-order observation numbers, backwards timestamps,
+missing results, retries after a pass/interruption, invalid identifiers and
+capacity exhaustion fail. History snapshots cannot be mutated by the caller.
+Overlapping use of a runner is refused, without corrupting its active execution.
+
+The observation timestamp is completion time in UTC. A flake counts when its
+timestamp is in the inclusive interval from the current completion time minus
+the policy's 14 days (24-hour days) through the current completion time. Exactly
+two failure-then-pass observations in that window set `quarantine_advisory: true`.
+An observation one nanosecond before the lower boundary does not count. Stable
+success does not erase still-current advice; expiry from the observation window
+is not a declaration that a quarantined test has been fixed.
+
+Each `flaky_test_observation` JSON line includes the safe test/seed identifiers,
+category/task, observation number, policy hash, source/configuration digests,
+every attempt's outcome and monotonic elapsed milliseconds, retry count, window
+count, classification and advisory flag. The source digest covers the task's
+main/test/accepted Money source inputs and Gradle configuration/lock/verification
+files. The configuration digest binds the property, seed, case count, corpus,
+policy and declared retry/change-class settings. Bindings may not change within
+or between observations of the same runner. They are comparability metadata,
+not an independent attestation or proof that external services are unchanged.
+The events contain no input records, exception text or financial values.
+Existing per-category suite durations remain the wall-clock attribution;
+classification attempts also have individually attributable durations.
+
+**No test is quarantined or skipped.** Advice is only a candidate flag, not an
+entry in a quarantine inventory. Every event explicitly states
+`quarantined: false`, `skipped: false`, and
+`quarantine_inventory_gates: "not_implemented"`. The accepted 2 percent actual
+quarantine-rate ceiling and 14-day actual quarantine maximum age are read and
+reported, but **repository-wide ceiling/expiry enforcement is not implemented**.
+There is no verified repository-wide denominator, quarantine inventory,
+fix-only exception or reviewer-approved deletion flow in this increment. Those
+policy obligations are not waived by calling this advisory. Native cross-run
+retention/aggregation and any later exclusion mechanism also remain unimplemented.
+
+### Advisory controls
+
+After the existing source preparation, run:
+
+```powershell
+.\gradlew.bat --no-daemon --console=plain '-Pkotlin.compiler.execution.strategy=in-process' test --tests 'com.pennilogic.testing.Flake*'
+.\gradlew.bat --no-daemon --console=plain '-Pkotlin.compiler.execution.strategy=in-process' test --tests 'com.pennilogic.testing.*'
+.\gradlew.bat --no-daemon --console=plain '-Pkotlin.compiler.execution.strategy=in-process' -PflakeAdviceNegativeControl=true test --tests '*FlakeHarnessTest.the real varying fixture*'
+.\gradlew.bat --no-daemon --console=plain '-Pkotlin.compiler.execution.strategy=in-process' integrationTest --tests 'com.pennilogic.ledger.LedgerPropertyPostgresTest'
+```
+
+The third command **must fail**, even though the permitted classification
+re-execution passes. It exposes the same deliberately varying, synthetic-only
+fixture used by the ordinary meta-test, through the actual Kotest engine.
+Its input remains `Unit` with the same case ID and seed; only the deliberately
+stateful assertion varies. The meta-test observes three failure/pass pairs,
+flags the second pair under the accepted policy, confirms the third still runs,
+and checks a separate stable recovery control. It catches its deliberate
+assertions only to test the harness; the negative-control command propagates
+the next original assertion to JUnit/Gradle. It does not mutate ledger logic.
+
+The other controls cover exact threshold/window boundaries, zero-money and mixed
+change-class retries, persistent real failure, incomplete/changed executions,
+policy/history/input refusal, bounded ASCII output and concurrent-instance
+refusal/recovery. They are not whole-suite timing or native CI qualification.
+
 ## Remaining original requirements
 
 Live API/OpenAPI and currently generated-client contract stages, Testcontainers
-adoption (the existing harness uses the pinned Docker CLI), flaky-test advisory
-and quarantine controls, broader realistic product generators and full original
+adoption (the existing harness uses the pinned Docker CLI), repository-wide
+quarantine inventory/rate/expiry gates and native history retention, broader
+realistic product generators and full original
 DoD remain pending. The fixture-contract test is not a live API contract test.
 The existing Money coverage/mutation gates retain every denominator, floor and
 budget, but do not establish whole-API3 acceptance.

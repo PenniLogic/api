@@ -16,17 +16,81 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.opentest4j.TestAbortedException
 import java.io.ByteArrayOutputStream
 import java.io.PrintStream
 import java.security.MessageDigest
+import java.time.Clock
 import java.util.concurrent.TimeUnit
 
-@OptIn(ExperimentalKotest::class)
 internal fun <T> checkProperty(
     id: String,
     cases: Int,
     generator: Arb<FixtureCase<T>>,
     onResult: (PropertyExecution) -> Unit = {},
+    check: (FixtureCase<T>) -> Unit,
+) {
+    propertyCheck(id, cases, { generator }, setOf("money_path"), onResult = onResult, check = check).run()
+}
+
+internal fun <T> propertyCheck(
+    id: String,
+    cases: Int,
+    generator: () -> Arb<FixtureCase<T>>,
+    changeClasses: Set<String>,
+    requestedRetries: Int? = null,
+    clock: Clock = Clock.systemUTC(),
+    onResult: (PropertyExecution) -> Unit = {},
+    onObservation: (FlakeObservation) -> Unit = {},
+    check: (FixtureCase<T>) -> Unit,
+): AdvisoryCheck {
+    require(Regex("[a-z][a-z0-9-]{0,63}").matches(id) && cases in 1..512) { "property-configuration" }
+    val policy = FlakePolicy.accepted()
+    val classes = changeClasses.toSet()
+    val seed = SharedFixtures.corpus.seed
+    val configuration =
+        buildJsonObject {
+            put("property", id)
+            put("cases", cases)
+            put("seed", seed)
+            put("fixtures", flakeDigest(SharedFixtures.resource().toByteArray(Charsets.UTF_8)))
+            put("policy", policy.digest)
+            put("retries", policy.retries(classes, requestedRetries))
+            put("change_classes", classes.sorted().joinToString(","))
+        }.toString()
+    return AdvisoryCheck(
+        policy,
+        {
+            FlakeIdentity(
+                id,
+                seed,
+                TestCategory.PROPERTY,
+                requireNotNull(System.getProperty("pennilogic.testing.task")) { "flake-task-missing" },
+                requireNotNull(System.getProperty("pennilogic.testing.source")) { "flake-source-missing" },
+                flakeDigest(configuration.toByteArray(Charsets.UTF_8)),
+            )
+        },
+        classes,
+        requestedRetries,
+        clock,
+        onObservation,
+    ) {
+        val arbitrary =
+            try {
+                generator()
+            } catch (_: AssertionError) {
+                throw IllegalStateException("property-execution-incomplete")
+            }
+        checkPropertyAttempt(id, cases, arbitrary, onResult, check)
+    }
+}
+
+@OptIn(ExperimentalKotest::class)
+private fun <T> checkPropertyAttempt(
+    id: String,
+    cases: Int,
+    generator: Arb<FixtureCase<T>>,
+    onResult: (PropertyExecution) -> Unit,
     check: (FixtureCase<T>) -> Unit,
 ) {
     require(Regex("[a-z][a-z0-9-]{0,63}").matches(id) && cases in 1..512) { "property-configuration" }
@@ -36,6 +100,8 @@ internal fun <T> checkProperty(
     var passed = 0
     var evaluations = 0
     var completed = false
+    var interrupted = false
+    var assertionObserved = false
     var primaryPending = false
     val families = mutableMapOf<ExpectedInvariant, Int>()
     val listener =
@@ -70,9 +136,17 @@ internal fun <T> checkProperty(
                         families.merge(case.expectedInvariant, 1, Int::plus)
                         primaryPending = false
                     }
+                    var outcomeKnown = false
                     try {
                         check(case)
+                        outcomeKnown = true
+                    } catch (error: AssertionError) {
+                        outcomeKnown = true
+                        assertionObserved = true
+                        throw error
                     } catch (error: MoneyWireException) {
+                        outcomeKnown = true
+                        assertionObserved = true
                         val field =
                             when (error.field) {
                                 "" -> "root"
@@ -83,12 +157,25 @@ internal fun <T> checkProperty(
                         // The accepted provider can reflect arbitrary extra keys; never retain its cause.
                         throw AssertionError("case=${case.id} operation=$id reason=${error.reason.wireName} field=$field")
                     } catch (_: SerializationException) {
+                        outcomeKnown = true
+                        assertionObserved = true
                         throw AssertionError("case=${case.id} operation=$id failure=json-decoding")
+                    } catch (_: TestAbortedException) {
+                        throw IllegalStateException("property-execution-incomplete")
+                    } finally {
+                        if (!outcomeKnown) interrupted = true
                     }
                 }
             }
+        if (interrupted) throw IllegalStateException("property-execution-incomplete")
         assertTrue(context.evals() == cases && context.successes() == cases && context.failures() == 0, "property=$id exact-execution")
         completed = true
+    } catch (error: AssertionError) {
+        // Kotest wraps non-assertion callback exceptions in AssertionFailedError too.
+        if (interrupted || !assertionObserved) throw IllegalStateException("property-execution-incomplete")
+        throw error
+    } catch (_: TestAbortedException) {
+        throw IllegalStateException("property-execution-incomplete")
     } finally {
         val elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
         val execution = PropertyExecution(id, seed, primary, passed, evaluations, families.toMap(), elapsed, completed)
@@ -138,18 +225,23 @@ internal class CapturedPropertyFailure(
     private fun digest(text: String): String = MessageDigest.getInstance("SHA-256").digest(text.toByteArray(Charsets.UTF_8)).toHexString()
 }
 
-// Call only from isolated tests holding JUnit's SYSTEM_OUT and SYSTEM_ERR resource locks.
 internal fun capturePropertyFailure(action: ((PropertyExecution) -> Unit) -> Unit): CapturedPropertyFailure {
+    val executions = mutableListOf<PropertyExecution>()
+    val (failure, output) = capturePropertyOutput { assertThrows(AssertionError::class.java) { action { executions.add(it) } } }
+    return CapturedPropertyFailure(failure, output, executions.toList())
+}
+
+// Call only from isolated tests holding JUnit's SYSTEM_OUT and SYSTEM_ERR resource locks.
+internal fun <T> capturePropertyOutput(action: () -> T): Pair<T, String> {
     val originalOut = System.out
     val originalErr = System.err
     val bytes = ByteArrayOutputStream()
-    val executions = mutableListOf<PropertyExecution>()
     PrintStream(bytes, true, Charsets.UTF_8).use { stream ->
         try {
             System.setOut(stream)
             System.setErr(stream)
-            val failure = assertThrows(AssertionError::class.java) { action { executions.add(it) } }
-            return CapturedPropertyFailure(failure, bytes.toString(Charsets.UTF_8), executions.toList())
+            val result = action()
+            return result to bytes.toString(Charsets.UTF_8)
         } finally {
             System.setOut(originalOut)
             System.setErr(originalErr)
