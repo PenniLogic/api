@@ -1,5 +1,6 @@
 import importlib.util
 import hashlib
+from contextlib import chdir
 import io
 import json
 import os
@@ -310,10 +311,63 @@ class QualityWindowsBatchBoundaryTest(unittest.TestCase):
                     self.assertEqual(call([*expected, "test", "installDist"], root, True, budget), self.run.call_args)
         self.popen.assert_not_called()
 
+    def test_relative_windows_roots_cannot_hide_unsafe_effective_directory(self):
+        unsafe = self.root / "checkout&relative-marker&"
+        child = unsafe / "child"
+        child.mkdir(parents=True)
+        roots = [(Path("."), unsafe), (Path("child") / "..", unsafe), (Path(".."), child)]
+        if os.name == "nt":
+            roots.append((Path(unsafe.drive + "."), unsafe))
+        for root, cwd in roots:
+            for capture in (False, True):
+                for budget in (None, 10):
+                    with self.subTest(root=root, capture=capture, budget=budget), chdir(cwd):
+                        with self.assertRaisesRegex(
+                            ValueError, "^Windows Gradle batch operands contain unsupported shell characters$",
+                        ):
+                            quality.gradle("test", root=root, capture=capture, budget=budget)
+        self.run.assert_not_called()
+        self.popen.assert_not_called()
+
+    def test_relative_windows_roots_use_the_same_absolute_wrapper_and_working_directory(self):
+        root = self.root / "checkout with ordinary spaces"
+        child = root / "child"
+        child.mkdir(parents=True)
+        roots = [(Path("."), root), (Path("child") / "..", root), (Path(".."), child)]
+        if os.name == "nt":
+            roots.append((Path(root.drive + "."), root))
+        for relative, cwd in roots:
+            for capture in (False, True):
+                for budget in (None, 10):
+                    with self.subTest(root=relative, capture=capture, budget=budget), chdir(cwd):
+                        self.assertEqual("observed", quality.gradle("test", root=relative, capture=capture, budget=budget))
+                    self.assertEqual(call(
+                        [str(root / "gradlew.bat"), "--no-daemon", "--console=plain",
+                         "-Pkotlin.compiler.execution.strategy=in-process", "test"],
+                        root, capture, budget,
+                    ), self.run.call_args)
+        self.popen.assert_not_called()
+
+    def test_effective_wrapper_target_is_checked_as_well_as_working_directory(self):
+        wrapper = self.root / "gradlew.bat"
+        resolve = Path.resolve
+
+        def resolved(path, *args, **kwargs):
+            return self.root / "target%TEMP%" / "gradlew.bat" if path == wrapper else resolve(path, *args, **kwargs)
+
+        with patch.object(Path, "resolve", autospec=True, side_effect=resolved):
+            with self.assertRaisesRegex(ValueError, "Windows Gradle batch operands"):
+                quality.gradle("test", root=self.root)
+        self.run.assert_not_called()
+        self.popen.assert_not_called()
+
     def test_posix_sh_keeps_literal_metacharacters_without_windows_restrictions(self):
-        root = self.root / "checkout & percent% bang! caret^ (group)"
+        root = Path("relative & percent% bang! caret^ (group)") / ".." / "checkout"
         node = root / "SDK & spaces" / "node"
-        with patch.object(quality, "os", SimpleNamespace(name="posix")):
+        with (
+            patch.object(quality, "os", SimpleNamespace(name="posix")),
+            patch.object(Path, "resolve", side_effect=AssertionError("POSIX wrapper operands must remain literal")),
+        ):
             self.assertEqual("observed", quality.gradle(
                 "task&data", root=root, capture=True, budget=10, money_client_interop_node=node,
             ))
@@ -326,6 +380,33 @@ class QualityWindowsBatchBoundaryTest(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "Native Windows batch argument boundary")
 class QualityWindowsBatchNativeTest(unittest.TestCase):
+    def test_relative_unsafe_checkout_is_refused_before_the_unchanged_wrapper_expands_it(self):
+        wrapper = (quality.ROOT / "gradlew.bat").read_bytes()
+        helper = quality.script_module("process_budget")
+        with tempfile.TemporaryDirectory(prefix="api-relative-wrapper-") as temporary:
+            parent = Path(temporary)
+            unsafe = parent / "checkout&relative-marker&"
+            child = unsafe / "child"
+            child.mkdir(parents=True)
+            (unsafe / "gradlew.bat").write_bytes(wrapper)
+            (unsafe / "relative-marker.cmd").write_text(
+                "@echo off\n> unexpected.marker echo unexpected-command\nexit /b 0\n", encoding="ascii",
+            )
+            environment = helper.environment({"JAVA_HOME": str(parent / "absent-jdk")})
+            roots = [(Path("."), unsafe), (Path("child") / "..", unsafe),
+                     (Path(".."), child), (Path(unsafe.drive + "."), unsafe)]
+            with patch.dict(os.environ, environment, clear=True):
+                for root, cwd in roots:
+                    for capture in (False, True):
+                        for budget in (None, 10):
+                            with self.subTest(root=root, capture=capture, budget=budget), chdir(cwd):
+                                with self.assertRaisesRegex(
+                                    ValueError, "^Windows Gradle batch operands contain unsupported shell characters$",
+                                ):
+                                    quality.gradle("--version", root=root, capture=capture, budget=budget)
+                            self.assertFalse((unsafe / "unexpected.marker").exists())
+            self.assertEqual(wrapper, (unsafe / "gradlew.bat").read_bytes())
+
     def test_actual_cli_and_direct_dispatch_refuse_before_any_wrapper_or_extra_marker(self):
         helper = quality.script_module("process_budget")
         with tempfile.TemporaryDirectory(prefix="api-batch-native-") as temporary:

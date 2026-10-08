@@ -74,6 +74,11 @@ def gradle(*tasks, root=ROOT, capture=False, budget=None, money_client_interop_n
         *command, "--no-daemon", "--console=plain", "-Pkotlin.compiler.execution.strategy=in-process", *properties, *tasks,
     ]
     check_windows_batch_operands(arguments)
+    if os.name == "nt":
+        root = root.resolve()
+        wrapper = root / "gradlew.bat"
+        check_windows_batch_operands((root, wrapper.resolve()))
+        arguments[0] = str(wrapper)
     return run(arguments, root, capture, budget)
 
 

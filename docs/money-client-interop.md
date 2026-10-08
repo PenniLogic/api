@@ -127,6 +127,13 @@ POSIX `sh` dispatch, omitted-Node behavior and direct executable-only collector
 runtime validation are unchanged. No ambient environment or PATH is admitted
 to work around the restriction.
 
+Windows dispatch resolves relative roots against the caller's current directory
+and checks both the effective absolute working directory and resolved wrapper
+target, in addition to the supplied argv. The wrapper is then invoked by its
+absolute path under that validated working directory, without PATH lookup.
+Using `.`, `..` or a drive-relative root cannot hide an unsafe checkout name from
+the check. POSIX root and wrapper spellings remain unchanged.
+
 Each owned baseline/candidate copy must run its own quality script with its own
 working directory and self-test artifact parent. Only the explicit SDK path is
 shared, not launch files, generated output or runtime evidence. `coverage --base`
