@@ -58,16 +58,23 @@ def run(command, root=ROOT, capture=False, budget=None):
     return result.stdout if capture else ""
 
 
+def check_windows_batch_operands(operands):
+    # Python argv quoting is not CMD escaping, including inside quoted paths.
+    if os.name == "nt" and any(re.search(r'[\x00-\x1f\x7f"%!^&|<>()]', str(operand)) for operand in operands):
+        raise ValueError("Windows Gradle batch operands contain unsupported shell characters")
+
+
 def gradle(*tasks, root=ROOT, capture=False, budget=None, money_client_interop_node=None):
     wrapper = root / ("gradlew.bat" if os.name == "nt" else "gradlew")
     command = [str(wrapper)] if os.name == "nt" else ["sh", str(wrapper)]
     properties = [] if money_client_interop_node is None else [
         "-PmoneyClientInteropNode=" + str(money_client_interop_node),
     ]
-    return run(
-        [*command, "--no-daemon", "--console=plain", "-Pkotlin.compiler.execution.strategy=in-process", *properties, *tasks],
-        root, capture, budget,
-    )
+    arguments = [
+        *command, "--no-daemon", "--console=plain", "-Pkotlin.compiler.execution.strategy=in-process", *properties, *tasks,
+    ]
+    check_windows_batch_operands(arguments)
+    return run(arguments, root, capture, budget)
 
 
 def read_report(path):
@@ -567,6 +574,7 @@ def main():
             if args.command in ("money-guard", "money-coverage-report", "money-mutation-report"):
                 parser.error("--money-client-interop-node requires a Gradle-producing command")
             node, _ = script_module("money_client_interop").node_runtime(args.money_client_interop_node)
+            check_windows_batch_operands((node,))
             gradle_options["money_client_interop_node"] = node
         if args.command == "version":
             gradle("--version", **gradle_options)

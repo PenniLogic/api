@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 SPEC = importlib.util.spec_from_file_location("quality", Path(__file__).resolve().parents[1] / "quality.py")
@@ -138,7 +139,43 @@ class QualityNodeBridgeTest(unittest.TestCase):
             run.assert_not_called()
         self.loader.assert_not_called()
 
+    def test_unsafe_windows_sdk_refuses_every_cli_branch_before_other_work(self):
+        commands = (
+            "version", "install", "build", "test", "lint", "format", "coverage",
+            "money-coverage", "money-mutation", "gate-self-test",
+        )
+        with (
+            patch.object(quality, "os", SimpleNamespace(name="nt")),
+            patch.object(quality, "gradle") as gradle,
+            patch.object(quality, "run") as run,
+            patch.object(quality, "gate_self_test") as self_test,
+            patch.object(quality, "money_provider_module") as provider,
+            patch.object(subprocess, "Popen") as popen,
+        ):
+            for name in ("SDK&extra&", "SDK%TEMP%", "SDK!TEMP!", "SDK^literal", "SDK(group)", "SDK & spaces"):
+                sdk = self.root / name
+                sdk.mkdir()
+                node = sdk / self.node.name
+                node.write_bytes(self.node.read_bytes())
+                npm = sdk / "node_modules/npm/bin/npm-cli.js"
+                npm.parent.mkdir(parents=True)
+                npm.write_bytes(self.npm.read_bytes())
+                for command in commands:
+                    with self.subTest(path=name, command=command):
+                        self.assertEqual(1, self.invoke(
+                            command, "--base", "a" * 40, "--artifact-dir", self.root,
+                            "--money-client-interop-node", node,
+                        ))
+                        self.assertIn("Windows Gradle batch operands contain unsupported shell characters",
+                                      self.errors.getvalue())
+            gradle.assert_not_called()
+            run.assert_not_called()
+            self_test.assert_not_called()
+            provider.assert_not_called()
+            popen.assert_not_called()
+
     def test_all_nine_self_test_calls_keep_root_path_tasks_and_all_seven_refusals(self):
+        real_gradle = quality.gradle
         for selected in (None, str(self.node)):
             calls = []
 
@@ -147,6 +184,10 @@ class QualityNodeBridgeTest(unittest.TestCase):
                 self.assertNotEqual(root, quality.ROOT)
                 self.assertEqual(self.root, root.parent)
                 self.assertEqual({} if selected is None else {"money_client_interop_node": selected}, options)
+                with patch.object(quality, "run", return_value="") as run:
+                    real_gradle(*tasks, root=root, capture=capture, **options)
+                    run.assert_called_once()
+                    self.assertEqual(root, run.call_args.args[1])
                 tests = root / "src/test/kotlin/com/pennilogic/bootstrap"
                 if (tests / "GateFailureTest.kt").exists():
                     report = root / "build/test-results/test/TEST-com.pennilogic.bootstrap.GateFailureTest.xml"
@@ -177,6 +218,16 @@ class QualityNodeBridgeTest(unittest.TestCase):
         self.assertEqual(14, sum('"rejected":true' in line.replace(" ", "")
                                  for line in self.output.getvalue().splitlines()))
 
+    def test_direct_self_test_refuses_an_unsafe_sdk_before_the_first_wrapper(self):
+        with (
+            patch.object(quality, "os", SimpleNamespace(name="nt")),
+            patch.object(quality, "run") as run,
+            self.assertRaisesRegex(ValueError, "Windows Gradle batch operands"),
+        ):
+            quality.gate_self_test(self.root, money_client_interop_node=self.root / "SDK%TEMP%" / "node.exe")
+        run.assert_not_called()
+        self.assertFalse(list(self.root.glob("api-gate-self-test-*")))
+
     def test_owned_baseline_candidate_roots_and_repeated_invocations_cannot_share_node_or_report_state(self):
         modules, reports = [], {}
         for name in ("baseline", "candidate"):
@@ -206,6 +257,128 @@ class QualityNodeBridgeTest(unittest.TestCase):
                 self.assertFalse(any(argument.startswith("-PmoneyClientInteropNode=") for argument in run.call_args.args[0]))
         self.assertNotEqual(modules[0].ROOT, modules[1].ROOT)
         self.assertEqual(reports, {path: path.read_bytes() for path in reports})
+
+
+class QualityWindowsBatchBoundaryTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="api-batch-boundary-"))).resolve()
+        self.enterContext(patch.object(quality, "os", SimpleNamespace(name="nt")))
+        self.run = self.enterContext(patch.object(quality, "run", return_value="observed"))
+        self.popen = self.enterContext(patch.object(subprocess, "Popen"))
+
+    def test_cmd_expansion_is_refused_before_dispatch(self):
+        for value in ("SDK&extra&", "SDK%TEMP%", "SDK%%TEMP%%", "SDK!TEMP!", "SDK!!TEMP!!",
+                      "SDK^literal", "SDK^&extra^&", "SDK(group)", "SDK & spaces"):
+            for budget in (None, 10):
+                with self.subTest(value=value, budget=budget), self.assertRaisesRegex(
+                    ValueError, "^Windows Gradle batch operands contain unsupported shell characters$",
+                ):
+                    quality.gradle("test", root=self.root, capture=True, budget=budget,
+                                   money_client_interop_node=self.root / value / "node.exe")
+        self.run.assert_not_called()
+        self.popen.assert_not_called()
+
+    def test_every_shell_character_and_control_in_any_operand_refuses_without_dispatch(self):
+        for character in '"%!^&|<>()' + "".join(map(chr, range(32))) + chr(127):
+            for field in ("wrapper", "node", "task"):
+                for capture in (False, True):
+                    for budget in (None, 10):
+                        root = self.root / ("checkout" + character + "path") if field == "wrapper" else self.root
+                        node = self.root / ("SDK" + character + "path") / "node.exe" if field == "node" else None
+                        task = "task" + character + "data" if field == "task" else "test"
+                        with self.subTest(character=repr(character), field=field, capture=capture, budget=budget):
+                            with self.assertRaisesRegex(ValueError, "Windows Gradle batch operands"):
+                                quality.gradle(task, root=root, capture=capture, budget=budget,
+                                               money_client_interop_node=node)
+        self.run.assert_not_called()
+        self.popen.assert_not_called()
+
+    def test_ordinary_spaces_and_non_cmd_neighbors_keep_exact_argv(self):
+        root = self.root / "checkout with spaces $[]{};,+@=~'`-"
+        node = root / "approved sdk with spaces" / "node.exe"
+        for selected in (None, node):
+            for budget in (None, 10):
+                with self.subTest(explicit=selected is not None, budget=budget):
+                    self.assertEqual("observed", quality.gradle(
+                        "test", "installDist", root=root, capture=True, budget=budget,
+                        money_client_interop_node=selected,
+                    ))
+                    expected = [str(root / "gradlew.bat"), "--no-daemon", "--console=plain",
+                                "-Pkotlin.compiler.execution.strategy=in-process"]
+                    if selected is not None:
+                        expected.append("-PmoneyClientInteropNode=" + str(node))
+                    self.assertEqual(call([*expected, "test", "installDist"], root, True, budget), self.run.call_args)
+        self.popen.assert_not_called()
+
+    def test_posix_sh_keeps_literal_metacharacters_without_windows_restrictions(self):
+        root = self.root / "checkout & percent% bang! caret^ (group)"
+        node = root / "SDK & spaces" / "node"
+        with patch.object(quality, "os", SimpleNamespace(name="posix")):
+            self.assertEqual("observed", quality.gradle(
+                "task&data", root=root, capture=True, budget=10, money_client_interop_node=node,
+            ))
+        self.assertEqual(call(
+            ["sh", str(root / "gradlew"), "--no-daemon", "--console=plain",
+             "-Pkotlin.compiler.execution.strategy=in-process", "-PmoneyClientInteropNode=" + str(node), "task&data"],
+            root, True, 10,
+        ), self.run.call_args)
+
+
+@unittest.skipUnless(os.name == "nt", "Native Windows batch argument boundary")
+class QualityWindowsBatchNativeTest(unittest.TestCase):
+    def test_actual_cli_and_direct_dispatch_refuse_before_any_wrapper_or_extra_marker(self):
+        helper = quality.script_module("process_budget")
+        with tempfile.TemporaryDirectory(prefix="api-batch-native-") as temporary:
+            parent = Path(temporary)
+            sdk = parent / "approved sdk with spaces"
+            sdk.mkdir()
+            node = sdk / "node.exe"
+            node.write_bytes(b"inert validation-only fixture; never executed")
+            npm = sdk / "node_modules/npm/bin/npm-cli.js"
+            npm.parent.mkdir(parents=True)
+            npm.write_bytes(b"inert paired npm fixture")
+            for root_name in ("checkout with ordinary spaces", "checkout&sec06-extra&", "checkout%TEMP%",
+                              "checkout!TEMP!", "checkout^literal", "checkout(group)"):
+                root = parent / root_name
+                (root / "scripts").mkdir(parents=True)
+                for filename in ("quality.py", "money_client_interop.py", "process_budget.py", "materialize_money_sources.py"):
+                    (root / "scripts" / filename).write_bytes((quality.ROOT / "scripts" / filename).read_bytes())
+                (root / "gradlew.bat").write_text(
+                    "@echo off\n> gradle-reached.marker echo wrapper-reached\nexit /b 0\n", encoding="ascii",
+                )
+                (root / "sec06-extra.cmd").write_text(
+                    "@echo off\n> sec06-extra.marker echo unexpected-command\nexit /b 0\n", encoding="ascii",
+                )
+                for caller in ("cli", "budgeted", "unbudgeted"):
+                    with self.subTest(root=root_name, caller=caller):
+                        unsafe = root_name != "checkout with ordinary spaces"
+                        if caller == "cli":
+                            result = helper.run(
+                                [sys.executable, "-I", "-S", "-B", str(root / "scripts/quality.py"), "install",
+                                 "--money-client-interop-node", str(node)],
+                                root, 10, capture=True,
+                            )
+                            self.assertEqual(1 if unsafe else 0, result.returncode)
+                            if unsafe:
+                                self.assertIn("Windows Gradle batch operands", result.stdout)
+                        else:
+                            with patch("sys.stdout", new_callable=io.StringIO):
+                                if unsafe:
+                                    with self.assertRaisesRegex(ValueError, "Windows Gradle batch operands"):
+                                        quality.gradle("test", root=root, capture=True,
+                                                       budget=10 if caller == "budgeted" else None,
+                                                       money_client_interop_node=node)
+                                else:
+                                    quality.gradle("test", root=root, capture=True,
+                                                   budget=10 if caller == "budgeted" else None,
+                                                   money_client_interop_node=node)
+                        reached = root / "gradle-reached.marker"
+                        self.assertEqual(not unsafe, reached.exists())
+                        self.assertFalse((root / "sec06-extra.marker").exists())
+                        if reached.exists():
+                            self.assertEqual("wrapper-reached", reached.read_text().strip())
+                            reached.unlink()
+            self.assertEqual(b"inert validation-only fixture; never executed", node.read_bytes())
 
 
 class GateSelfTestAdmissionCopyTest(unittest.TestCase):

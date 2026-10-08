@@ -113,6 +113,20 @@ retain it, including the seven plants and clean restoration. Report-only command
 and the direct Money guard reject the option; collector `prepare`/`verify` and the
 separate Kotlin smoke build do not gain new flags or tasks.
 
+On Windows, Python's argv quoting does not make `gradlew.bat` operands literal
+CMD data. The quality boundary therefore refuses `"`, `&`, `|`, `<`, `>`, `(`,
+`)`, `^`, `%`, `!`, ASCII control characters and DEL before batch dispatch.
+This covers the complete wrapper path, explicit Node property and task arguments
+in both budgeted and unbudgeted calls, including every isolated self-test call.
+The CLI also rejects an unsafe explicit Node path before starting any other
+command. Refusals have a static diagnostic and do not run the wrapper or runtime.
+Adding quotes or caret escapes does not bypass this conservative restriction.
+Plain spaces remain supported in SDK and checkout paths; parenthesized paths
+such as `Program Files (x86)` require an approved alternative without CMD syntax.
+POSIX `sh` dispatch, omitted-Node behavior and direct executable-only collector
+runtime validation are unchanged. No ambient environment or PATH is admitted
+to work around the restriction.
+
 Each owned baseline/candidate copy must run its own quality script with its own
 working directory and self-test artifact parent. Only the explicit SDK path is
 shared, not launch files, generated output or runtime evidence. `coverage --base`
