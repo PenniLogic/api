@@ -1,0 +1,32 @@
+{
+  "schema": "pennilogic.shared-test-fixtures/1",
+  "seed": 72131,
+  "values": [
+    {"id": "inr-maximum", "input": {"minor_units": "9223372036854775807", "currency": "INR"}, "expected_invariant": "money-round-trip", "tolerance": 0},
+    {"id": "inr-minimum", "input": {"minor_units": "-9223372036854775807", "currency": "INR"}, "expected_invariant": "money-round-trip", "tolerance": 0},
+    {"id": "inr-unit", "input": {"minor_units": "1", "currency": "INR"}, "expected_invariant": "money-round-trip", "tolerance": 0},
+    {"id": "inr-negative", "input": {"minor_units": "-1", "currency": "INR"}, "expected_invariant": "money-round-trip", "tolerance": 0},
+    {"id": "inr-beyond-js-integer", "input": {"minor_units": "9007199254740993", "currency": "INR"}, "expected_invariant": "money-round-trip", "tolerance": 0},
+    {"id": "inr-zero", "input": {"minor_units": "0", "currency": "INR"}, "expected_invariant": "money-round-trip", "tolerance": 0},
+    {"id": "jpy-maximum", "input": {"minor_units": "9223372036854775807", "currency": "JPY"}, "expected_invariant": "money-round-trip", "tolerance": 0},
+    {"id": "kwd-minimum", "input": {"minor_units": "-9223372036854775807", "currency": "KWD"}, "expected_invariant": "money-round-trip", "tolerance": 0},
+    {"id": "excluded-long-minimum", "input": {"minor_units": "-9223372036854775808", "currency": "INR"}, "expected_invariant": "money-out-of-range", "tolerance": 0},
+    {"id": "unknown-currency", "input": {"minor_units": "1", "currency": "XYZ"}, "expected_invariant": "money-currency-unknown", "tolerance": 0}
+  ],
+  "accounts": [
+    {"id": "asset-v7", "input": {"id": "019a0000-0000-7000-8000-000000000001", "type": "ASSET"}, "expected_invariant": "account-admitted", "tolerance": 0},
+    {"id": "expense-v7", "input": {"id": "019a0000-0000-7000-bfff-ffffffffffff", "type": "EXPENSE"}, "expected_invariant": "account-admitted", "tolerance": 0},
+    {"id": "liability-v7", "input": {"id": "019a0000-0000-7fff-8000-000000000003", "type": "LIABILITY"}, "expected_invariant": "account-admitted", "tolerance": 0},
+    {"id": "account-v4", "input": {"id": "019a0000-0000-4000-8000-000000000004", "type": "ASSET"}, "expected_invariant": "account-uuid", "tolerance": 0},
+    {"id": "account-nil", "input": {"id": "00000000-0000-0000-0000-000000000000", "type": "ASSET"}, "expected_invariant": "account-uuid", "tolerance": 0},
+    {"id": "account-wrong-variant", "input": {"id": "019a0000-0000-7000-0000-000000000006", "type": "ASSET"}, "expected_invariant": "account-uuid", "tolerance": 0}
+  ],
+  "transactions": [
+    {"id": "epoch", "input": {"id": "019b0000-0000-7000-8000-000000000001", "occurred_at": "1970-01-01T00:00:00.000Z", "value_date": null}, "expected_invariant": "transaction-admitted", "tolerance": 0},
+    {"id": "leap-day", "input": {"id": "019b0000-0000-7000-8000-000000000002", "occurred_at": "2000-02-29T23:59:59.999Z", "value_date": "2000-02-29"}, "expected_invariant": "transaction-admitted", "tolerance": 0},
+    {"id": "year-boundary", "input": {"id": "019b0000-0000-7000-8000-000000000003", "occurred_at": "1999-12-31T23:59:59.999Z", "value_date": "2000-01-01"}, "expected_invariant": "transaction-admitted", "tolerance": 0},
+    {"id": "beyond-epoch-int", "input": {"id": "019b0000-0000-7000-8000-000000000004", "occurred_at": "2038-01-19T03:14:08.000Z", "value_date": "2038-01-19"}, "expected_invariant": "transaction-admitted", "tolerance": 0},
+    {"id": "four-digit-year-end", "input": {"id": "019b0000-0000-7000-8000-000000000005", "occurred_at": "9999-12-31T23:59:59.999Z", "value_date": "9999-12-31"}, "expected_invariant": "transaction-admitted", "tolerance": 0},
+    {"id": "transaction-v4", "input": {"id": "019b0000-0000-4000-8000-000000000006", "occurred_at": "2000-02-29T00:00:00.000Z", "value_date": null}, "expected_invariant": "transaction-uuid", "tolerance": 0}
+  ]
+}
