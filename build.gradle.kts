@@ -1,5 +1,10 @@
 import org.gradle.api.artifacts.dsl.LockMode
+import org.gradle.api.tasks.testing.TestDescriptor
+import org.gradle.api.tasks.testing.TestListener
+import org.gradle.api.tasks.testing.TestResult
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
@@ -113,6 +118,7 @@ dependencies {
     implementation("org.postgresql:postgresql:42.7.13")
     testImplementation(platform("org.junit:junit-bom:6.1.3"))
     testImplementation("org.junit.jupiter:junit-jupiter")
+    testImplementation("io.kotest:kotest-property-jvm:6.2.5")
     testImplementation("io.ktor:ktor-server-test-host")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     mutationTool("org.pitest:pitest-command-line:1.30.0")
@@ -140,6 +146,42 @@ spotless {
 
 jacoco {
     toolVersion = "0.8.15"
+}
+
+tasks.withType<Test>().configureEach {
+    systemProperty("kotest.proptest.seed.write-failed", false)
+    systemProperty("kotest.proptest.output.shrink-steps", true)
+    val taskName = name
+    addTestListener(
+        object : TestListener {
+            override fun beforeSuite(suite: TestDescriptor) = Unit
+
+            override fun beforeTest(testDescriptor: TestDescriptor) = Unit
+
+            override fun afterTest(
+                testDescriptor: TestDescriptor,
+                result: TestResult,
+            ) = Unit
+
+            override fun afterSuite(
+                suite: TestDescriptor,
+                result: TestResult,
+            ) {
+                val className = suite.className ?: return
+                if (suite.parent?.className != null) return
+                val category =
+                    when {
+                        className.contains("Property") -> "property"
+                        className.contains("Contract") -> "contract"
+                        taskName == "integrationTest" -> "integration"
+                        else -> "unit"
+                    }
+                logger.lifecycle(
+                    """{"event":"test_category_suite","task":"$taskName","category":"$category","suite":"$className","wall_ms":${result.endTime - result.startTime},"tests":${result.testCount},"failed":${result.failedTestCount},"skipped":${result.skippedTestCount}}""",
+                )
+            }
+        },
+    )
 }
 
 tasks.test {
@@ -332,21 +374,38 @@ val dockerAvailable: Provider<Boolean> =
 
 val migrationTestContainerId = layout.buildDirectory.file("migration-test/container-id")
 
+object MigrationTestPostgresCleanup {
+    fun remove(file: File) {
+        if (!Files.exists(file.toPath(), LinkOption.NOFOLLOW_LINKS)) return
+        check(Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS)) { "Invalid migration test container marker" }
+        val id = file.readText().trim()
+        check(Regex("[0-9a-f]{64}").matches(id)) { "Invalid migration test container marker" }
+        val diagnostics = file.resolveSibling("docker-cleanup.log")
+        val process =
+            ProcessBuilder("docker", "rm", "-f", "-v", id)
+                .redirectErrorStream(true)
+                .redirectOutput(diagnostics)
+                .start()
+        if (!process.waitFor(30, TimeUnit.SECONDS)) {
+            process.destroyForcibly()
+            check(process.waitFor(5, TimeUnit.SECONDS)) { "Disposable PostgreSQL cleanup process did not stop; marker retained" }
+            error("Disposable PostgreSQL cleanup timed out; marker retained")
+        }
+        val acknowledged = diagnostics.readText().trim() == id
+        check(process.exitValue() == 0 && acknowledged) {
+            "Disposable PostgreSQL cleanup failed (exit=${process.exitValue()}, acknowledged=$acknowledged); marker retained"
+        }
+        check(file.delete()) { "Could not delete the disposable PostgreSQL container marker after cleanup" }
+    }
+}
+
 val stopMigrationTestPostgres =
     tasks.register("stopMigrationTestPostgres") {
-        description = "Removes the disposable Postgres container started for integrationTest."
+        description = "Removes the owned disposable Postgres container and its unshared anonymous volumes."
         group = "verification"
         val idFile = migrationTestContainerId
         doLast {
-            val file = idFile.get().asFile
-            if (file.isFile) {
-                ProcessBuilder("docker", "rm", "-f", file.readText().trim())
-                    .redirectErrorStream(true)
-                    .start()
-                    .apply { inputStream.readAllBytes() }
-                    .waitFor()
-                file.delete()
-            }
+            MigrationTestPostgresCleanup.remove(idFile.get().asFile)
         }
     }
 
@@ -369,6 +428,14 @@ val integrationTest =
             (files(tasks.jar) + configurations.runtimeClasspath.get()).asPath,
         )
         systemProperty("user.timezone", "UTC")
+        systemProperty(
+            "pennilogic.testing.ledgerNegativeControl",
+            providers
+                .gradleProperty("ledgerPropertyNegativeControl")
+                .map(String::toBooleanStrict)
+                .orElse(false)
+                .get(),
+        )
         testLogging {
             events("failed", "skipped")
         }
@@ -415,14 +482,7 @@ val integrationTest =
                     .trim()
             }
             // A previous run whose JVM died before its finalizer may have left this container behind; remove exactly that one.
-            if (file.isFile) {
-                ProcessBuilder("docker", "rm", "-f", file.readText().trim())
-                    .redirectErrorStream(true)
-                    .start()
-                    .apply { inputStream.readAllBytes() }
-                    .waitFor()
-                file.delete()
-            }
+            MigrationTestPostgresCleanup.remove(file)
             val password = UUID.randomUUID().toString()
             val id =
                 dockerCommand(
