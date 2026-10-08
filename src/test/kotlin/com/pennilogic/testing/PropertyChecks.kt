@@ -101,7 +101,7 @@ private fun <T> checkPropertyAttempt(
     var evaluations = 0
     var completed = false
     var interrupted = false
-    var assertionObserved = false
+    val callbackAssertions = mutableListOf<AssertionError>()
     var primaryPending = false
     val families = mutableMapOf<ExpectedInvariant, Int>()
     val listener =
@@ -142,11 +142,10 @@ private fun <T> checkPropertyAttempt(
                         outcomeKnown = true
                     } catch (error: AssertionError) {
                         outcomeKnown = true
-                        assertionObserved = true
+                        callbackAssertions.add(error)
                         throw error
                     } catch (error: MoneyWireException) {
                         outcomeKnown = true
-                        assertionObserved = true
                         val field =
                             when (error.field) {
                                 "" -> "root"
@@ -155,11 +154,14 @@ private fun <T> checkPropertyAttempt(
                                 else -> "unrecognized"
                             }
                         // The accepted provider can reflect arbitrary extra keys; never retain its cause.
-                        throw AssertionError("case=${case.id} operation=$id reason=${error.reason.wireName} field=$field")
+                        val failure = AssertionError("case=${case.id} operation=$id reason=${error.reason.wireName} field=$field")
+                        callbackAssertions.add(failure)
+                        throw failure
                     } catch (_: SerializationException) {
                         outcomeKnown = true
-                        assertionObserved = true
-                        throw AssertionError("case=${case.id} operation=$id failure=json-decoding")
+                        val failure = AssertionError("case=${case.id} operation=$id failure=json-decoding")
+                        callbackAssertions.add(failure)
+                        throw failure
                     } catch (_: TestAbortedException) {
                         throw IllegalStateException("property-execution-incomplete")
                     } finally {
@@ -172,15 +174,24 @@ private fun <T> checkPropertyAttempt(
         completed = true
     } catch (error: AssertionError) {
         // Kotest wraps non-assertion callback exceptions in AssertionFailedError too.
-        if (interrupted || !assertionObserved) throw IllegalStateException("property-execution-incomplete")
+        val callbackFailure =
+            generateSequence<Throwable>(error) { it.cause }.take(16).any { cause ->
+                callbackAssertions.any { it === cause }
+            }
+        if (interrupted || !callbackFailure) throw IllegalStateException("property-execution-incomplete")
         throw error
     } catch (_: TestAbortedException) {
         throw IllegalStateException("property-execution-incomplete")
     } finally {
         val elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
         val execution = PropertyExecution(id, seed, primary, passed, evaluations, families.toMap(), elapsed, completed)
-        onResult(execution)
-        println(execution.json())
+        try {
+            onResult(execution)
+        } catch (_: AssertionError) {
+            throw IllegalStateException("property-execution-incomplete")
+        } finally {
+            println(execution.json())
+        }
     }
 }
 

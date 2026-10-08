@@ -3,7 +3,9 @@ package com.pennilogic.testing
 import io.kotest.property.Arb
 import io.kotest.property.RandomSource
 import io.kotest.property.Sample
+import io.kotest.property.Shrinker
 import io.kotest.property.arbitrary.constant
+import io.kotest.property.sampleOf
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -223,6 +225,61 @@ class FlakeHarnessTest {
             assertTrue(observations.single().blocked)
             println(event(output))
         }
+    }
+
+    @Test
+    fun `an assertion interrupting shrinking cannot become a flake`() {
+        var engines = 0
+        val observations = mutableListOf<FlakeObservation>()
+        val runner =
+            propertyCheck(
+                "synthetic-shrinking-interruption",
+                1,
+                {
+                    engines++
+                    object : Arb<FixtureCase<Unit>>() {
+                        override fun edgecase(rs: RandomSource): Sample<FixtureCase<Unit>>? = null
+
+                        override fun sample(rs: RandomSource): Sample<FixtureCase<Unit>> =
+                            sampleOf(
+                                FixtureCase("synthetic-fixed-input", Unit, ExpectedInvariant.HARNESS_STABILITY),
+                                Shrinker { throw AssertionError("synthetic-shrinking-interruption") },
+                            )
+                    }
+                },
+                setOf("api_service"),
+                onObservation = { observations.add(it) },
+            ) { case -> case.verify("synthetic-callback-assertion", engines != 1) }
+        val (error, output) = capturePropertyOutput { assertThrows(IllegalStateException::class.java) { runner.run() } }
+        assertEquals("property-execution-incomplete", error.message)
+        assertEquals(1, engines)
+        assertEquals(FlakeClassification.INCOMPLETE, observations.single().classification)
+        assertTrue(observations.single().blocked)
+        println(event(output))
+    }
+
+    @Test
+    fun `an assertion interrupting result reporting cannot become a flake`() {
+        var engines = 0
+        val observations = mutableListOf<FlakeObservation>()
+        val runner =
+            propertyCheck(
+                "synthetic-reporting-interruption",
+                1,
+                {
+                    engines++
+                    fixture()
+                },
+                setOf("api_service"),
+                onResult = { if (engines == 1) throw AssertionError("synthetic-reporting-interruption") },
+                onObservation = { observations.add(it) },
+            ) {}
+        val (error, output) = capturePropertyOutput { assertThrows(IllegalStateException::class.java) { runner.run() } }
+        assertEquals("property-execution-incomplete", error.message)
+        assertEquals(1, engines)
+        assertEquals(FlakeClassification.INCOMPLETE, observations.single().classification)
+        assertTrue(observations.single().blocked)
+        println(event(output))
     }
 
     @Test

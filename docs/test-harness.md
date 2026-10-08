@@ -203,8 +203,11 @@ wraps non-assertion callback exceptions as `AssertionFailedError`; the shared
 property adapter tracks the callback outcome before that wrapping and refuses
 to call it a completed assertion failure. Such interrupted properties fail with
 `property-execution-incomplete`. JUnit aborts are converted to blocking failures,
-not propagated as test skips. Assertions in fixture construction, sampling or
-execution-count validation also do not establish a completed callback failure.
+not propagated as test skips. Assertions in fixture construction, sampling,
+shrinking, result reporting or execution-count validation also do not establish
+a completed callback failure. The engine's propagated assertion must retain an
+actual callback assertion by identity in its bounded cause chain; an earlier
+callback failure does not turn an unrelated shrinking interruption into a flake.
 If the classification attempt is interrupted, its exception propagates and the
 event retains both the original failed outcome and the incomplete outcome. A
 clock moving backwards is an explicit history error, not a new observation.
