@@ -449,6 +449,43 @@ No XML binding, timestamp, cache/up-to-date rule, provider, native selection, th
 baseline or generated workflow/profile is changed. The correction needs fresh separate
 Core/QA admission; frozen 6e's finite source reviews do not approve it.
 
+### Combined build and reviewed-base coverage
+
+The API-owned CLI can qualify the same build against an explicit reviewed base without
+starting a second Gradle invocation:
+
+```powershell
+python scripts\quality.py build --base "<full trusted base SHA>" --money-client-interop-node "<approved absolute Node executable>"
+```
+
+`build --base` runs the unchanged `build installDist` graph, including `check`, real
+PostgreSQL tests, generated-client interop, forced Money tests and mandatory PIT. After
+the ordinary test-count/skip/failure check, it calls the existing aggregate and Money
+coverage helpers with that base, then performs the existing final mutation-freshness
+verification. Aggregate floors, changed-line coverage, both reviewed-base ratchets,
+source/report inventories and baseline equality remain blocking. Baseline writing is
+not automatic; an explicit `--write-baseline` is passed to the same helpers without
+bypassing their guards or final freshness verification.
+
+An explicitly empty or malformed SHA fails before the build graph. The aggregate helper
+still verifies the named commit exists when reading its coverage baseline; no branch,
+environment value or implicit base is substituted. Omitting `--base` preserves the
+existing normal build behavior. Standalone `coverage --base` still runs its own coverage
+and mutation graph; it is not changed into a report-only command.
+
+All combined checks and the final readback remain inside the original build deadline.
+The graph receives only the remaining strategy-derived budget, capped at 600 seconds.
+Approved Node propagation, process ownership, cleanup and failure propagation are
+unchanged. A failed graph or coverage check never falls back to an old mutation result.
+
+Canonical Infra must supply the existing trusted `BASE_SHA` to the build command,
+retain the approved Node argument and all other checks, and remove the subsequent
+standalone coverage invocation only when adopting this combined path. The generated
+API workflow is not edited here. Until that caller changes, native CI still executes
+both graphs. Focused dispatcher and real synthetic-report regressions are not a new
+native timing result: eliminating a redundant invocation does not establish API #3's
+full-suite-under-five-minutes requirement or clear Windows environment failures.
+
 ### Q1 native-summary consistency correction
 
 The frozen `35267fc` executor compared the native generated count with XML, but the
