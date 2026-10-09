@@ -158,9 +158,49 @@ reported as property executions. `test_category_suite` console events record
 each top-level class suite's wall-clock span and test/failure/skip counts,
 separating property, contract, integration and unit suites. Nested and
 parameterized containers are included once in their parent class, not counted
-again. These are per-suite measurements, not end-to-end workflow timing;
+again. These existing intervals now explicitly name `boundary: top_level_class`
+and `clock: junit_epoch_ms`, with the original `started_ms` and `finished_ms`
+from Gradle's `TestResult`; `wall_ms` remains their difference. Class fixtures,
+including `BeforeAll` and `AfterAll`, are inside this boundary. These are
+per-suite measurements, not end-to-end workflow timing;
 property-backed PostgreSQL classes retain their `integrationTest` task
 attribution.
+
+The integration fixture also has work outside any JUnit class. The existing
+`integrationTest` setup action and `stopMigrationTestPostgres` cleanup action
+now emit `test_category_fixture` intervals in `finally`, categorized as
+`integration`. `phase: setup` covers the action's stale-container cleanup,
+container creation/image pull, readiness wait and environment setup.
+`phase: teardown` covers the exact existing removal/acknowledgment/marker
+cleanup action, including an absent-marker no-op when invoked alone.
+`boundary: fixture_action` excludes task dependencies, the Docker availability
+predicate, worker startup, gaps between classes and coverage/report generation.
+
+These fixture records use `clock: gradle_process_monotonic_ns`,
+`started_ns`, `finished_ns` and the elapsed `wall_ms`, not sums of XML case
+times. Their `outcome: completed|failed` describes only that action, never
+test success or proof that a database existed. The failure is rethrown unchanged;
+if timing/reporting also fails, its exception is suppressed on the original.
+No exception content, connection data or fixture payload is logged by the timer.
+A skipped/up-to-date setup emits no setup interval. A process killed before
+`finally` has no completed interval; missing evidence is not a zero duration.
+
+All these records are **individual category-attributed intervals**, not an
+additive category total or a complete-suite timer. Class intervals can overlap
+under parallel execution; the fixture clock can be compared only within its
+Gradle process and must not be numerically mixed with JUnit epoch timestamps.
+The task label still distinguishes PostgreSQL properties/contracts from
+ordinary ones. Do not sum overlapping intervals or classify the enclosing
+quality build/job as the full test suite. There is no new budget definition,
+threshold or under-five-minute claim.
+
+`CategoryTimingTest` uses one isolated, offline, no-Docker Gradle fixture to
+exercise the actual cleanup task and the same timing helper. Deterministic
+setup/failure/recovery, overlap, zero-duration, bad-clock, reporting-failure
+and invalid-phase controls capture synthetic timings rather than printing
+them as runtime events. The normal class event surrounds its genuine class
+fixture callbacks. Full PostgreSQL lifecycle qualification remains part of
+the existing integration route; these focused controls do not replace it.
 
 ## Class-scoped advisory-first property checks
 

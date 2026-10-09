@@ -220,7 +220,7 @@ tasks.withType<Test>().configureEach {
                         else -> "unit"
                     }
                 logger.lifecycle(
-                    """{"event":"test_category_suite","task":"$taskName","category":"$category","suite":"$className","wall_ms":${result.endTime - result.startTime},"tests":${result.testCount},"failed":${result.failedTestCount},"skipped":${result.skippedTestCount}}""",
+                    """{"event":"test_category_suite","task":"$taskName","category":"$category","suite":"$className","boundary":"top_level_class","clock":"junit_epoch_ms","started_ms":${result.startTime},"finished_ms":${result.endTime},"wall_ms":${result.endTime - result.startTime},"tests":${result.testCount},"failed":${result.failedTestCount},"skipped":${result.skippedTestCount}}""",
                 )
             }
         },
@@ -417,6 +417,42 @@ val dockerAvailable: Provider<Boolean> =
 
 val migrationTestContainerId = layout.buildDirectory.file("migration-test/container-id")
 
+object TestCategoryFixtureTiming {
+    fun measure(
+        phase: String,
+        report: (String) -> Unit,
+        clock: () -> Long = System::nanoTime,
+        action: () -> Unit,
+    ) {
+        require(phase in setOf("setup", "teardown")) { "test-category-fixture-phase" }
+        val task = if (phase == "setup") "integrationTest" else "stopMigrationTestPostgres"
+        val started = clock()
+        var failure: Throwable? = null
+        try {
+            action()
+        } catch (error: Throwable) {
+            failure = error
+            throw error
+        } finally {
+            try {
+                val finished = clock()
+                val elapsed = finished - started
+                check(elapsed >= 0) { "test-category-clock-order" }
+                val outcome = if (failure == null) "completed" else "failed"
+                report(
+                    """{"event":"test_category_fixture","task":"$task","category":"integration","phase":"$phase","boundary":"fixture_action","clock":"gradle_process_monotonic_ns","started_ns":$started,"finished_ns":$finished,"wall_ms":${TimeUnit.NANOSECONDS.toMillis(
+                        elapsed,
+                    )},"outcome":"$outcome"}""",
+                )
+            } catch (reportingError: Throwable) {
+                val original = failure
+                if (original == null) throw reportingError
+                if (reportingError !== original) original.addSuppressed(reportingError)
+            }
+        }
+    }
+}
+
 object MigrationTestPostgresCleanup {
     fun remove(file: File) {
         if (!Files.exists(file.toPath(), LinkOption.NOFOLLOW_LINKS)) return
@@ -448,7 +484,9 @@ val stopMigrationTestPostgres =
         group = "verification"
         val idFile = migrationTestContainerId
         doLast {
-            MigrationTestPostgresCleanup.remove(idFile.get().asFile)
+            TestCategoryFixtureTiming.measure("teardown", logger::lifecycle) {
+                MigrationTestPostgresCleanup.remove(idFile.get().asFile)
+            }
         }
     }
 
@@ -503,62 +541,64 @@ val integrationTest =
         val idFile = migrationTestContainerId
         val image = postgresImage
         doFirst {
-            val file = idFile.get().asFile
-            file.parentFile.mkdirs()
-            val diagnostics = file.resolveSibling("docker-stderr.log")
+            TestCategoryFixtureTiming.measure("setup", logger::lifecycle) {
+                val file = idFile.get().asFile
+                file.parentFile.mkdirs()
+                val diagnostics = file.resolveSibling("docker-stderr.log")
 
-            // Stdout carries the answer; stderr carries pull progress and errors, so the two are kept apart.
-            // The wait is bounded so a hung image pull fails here instead of at the 30-minute CI job timeout.
-            fun dockerCommand(vararg arguments: String): String {
-                val stdout = file.resolveSibling("docker-stdout.log")
-                val process = ProcessBuilder("docker", *arguments).redirectOutput(stdout).redirectError(diagnostics).start()
-                if (!process.waitFor(10, TimeUnit.MINUTES)) {
-                    process.destroyForcibly()
-                    error("docker ${arguments.first()} did not finish within 10 minutes: ${diagnostics.readText()}")
+                // Stdout carries the answer; stderr carries pull progress and errors, so the two are kept apart.
+                // The wait is bounded so a hung image pull fails here instead of at the 30-minute CI job timeout.
+                fun dockerCommand(vararg arguments: String): String {
+                    val stdout = file.resolveSibling("docker-stdout.log")
+                    val process = ProcessBuilder("docker", *arguments).redirectOutput(stdout).redirectError(diagnostics).start()
+                    if (!process.waitFor(10, TimeUnit.MINUTES)) {
+                        process.destroyForcibly()
+                        error("docker ${arguments.first()} did not finish within 10 minutes: ${diagnostics.readText()}")
+                    }
+                    val output = stdout.readText()
+                    check(process.exitValue() == 0) { "docker ${arguments.first()} failed: $output ${diagnostics.readText()}" }
+                    return output
+                        .trim()
+                        .lines()
+                        .last()
+                        .trim()
                 }
-                val output = stdout.readText()
-                check(process.exitValue() == 0) { "docker ${arguments.first()} failed: $output ${diagnostics.readText()}" }
-                return output
-                    .trim()
-                    .lines()
-                    .last()
-                    .trim()
+                // A previous run whose JVM died before its finalizer may have left this container behind; remove exactly that one.
+                MigrationTestPostgresCleanup.remove(file)
+                val password = UUID.randomUUID().toString()
+                val id =
+                    dockerCommand(
+                        "run",
+                        "-d",
+                        "--rm",
+                        "--label",
+                        "pennilogic-api-migration-test",
+                        "-e",
+                        "POSTGRES_PASSWORD=$password",
+                        "-e",
+                        "POSTGRES_USER=migration",
+                        "-e",
+                        "POSTGRES_DB=pennilogic",
+                        "-p",
+                        "127.0.0.1:0:5432",
+                        image,
+                    )
+                file.writeText(id)
+                val port = dockerCommand("port", id, "5432/tcp").lines().first().substringAfterLast(':')
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(120)
+                while (ProcessBuilder("docker", "exec", id, "pg_isready", "-h", "127.0.0.1", "-U", "migration", "-d", "pennilogic")
+                        .redirectErrorStream(true)
+                        .start()
+                        .apply { inputStream.readAllBytes() }
+                        .waitFor() != 0
+                ) {
+                    check(System.nanoTime() < deadline) { "the migration test Postgres container did not become ready" }
+                    Thread.sleep(500)
+                }
+                environment("MIGRATION_TEST_JDBC_URL", "jdbc:postgresql://127.0.0.1:$port/pennilogic")
+                environment("MIGRATION_TEST_DB_USER", "migration")
+                environment("MIGRATION_TEST_DB_PASSWORD", password)
             }
-            // A previous run whose JVM died before its finalizer may have left this container behind; remove exactly that one.
-            MigrationTestPostgresCleanup.remove(file)
-            val password = UUID.randomUUID().toString()
-            val id =
-                dockerCommand(
-                    "run",
-                    "-d",
-                    "--rm",
-                    "--label",
-                    "pennilogic-api-migration-test",
-                    "-e",
-                    "POSTGRES_PASSWORD=$password",
-                    "-e",
-                    "POSTGRES_USER=migration",
-                    "-e",
-                    "POSTGRES_DB=pennilogic",
-                    "-p",
-                    "127.0.0.1:0:5432",
-                    image,
-                )
-            file.writeText(id)
-            val port = dockerCommand("port", id, "5432/tcp").lines().first().substringAfterLast(':')
-            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(120)
-            while (ProcessBuilder("docker", "exec", id, "pg_isready", "-h", "127.0.0.1", "-U", "migration", "-d", "pennilogic")
-                    .redirectErrorStream(true)
-                    .start()
-                    .apply { inputStream.readAllBytes() }
-                    .waitFor() != 0
-            ) {
-                check(System.nanoTime() < deadline) { "the migration test Postgres container did not become ready" }
-                Thread.sleep(500)
-            }
-            environment("MIGRATION_TEST_JDBC_URL", "jdbc:postgresql://127.0.0.1:$port/pennilogic")
-            environment("MIGRATION_TEST_DB_USER", "migration")
-            environment("MIGRATION_TEST_DB_PASSWORD", password)
         }
         // Direct assertion that the Postgres tests executed: a run with none discovered or any skipped is a failure.
         val junitXml = reports.junitXml.outputLocation
