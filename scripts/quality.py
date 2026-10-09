@@ -134,11 +134,15 @@ def changed_line_numbers(diff):
     return numbers
 
 
-def check_coverage(base, write_baseline=False):
+def check_coverage_base(base):
     # No origin/main or environment fallback: the caller must name its reviewed base.
     if not base or not re.fullmatch(r"[0-9a-fA-F]{40}", base):
         raise ValueError("coverage requires --base with the full trusted base commit SHA")
     run(["git", "cat-file", "-e", f"{base}^{{commit}}"])
+
+
+def check_coverage(base, write_baseline=False):
+    check_coverage_base(base)
     counters, executable = read_report(ROOT / REPORT)
     sources = {path.relative_to(ROOT).as_posix() for path in (ROOT / "src/main/kotlin").rglob("*.kt")}
     if sources != set(executable):
@@ -566,7 +570,7 @@ def main():
             "money-mutation", "money-mutation-report",
         ],
     )
-    parser.add_argument("--base", help="Full trusted PR base commit SHA; required for coverage")
+    parser.add_argument("--base", help="Full trusted base commit SHA; required for coverage, optional for build")
     parser.add_argument("--write-baseline", action="store_true")
     parser.add_argument("--artifact-dir", type=Path, help="Parent directory for isolated gate self-test copies")
     parser.add_argument("--money-client-interop-node", type=Path, help="Approved absolute Node executable for Gradle commands")
@@ -586,9 +590,14 @@ def main():
         elif args.command == "install":
             gradle("resolveDependencies", **gradle_options)
         elif args.command == "build":
+            if args.base is not None:
+                check_coverage_base(args.base)
             budget = money_budget(money_provider_module())["enforced_seconds"]
             gradle("build", "installDist", budget=budget - (time.monotonic() - started), **gradle_options)
             test_metrics()
+            if args.base is not None:
+                check_coverage(args.base, args.write_baseline)
+                check_money_coverage(args.base, args.write_baseline)
         elif args.command == "test":
             run([sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests", "-v"])
             gradle("test", **gradle_options)

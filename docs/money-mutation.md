@@ -449,6 +449,16 @@ No XML binding, timestamp, cache/up-to-date rule, provider, native selection, th
 baseline or generated workflow/profile is changed. The correction needs fresh separate
 Core/QA admission; frozen 6e's finite source reviews do not approve it.
 
+The combined CI command, `python scripts\quality.py build --base <full-trusted-base-commit-SHA>`,
+avoids that second graph: it retains `build installDist`, then checks test metrics, both
+general and Money baselines against the explicit commit, and terminal mutation freshness.
+Commit-usability preflight and all comparisons stay inside the same elapsed budget.
+After the normal CLI and optional Node guards, an explicitly supplied unusable base fails
+before provider/budget reads, Gradle or test metrics; it is never replaced by an environment
+value or treated as omitted. The report consumer retains its own commit validation.
+Manual build without a base and standalone `coverage --base` keep their existing behavior,
+including explicit `--write-baseline` on the commands that compare coverage.
+
 ### Q1 native-summary consistency correction
 
 The frozen `35267fc` executor compared the native generated count with XML, but the

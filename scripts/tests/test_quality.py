@@ -5,12 +5,14 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
+import xml.etree.ElementTree as ET
 
 SPEC = importlib.util.spec_from_file_location("quality", Path(__file__).resolve().parents[1] / "quality.py")
 quality = importlib.util.module_from_spec(SPEC)
@@ -86,6 +88,7 @@ class QualityNodeBridgeTest(unittest.TestCase):
                         command, "--base", "a" * 40, "--money-client-interop-node", self.node,
                     ))
                     self.validate.assert_called_once_with(self.node)
+                    gradle.assert_called_once()
                     self.assertEqual(expected, gradle.call_args.args)
                     options = gradle.call_args.kwargs
                     self.assertEqual(str(self.node), options["money_client_interop_node"])
@@ -829,8 +832,9 @@ class FullMoneyCommandTest(unittest.TestCase):
     def setUp(self):
         self.clock = 1000
         self.calls = Mock()
-        for name in ("gradle", "test_metrics", "check_coverage", "check_money_coverage"):
+        for name in ("run", "gradle", "test_metrics", "check_coverage", "check_money_coverage"):
             self.enterContext(patch.object(quality, name, getattr(self.calls, name)))
+        self.calls.run.return_value = ""
         self.loader = self.enterContext(patch.object(
             quality, "script_module", return_value=Mock(check_latest=self.calls.check_latest),
         ))
@@ -846,14 +850,19 @@ class FullMoneyCommandTest(unittest.TestCase):
 
     def expected_calls(self, command, write_baseline=False):
         checks = {
-            "build": [call.test_metrics()],
+            "build": [
+                call.test_metrics(),
+                call.check_coverage(self.base, write_baseline),
+                call.check_money_coverage(self.base, write_baseline),
+            ],
             "coverage": [
                 call.check_coverage(self.base, write_baseline),
                 call.check_money_coverage(self.base, write_baseline),
             ],
             "money-mutation": [],
         }
-        return [call.gradle(*self.tasks[command], budget=600), *checks[command], call.check_latest()]
+        preflight = [call.run(["git", "cat-file", "-e", f"{self.base}^{{commit}}"])] if command == "build" else []
+        return [*preflight, call.gradle(*self.tasks[command], budget=600), *checks[command], call.check_latest()]
 
     def test_full_commands_verify_freshness_after_their_required_graph_and_checks(self):
         for command in self.tasks:
@@ -891,19 +900,24 @@ class FullMoneyCommandTest(unittest.TestCase):
                     self.calls.reset_mock()
                     self.calls.gradle.side_effect = error
                     self.assertEqual(1, self.invoke(command))
-                    self.assertEqual([call.gradle(*self.tasks[command], budget=600)], self.calls.mock_calls)
+                    expected = self.expected_calls(command)
+                    graph = next(index for index, entry in enumerate(expected) if entry[0] == "gradle")
+                    self.assertEqual(expected[:graph + 1], self.calls.mock_calls)
 
     def test_failed_test_or_coverage_checks_prevent_full_command_success(self):
         for command, failed_check in (
-            ("build", "test_metrics"), ("coverage", "check_coverage"), ("coverage", "check_money_coverage"),
+            ("build", "test_metrics"), ("build", "check_coverage"), ("build", "check_money_coverage"),
+            ("coverage", "check_coverage"), ("coverage", "check_money_coverage"),
         ):
             with self.subTest(command=command, failed_check=failed_check):
                 self.calls.reset_mock()
                 check = getattr(self.calls, failed_check)
                 check.side_effect = ValueError("Synthetic qualification failure")
                 self.assertEqual(1, self.invoke(command))
-                self.calls.check_latest.assert_not_called()
-                self.calls.gradle.assert_called_once_with(*self.tasks[command], budget=600)
+                expected = self.expected_calls(command)
+                failure = next(index for index, entry in enumerate(expected) if entry[0] == failed_check)
+                self.assertEqual(expected[:failure + 1], self.calls.mock_calls)
+                self.assertIn("Quality command failed: Synthetic qualification failure", self.errors.getvalue())
                 check.side_effect = None
 
     def test_each_full_command_passes_only_its_remaining_budget_to_gradle(self):
@@ -935,13 +949,39 @@ class FullMoneyCommandTest(unittest.TestCase):
                 self.assertEqual(self.expected_calls(command), self.calls.mock_calls)
                 self.assertIn("exceeded its enforced elapsed budget", self.errors.getvalue())
 
+    def test_build_commit_preflight_uses_the_same_elapsed_budget(self):
+        def verify_commit(*_):
+            self.clock += 11
+
+        self.calls.run.side_effect = verify_commit
+        self.assertEqual(0, self.invoke("build"))
+        self.calls.run.assert_called_once_with(["git", "cat-file", "-e", f"{self.base}^{{commit}}"])
+        self.calls.gradle.assert_called_once_with("build", "installDist", budget=589)
+        self.calls.check_latest.assert_called_once_with()
+
+    def test_build_commit_probe_failure_refuses_before_policy_or_graph(self):
+        command = ["git", "cat-file", "-e", f"{self.base}^{{commit}}"]
+        for error in (
+            subprocess.CalledProcessError(128, command),
+            PermissionError("Synthetic unreadable Git object"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                self.calls.reset_mock()
+                self.calls.run.side_effect = error
+                self.assertEqual(1, self.invoke("build"))
+                self.assertEqual([call.run(command)], self.calls.mock_calls)
+                self.provider.assert_not_called()
+                self.budget.assert_not_called()
+                self.assertIn("Quality command failed:", self.errors.getvalue())
+
     def test_missing_numeric_budget_refuses_before_any_native_work(self):
         self.budget.side_effect = ValueError("Synthetic missing numeric Money budget")
         for command in self.tasks:
             with self.subTest(command=command):
                 self.calls.reset_mock()
                 self.assertEqual(1, self.invoke(command))
-                self.assertEqual([], self.calls.mock_calls)
+                expected = [call.run(["git", "cat-file", "-e", f"{self.base}^{{commit}}"])] if command == "build" else []
+                self.assertEqual(expected, self.calls.mock_calls)
 
     def test_coverage_requires_its_base_before_reading_policy_or_starting_work(self):
         with patch.object(sys, "argv", ["quality.py", "coverage"]), self.assertRaises(SystemExit) as error:
@@ -952,8 +992,49 @@ class FullMoneyCommandTest(unittest.TestCase):
         self.assertEqual([], self.calls.mock_calls)
 
     def test_writing_coverage_baselines_still_refreshes_and_verifies_mutation(self):
-        self.assertEqual(0, self.invoke("coverage", "--write-baseline"))
-        self.assertEqual(self.expected_calls("coverage", True), self.calls.mock_calls)
+        for command in ("build", "coverage"):
+            with self.subTest(command=command):
+                self.calls.reset_mock()
+                self.assertEqual(0, self.invoke(command, "--write-baseline"))
+                self.assertEqual(self.expected_calls(command, True), self.calls.mock_calls)
+
+    def test_build_without_base_preserves_the_manual_graph_and_terminal_readback(self):
+        for arguments in ([], ["--write-baseline"]):
+            with self.subTest(arguments=arguments):
+                self.calls.reset_mock()
+                with (
+                    patch.dict(os.environ, {"BASE_SHA": self.base, "GITHUB_BASE_SHA": self.base}),
+                    patch.object(sys, "argv", ["quality.py", "build", *arguments]),
+                ):
+                    self.assertEqual(0, quality.main())
+                self.assertEqual([
+                    call.gradle("build", "installDist", budget=600), call.test_metrics(), call.check_latest(),
+                ], self.calls.mock_calls)
+
+    def test_explicit_empty_build_base_is_not_treated_as_omitted(self):
+        for base in ("", "main", "--help", "a" * 39, "a" * 40 + "\n"):
+            with self.subTest(base=base):
+                self.calls.reset_mock()
+                self.provider.reset_mock()
+                self.budget.reset_mock()
+                self.errors.seek(0)
+                self.errors.truncate()
+                with patch.object(sys, "argv", ["quality.py", "build", "--base=" + base]):
+                    self.assertEqual(1, quality.main())
+                self.assertEqual([], self.calls.mock_calls)
+                self.provider.assert_not_called()
+                self.budget.assert_not_called()
+                self.assertIn("coverage requires --base", self.errors.getvalue())
+
+    def test_combined_baseline_comparisons_remain_inside_the_elapsed_budget(self):
+        def compare_base(*_):
+            self.clock += 301
+
+        self.calls.check_coverage.side_effect = compare_base
+        self.calls.check_money_coverage.side_effect = compare_base
+        self.assertEqual(1, self.invoke("build"))
+        self.assertEqual(self.expected_calls("build"), self.calls.mock_calls)
+        self.assertIn("exceeded its enforced elapsed budget", self.errors.getvalue())
 
     def test_standalone_mutation_report_remains_readonly(self):
         self.assertEqual(0, self.invoke("money-mutation-report"))
@@ -973,6 +1054,212 @@ class FullMoneyCommandTest(unittest.TestCase):
                 self.assertEqual(expected, self.calls.mock_calls)
                 self.loader.assert_not_called()
                 self.budget.assert_not_called()
+
+
+class BuildCoverageConsumerTest(unittest.TestCase):
+    """Real provider, Git baselines and report consumers; synthetic native reports, not a JVM run."""
+
+    def setUp(self):
+        self.repository = quality.ROOT
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="api-build-coverage-")))
+        self.base = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repository, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.baselines = {
+            path: json.loads(subprocess.run(
+                ["git", "show", f"{self.base}:{path}"], cwd=self.repository,
+                capture_output=True, text=True, check=True,
+            ).stdout) for path in (quality.BASELINE, quality.MONEY_BASELINE)
+        }
+        provider = quality.money_provider_module()
+        provider.verify_outputs()
+        shutil.copytree(self.repository / provider.BUNDLE, self.root / provider.BUNDLE)
+        verify_outputs = provider.verify_outputs
+        self.provider_verify = self.enterContext(patch.object(
+            provider, "verify_outputs", side_effect=lambda: verify_outputs(self.root),
+        ))
+        self.provider = self.enterContext(patch.object(quality, "money_provider_module", return_value=provider))
+        self.budget = self.enterContext(patch.object(quality, "money_budget", wraps=quality.money_budget))
+        self.enterContext(patch.object(quality, "ROOT", self.root))
+        real_run = quality.run
+        self.git = self.enterContext(patch.object(
+            quality, "run", side_effect=lambda command, **_: real_run(command, root=self.repository, capture=True),
+        ))
+        self.gradle = self.enterContext(patch.object(quality, "gradle"))
+        metrics = quality.test_metrics
+        self.metrics = self.enterContext(patch.object(quality, "test_metrics", side_effect=lambda: metrics(self.root)))
+        money_metrics = quality.money_test_metrics
+        self.money_metrics = self.enterContext(patch.object(
+            quality, "money_test_metrics", side_effect=lambda: money_metrics(self.root),
+        ))
+        self.general = self.enterContext(patch.object(quality, "check_coverage", wraps=quality.check_coverage))
+        self.money = self.enterContext(patch.object(quality, "check_money_coverage", wraps=quality.check_money_coverage))
+        self.latest = Mock()
+        self.enterContext(patch.object(
+            quality, "script_module", return_value=SimpleNamespace(check_latest=self.latest),
+        ))
+        self.output = self.enterContext(patch("sys.stdout", new_callable=io.StringIO))
+        self.errors = self.enterContext(patch("sys.stderr", new_callable=io.StringIO))
+        source = self.root / "src/main/kotlin/example/BuildFixture.kt"
+        source.parent.mkdir(parents=True)
+        source.write_text("package example\nclass BuildFixture\n", encoding="utf-8")
+        self.classes = [f"{quality.MONEY_PACKAGE}/Fixture{index}" for index in range(
+            self.baselines[quality.MONEY_BASELINE]["compiled_class_count"],
+        )]
+        for name in self.classes:
+            path = self.root / quality.MONEY_CLASSES / (name + ".class")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"synthetic inventory fixture; never loaded by a JVM")
+        suite = ET.Element("testsuite", name=quality.MONEY_PRIMITIVE_TEST_CLASS,
+                           tests=str(len(quality.MONEY_PRIMITIVE_TESTS)), skipped="0", failures="0", errors="0")
+        events = []
+        for category, method in quality.MONEY_PRIMITIVE_TESTS.items():
+            ET.SubElement(suite, "testcase", classname=quality.MONEY_PRIMITIVE_TEST_CLASS, name=method)
+            events.append({"event": "money_primitive_model", "category": category, "comparisons": 1, "disagreements": 0})
+        events.extend({"event": "money_property_cases", "property": name, "count": 1}
+                      for name in ("round_trip", "associativity", "collision_keys"))
+        ET.SubElement(suite, "system-out").text = "\n".join(map(json.dumps, events))
+        self.write_xml("build/test-results/moneyTest/TEST-fixture.xml", suite)
+        self.write_xml("build/test-results/test/TEST-fixture.xml", suite)
+        self.write_reports()
+
+    def write_xml(self, relative, element):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(ET.tostring(element))
+
+    def write_reports(self, declined=None):
+        for baseline_path, report_path in (
+            (quality.BASELINE, quality.REPORT), (quality.MONEY_BASELINE, quality.MONEY_REPORT),
+        ):
+            baseline = json.loads(json.dumps(self.baselines[baseline_path]))
+            if declined and declined[0] == baseline_path:
+                baseline[declined[1]]["covered"] -= 1
+            path = self.root / baseline_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(baseline, indent=2) + "\n", encoding="utf-8")
+            report = ET.Element("report")
+            money = baseline_path == quality.MONEY_BASELINE
+            package = ET.SubElement(report, "package", name=quality.MONEY_PACKAGE if money else "example")
+            if money:
+                for name in self.classes:
+                    ET.SubElement(package, "class", name=name)
+                for name in ("Money.kt", "CurrencyRegistry.kt"):
+                    ET.SubElement(package, "sourcefile", name=name)
+            else:
+                source = ET.SubElement(package, "sourcefile", name="BuildFixture.kt")
+                ET.SubElement(source, "line", nr="2", mi="0", ci="1")
+            for kind in ("LINE", "BRANCH"):
+                counter = baseline[kind]
+                attributes = {"type": kind, "covered": str(counter["covered"]),
+                              "missed": str(counter["total"] - counter["covered"])}
+                ET.SubElement(report, "counter", **attributes)
+                if money:
+                    ET.SubElement(package, "counter", **attributes)
+            self.write_xml(report_path, report)
+
+    def invoke(self, base=None, *extra):
+        with patch.object(sys, "argv", ["quality.py", "build", "--base=" + (self.base if base is None else base), *extra]):
+            return quality.main()
+
+    def reset_calls(self):
+        for tracked in (
+            self.gradle, self.metrics, self.money_metrics, self.general, self.money,
+            self.latest, self.provider, self.budget, self.provider_verify, self.git,
+        ):
+            tracked.reset_mock()
+        for stream in (self.output, self.errors):
+            stream.seek(0)
+            stream.truncate()
+
+    def test_combined_build_consumes_both_committed_baselines_and_real_provider_once(self):
+        before = {name: (self.root / name).read_bytes() for name in self.baselines}
+        for base in (self.base, self.base.upper()):
+            with self.subTest(base=base):
+                self.reset_calls()
+                self.assertEqual(0, self.invoke(base), self.errors.getvalue())
+                self.gradle.assert_called_once()
+                self.assertEqual(("build", "installDist"), self.gradle.call_args.args)
+                self.general.assert_called_once_with(base, False)
+                self.money.assert_called_once_with(base, False)
+                self.metrics.assert_called_once_with()
+                self.money_metrics.assert_called_once_with()
+                self.latest.assert_called_once_with()
+                self.provider_verify.assert_called_once_with()
+                self.budget.assert_called_once_with(self.provider.return_value)
+                commit_check = call(["git", "cat-file", "-e", f"{base}^{{commit}}"])
+                self.assertEqual(commit_check, self.git.call_args_list[0])
+                self.assertEqual(2, self.git.call_args_list.count(commit_check))
+                for path in self.baselines:
+                    self.assertEqual(1, self.git.call_args_list.count(
+                        call(["git", "show", f"{base}:{path}"], capture=True),
+                    ))
+                self.assertEqual(before, {name: (self.root / name).read_bytes() for name in self.baselines})
+
+    def test_each_real_reviewed_ratchet_refuses_even_when_the_working_baseline_was_lowered(self):
+        for path in self.baselines:
+            for kind in ("LINE", "BRANCH"):
+                with self.subTest(baseline=path, counter=kind):
+                    self.reset_calls()
+                    self.write_reports((path, kind))
+                    before = {name: (self.root / name).read_bytes() for name in self.baselines}
+                    self.assertEqual(1, self.invoke())
+                    self.assertIn("coverage decreased from", self.errors.getvalue())
+                    self.general.assert_called_once_with(self.base, False)
+                    if path == quality.MONEY_BASELINE:
+                        self.money.assert_called_once_with(self.base, False)
+                        self.provider_verify.assert_called_once_with()
+                    else:
+                        self.money.assert_not_called()
+                    self.latest.assert_not_called()
+                    self.assertEqual(before, {name: (self.root / name).read_bytes() for name in self.baselines})
+        self.write_reports()
+        self.reset_calls()
+        self.assertEqual(0, self.invoke())
+        self.latest.assert_called_once_with()
+
+    def test_unusable_explicit_bases_fail_without_falling_back_to_head_or_environment(self):
+        objects = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}", f"HEAD:{quality.BASELINE}"],
+            cwd=self.repository, capture_output=True, text=True, check=True,
+        ).stdout.splitlines()
+        cases = [(value, False) for value in ("", "main", "--help", "a" * 39, "a" * 40 + "\n")]
+        cases.extend((value, True) for value in ("0" * 40, *objects))
+        with patch.dict(os.environ, {"BASE_SHA": self.base, "GITHUB_BASE_SHA": self.base}):
+            for base, uses_git in cases:
+                with self.subTest(base=base):
+                    self.reset_calls()
+                    self.assertEqual(1, self.invoke(base))
+                    self.provider.assert_not_called()
+                    self.budget.assert_not_called()
+                    self.gradle.assert_not_called()
+                    self.metrics.assert_not_called()
+                    self.general.assert_not_called()
+                    self.money.assert_not_called()
+                    self.money_metrics.assert_not_called()
+                    self.provider_verify.assert_not_called()
+                    self.latest.assert_not_called()
+                    if uses_git:
+                        self.git.assert_called_once_with(["git", "cat-file", "-e", f"{base}^{{commit}}"])
+                    else:
+                        self.git.assert_not_called()
+
+    def test_missing_provider_or_reports_cannot_turn_combined_build_into_success(self):
+        for relative in (
+            quality.REPORT, quality.MONEY_REPORT,
+            Path("build/contracts-money/kotlin/src/main/kotlin/com/pennilogic/contracts/money/Money.kt"),
+        ):
+            path = self.root / relative
+            content = path.read_bytes()
+            with self.subTest(missing=str(relative)):
+                self.reset_calls()
+                path.unlink()
+                try:
+                    self.assertEqual(1, self.invoke())
+                    self.latest.assert_not_called()
+                finally:
+                    path.write_bytes(content)
+        self.assertEqual(0, self.invoke())
 
 
 if __name__ == "__main__":

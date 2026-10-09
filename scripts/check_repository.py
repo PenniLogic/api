@@ -250,7 +250,7 @@ def validate_shape(value):
                 raise Refused("step-level key outside the generated step keys name, uses, with, run, env")
 
 
-def validate_workflow(name, data):
+def validate_non_api_ci_workflow(name, data):
     # Generated workflow files use JSON syntax, which is valid YAML.
     value = json_document(data)
     if not isinstance(value, dict):
@@ -308,6 +308,21 @@ def validate_workflow(name, data):
             raise Refused("Conformance must keep one authenticated harness step and no other environment")
     else:
         raise Refused("workflow file outside the generated pair or infra-only conformance.yml")
+
+
+import hashlib
+
+
+API_CI_SHA256 = "f6738c070157b5fdb59b84bfe854b22a6371e8be711bf308667ecf555f1bc3da"
+REQUIRED += ("scripts/qualify_windows.py",)
+
+
+def validate_workflow(name, data):
+    if name == ".github/workflows/ci.yml":
+        if hashlib.sha256(data).hexdigest() != API_CI_SHA256:
+            raise Refused("API CI must match its generated qualification jobs and required result")
+    else:
+        validate_non_api_ci_workflow(name, data)
 
 
 def check(files):

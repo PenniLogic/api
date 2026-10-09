@@ -99,6 +99,7 @@ approved Node executable without relying on ambient Gradle properties:
 
 ```text
 python scripts/quality.py build --money-client-interop-node "<approved absolute Node executable>"
+python scripts/quality.py build --base "<full trusted base SHA>" --money-client-interop-node "<approved absolute Node executable>"
 python scripts/quality.py coverage --base "<full trusted base SHA>" --money-client-interop-node "<approved absolute Node executable>"
 python scripts/quality.py gate-self-test --artifact-dir "<owned parent>" --money-client-interop-node "<approved absolute Node executable>"
 ```
@@ -138,9 +139,16 @@ Each owned baseline/candidate copy must run its own quality script with its own
 working directory and self-test artifact parent. Only the explicit SDK path is
 shared, not launch files, generated output or runtime evidence. `coverage --base`
 reads the named Git baseline; it does not build another checkout, and forwarding
-this option does not add interoperability to the coverage task graph. Canonical
-Infra setup must provision the supported SDK and explicitly supply its path only
-after this manual bridge is accepted; this change does not activate generated CI.
+this option does not add interoperability to the coverage task graph.
+The canonical CI adoption from accepted Infra `6b1e4baf403f25e6c4c695a5676e995f1ecb259e`
+keeps the isolated SDK preparation and passes its path to a single `build --base`
+invocation. That command runs the existing build/install graph and test metrics,
+then both general and Money reviewed-base comparisons before terminal mutation
+verification, without starting another Gradle/PIT graph. Omitting `--base`
+preserves the manual build behavior. After the normal CLI and optional Node
+guards, explicitly empty, malformed, missing or non-commit bases fail before
+provider/budget reads, Gradle or test metrics, rather than disabling comparisons.
+Standalone `coverage` and explicit baseline regeneration remain available.
 
 The budgeted quality caller also admits the standard Windows Docker Desktop CLI
 directory on the approved system drive (`Program Files\Docker\Docker\resources\bin`).
