@@ -2,6 +2,7 @@
 
 import ctypes
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -99,6 +100,35 @@ class OutputExceeded(BudgetExceeded):
     def __init__(self, output, stderr, streams):
         super().__init__(output, stderr, streams)
         self.args = ("Owned process tree exceeded its enforced output budget",)
+
+
+def budget_observation(process, captured, started, waiting):
+    schema = "pennilogic.process-budget-state/1"
+    try:
+        code = process.poll()
+        if code is not None and (type(code) is not int or not -2147483648 <= code <= 4294967295):
+            raise ValueError("Invalid process state")
+        readers = [] if captured is None else captured.threads
+        if type(readers) is not list or not 0 <= len(readers) <= 2:
+            raise ValueError("Invalid capture state")
+        alive = [reader.is_alive() for reader in readers]
+        if any(type(value) is not bool for value in alive):
+            raise ValueError("Invalid capture state")
+        observed = time.monotonic()
+        if (any(type(value) not in (int, float) or not math.isfinite(value)
+                for value in (started, waiting, observed)) or not started <= waiting <= observed):
+            raise ValueError("Invalid elapsed state")
+        elapsed_ms, setup_ms = int((observed - started) * 1000), int((waiting - started) * 1000)
+        if not 0 <= setup_ms <= elapsed_ms <= 86400000:
+            raise ValueError("Invalid elapsed state")
+        state = {
+            "schema": schema, "status": "observed", "process_running": code is None, "returncode": code,
+            "capture_readers": len(readers), "capture_readers_alive": sum(alive),
+            "setup_ms": setup_ms, "wait_ms": elapsed_ms - setup_ms, "elapsed_ms": elapsed_ms,
+        }
+    except (OSError, RuntimeError, AttributeError, TypeError, ValueError, OverflowError):
+        state = {"schema": schema, "status": "unavailable"}
+    return "process_budget_state=" + json.dumps(state, sort_keys=True, separators=(",", ":"))
 
 
 class Capture:
@@ -243,6 +273,7 @@ def run(command, root, seconds, capture=False, *, env=None, separate=False, inhe
         if job is not None:
             process.stdin.write(b"1")
             process.stdin.close()
+        waiting = time.monotonic()
         failure = None
         while process.poll() is None or (captured and any(thread.is_alive() for thread in captured.threads)):
             remaining = seconds - (time.monotonic() - started)
@@ -268,6 +299,8 @@ def run(command, root, seconds, capture=False, *, env=None, separate=False, inhe
         if failure is None and time.monotonic() - started > seconds:
             failure = "elapsed"
         if failure is not None:
+            if failure == "elapsed":
+                observation = budget_observation(process, captured, started, waiting)
             terminate()
             if captured:
                 if failure != "elapsed":
@@ -280,7 +313,9 @@ def run(command, root, seconds, capture=False, *, env=None, separate=False, inhe
         if failure == "capture":
             raise OSError("Owned process output capture failed")
         if failure == "elapsed":
-            raise BudgetExceeded(stdout, stderr, streams)
+            error = BudgetExceeded(stdout, stderr, streams)
+            error.add_note(observation)
+            raise error
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr if separate else None)
     finally:
         if captured is not None:

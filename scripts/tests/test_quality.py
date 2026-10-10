@@ -112,6 +112,74 @@ class QualityNodeBridgeTest(unittest.TestCase):
         self.loader.assert_not_called()
         self.validate.assert_not_called()
 
+    def test_required_preparation_keeps_the_build_test_graph_node_and_coverage_forwarding(self):
+        for command in ("build", "test"):
+            for selected in (False, True):
+                for node in (None, self.node):
+                    with (
+                        self.subTest(command=command, selected=selected, node=node is not None),
+                        patch.object(quality, "gradle", wraps=quality.gradle) as gradle,
+                        patch.object(quality, "run", return_value="") as run,
+                        patch.object(quality, "test_metrics") as metrics,
+                        patch.object(quality, "check_coverage") as coverage,
+                        patch.object(quality, "check_money_coverage") as money,
+                        patch.object(quality, "money_provider_module"),
+                        patch.object(quality, "money_budget", return_value={"enforced_seconds": 600}),
+                    ):
+                        arguments = ["--base", "a" * 40]
+                        if selected:
+                            arguments.append("--require-prepared")
+                        if node is not None:
+                            arguments.extend(("--money-client-interop-node", node))
+                        self.mutation.reset_mock()
+                        self.assertEqual(0, self.invoke(command, *arguments))
+                        gradle.assert_called_once()
+                        self.assertEqual(gradle.call_args.args,
+                                         ("build", "installDist") if command == "build" else ("test",))
+                        options = gradle.call_args.kwargs
+                        self.assertEqual(options.get("require_prepared", False), selected)
+                        self.assertEqual(options.get("money_client_interop_node"), None if node is None else str(node))
+                        wrapper_arguments = run.call_args.args[0]
+                        self.assertEqual(wrapper_arguments.count("-PmoneyClientInteropRequirePrepared=true"), int(selected))
+                        self.assertEqual(wrapper_arguments[-2:] if command == "build" else wrapper_arguments[-1:],
+                                         ["build", "installDist"] if command == "build" else ["test"])
+                        self.assertEqual(run.call_count, 2)
+                        metrics.assert_called_once_with()
+                        if command == "build":
+                            self.assertEqual(run.call_args_list[0], call([
+                                "git", "cat-file", "-e", "a" * 40 + "^{commit}",
+                            ]))
+                            self.assertGreater(options["budget"], 0)
+                            self.assertLessEqual(options["budget"], 600)
+                            coverage.assert_called_once_with("a" * 40, False)
+                            money.assert_called_once_with("a" * 40, False)
+                            self.mutation.check_latest.assert_called_once_with()
+                        else:
+                            self.assertNotIn("budget", options)
+                            self.assertEqual(run.call_args_list[0], call([
+                                sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests", "-v",
+                            ]))
+                            coverage.assert_not_called()
+                            money.assert_not_called()
+                            self.mutation.check_latest.assert_not_called()
+
+    def test_required_preparation_rejects_other_commands_before_runtime_or_process_work(self):
+        with (
+            patch.object(quality, "gradle") as gradle,
+            patch.object(quality, "run") as run,
+            patch.object(quality, "money_provider_module") as provider,
+            patch.object(quality, "gate_self_test") as self_test,
+        ):
+            for command in ("version", "install", "lint", "format", "coverage", "gate-self-test",
+                            "money-guard", "money-coverage", "money-coverage-report",
+                            "money-mutation", "money-mutation-report"):
+                with self.subTest(command=command), self.assertRaises(SystemExit) as error:
+                    self.invoke(command, "--require-prepared", "--money-client-interop-node", self.node)
+                self.assertEqual(error.exception.code, 2)
+            self.assertIn("--require-prepared requires build or test", self.errors.getvalue())
+            for operation in (gradle, run, provider, self_test, self.loader, self.validate):
+                operation.assert_not_called()
+
     def test_invalid_explicit_path_and_missing_npm_refuse_without_executing_any_candidate(self):
         wrong_name = self.sdk / "other-runtime"
         wrong_name.write_bytes(b"inert wrong-basename fixture")
@@ -520,6 +588,84 @@ class GateSelfTestAdmissionCopyTest(unittest.TestCase):
                 quality.gate_self_test(Path(temporary))
             self.assertEqual([], list(Path(temporary).iterdir()))
         self.assertEqual([("test", "spotlessCheck")], calls)
+
+
+class PreparedDatabaseInputTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(
+            prefix="api-prepared-database-", dir=quality.ROOT / "build",
+        )))
+        self.database = quality.script_module("prepare_database_admission")
+        self.helper = self.database.load_helper(quality.ROOT)
+        self.data = self.database.read_installation(quality.ROOT, self.helper)
+        self.database.verify(quality.ROOT, self.data, self.helper)
+        self.client = Mock(side_effect=AssertionError("unexpected source acquisition"))
+        load = self.database.load_helper
+
+        def guarded_helper(root):
+            helper = load(root)
+            helper.ReadOnlyClient = self.client
+            return helper
+
+        self.enterContext(patch.object(self.database, "load_helper", side_effect=guarded_helper))
+
+    def fixture(self, root, *, prepared=True):
+        for relative in (self.database.RESOURCE, self.database.LAUNCHER, Path("scripts/materialize_money_sources.py")):
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(quality.ROOT / relative, target)
+            target.chmod(0o644)
+        if prepared:
+            shutil.copytree(quality.ROOT / self.database.OUTPUT, root / self.database.OUTPUT)
+            self.database.verify(root, self.data, self.helper)
+
+    def invoke(self, root):
+        with (
+            patch.object(self.database, "ROOT", root),
+            patch.object(sys, "argv", ["prepare_database_admission.py", "prepare"]),
+            patch("sys.stdout", new_callable=io.StringIO) as output,
+            patch("sys.stderr", new_callable=io.StringIO) as errors,
+        ):
+            code = self.database.main()
+        return code, output.getvalue(), errors.getvalue()
+
+    def test_complete_prepared_database_uses_the_offline_cli_and_preserves_every_payload(self):
+        self.fixture(self.root)
+        before = {entry["path"]: (self.root / self.database.OUTPUT / entry["path"]).read_bytes()
+                  for entry in self.data["binding"]["payloads"]}
+        code, output, errors = self.invoke(self.root)
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(json.loads(output), {
+            "event": "database_admission_installation", "status": "verified_existing", "requests": 0,
+        })
+        self.assertEqual(before, self.database.verify(self.root, self.data, self.helper))
+        self.client.assert_not_called()
+
+    def test_absent_partial_and_disappeared_database_inputs_refuse_without_fetch(self):
+        for state in ("absent", "disappeared", "missing-file", "tampered", "extra"):
+            with self.subTest(state=state):
+                root = self.root / state
+                self.fixture(root, prepared=state != "absent")
+                if state != "absent":
+                    self.assertEqual(self.invoke(root)[0], 0)
+                    output = root / self.database.OUTPUT
+                    first = output / self.data["binding"]["payloads"][0]["path"]
+                    if state == "disappeared":
+                        shutil.rmtree(output)
+                    elif state == "missing-file":
+                        first.unlink()
+                    elif state == "tampered":
+                        first.write_bytes(b"tampered")
+                    else:
+                        (output / "unexpected").write_bytes(b"unexpected")
+                before = {path.relative_to(root).as_posix(): path.read_bytes()
+                          for path in root.rglob("*") if path.is_file()}
+                code, output, errors = self.invoke(root)
+                self.assertEqual((code, output), (1, ""))
+                self.assertEqual(json.loads(errors)["status"], "refused")
+                self.client.assert_not_called()
+                self.assertEqual(before, {path.relative_to(root).as_posix(): path.read_bytes()
+                                         for path in root.rglob("*") if path.is_file()})
 
 
 class CoverageGateTest(unittest.TestCase):

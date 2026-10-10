@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import py_compile
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -356,6 +357,343 @@ class ColdAcquisitionTest(InteropTest):
         before = len(responses.calls)
         self.assertEqual(interop.prepare(self.root)["requests"], 0)
         self.assertEqual(len(responses.calls), before)
+
+
+class NativePreparationTest(InteropTest):
+    TOKEN = "synthetic-native-source-token-not-a-credential"
+    NATIVE_CONTEXT = {
+        "GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": "PenniLogic/api",
+        "GITHUB_REPOSITORY_ID": "1394134582", "GITHUB_REPOSITORY_OWNER_ID": "335295566",
+        "GITHUB_EVENT_NAME": "pull_request",
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mock.patch.dict(os.environ, self.NATIVE_CONTEXT))
+        self.responses = PublicInputResponses()
+        self.client_type = interop.sources.ReadOnlyClient
+        self.clients = []
+        interop.write_file(self.root, interop.FIXTURES / "source-inputs.json",
+                           interop.read_file(ROOT / interop.FIXTURES / "source-inputs.json"))
+        catalog = interop.sources.validate_catalog(interop.sources.CATALOG)
+        for directory, bindings in (
+            (interop.sources.INPUTS, interop.sources.input_bindings(catalog)),
+            (interop.sources.PROVIDER, interop.sources.provider_bindings(catalog)),
+        ):
+            for name in bindings:
+                interop.write_file(self.root, directory / name, interop.read_file(ROOT / directory / name))
+        interop.write_file(self.root, interop.sources.INPUTS / "materialization.json",
+                           interop.sources.catalog_bytes(catalog))
+        interop.sources.verify_inputs(self.root)
+        interop.sources.verify_provider(self.root)
+
+    def client(self, data, *, native_fetch=False):
+        value = self.client_type(data, opener=self.responses, native_fetch=native_fetch)
+        self.assertIs(value.native_fetch, native_fetch)
+        self.assertFalse(value.authenticated_local)
+        self.clients.append(value)
+        return value
+
+    def prepared_inputs(self, root):
+        for name in interop.source_bindings(interop.catalog(root)):
+            interop.write_file(root, interop.AREA / "inputs" / name, self.responses.contracts[name])
+        interop.write_file(root, interop.AREA / "acquisition.json",
+                           interop.read_file(ROOT / interop.AREA / "acquisition.json"))
+        interop.verify_sources(root)
+        interop.verify_acquisition(root)
+
+    def invoke(self, *arguments, root=None):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(interop, "ROOT", self.root if root is None else root),
+            mock.patch.object(sys, "argv", ["money_client_interop.py", *arguments]),
+            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr),
+        ):
+            code = interop.main()
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_native_cli_forwards_once_and_completed_inputs_are_reused_without_credentials(self):
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "PENNILOGIC_NATIVE_SOURCE_TOKEN": self.TOKEN}),
+            mock.patch.object(interop.sources, "ReadOnlyClient", side_effect=self.client) as constructor,
+            mock.patch.object(interop, "prepare_tools", side_effect=AssertionError("unexpected tools")),
+            mock.patch.object(interop.process_budget, "run", side_effect=AssertionError("unexpected child")),
+        ):
+            code, stdout, stderr = self.invoke("prepare", "--native-fetch")
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(json.loads(stdout)["requests"], 4)
+            self.assertNotIn("PENNILOGIC_NATIVE_SOURCE_TOKEN", os.environ)
+            constructor.assert_called_once_with(interop.catalog(self.root), native_fetch=True)
+        self.assertEqual((self.responses.api_requests, self.responses.archive_requests), (3, 1))
+        for call in self.responses.calls:
+            headers = {name.lower(): value for name, value in call["headers"].items()}
+            self.assertEqual(headers.get("authorization"),
+                             None if call["url"] == interop.ARCHIVE_URL else "Bearer " + self.TOKEN)
+            self.assertEqual(call["method"], "GET")
+            self.assertLessEqual(call["timeout"], interop.sources.REQUEST_SECONDS)
+        interop.verify_sources(self.root)
+        interop.verify_acquisition(self.root)
+        for path in (self.root / interop.AREA).rglob("*"):
+            if path.is_file():
+                self.assertNotIn(self.TOKEN.encode(), path.read_bytes())
+        before = len(self.responses.calls)
+        with mock.patch.object(interop.sources, "ReadOnlyClient", side_effect=AssertionError("unexpected acquisition")):
+            code, stdout, stderr = self.invoke("prepare")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout), {
+            "event": "money_client_inputs", "status": "verified_existing", "inputs": 39, "requests": 0,
+        })
+        self.assertEqual(len(self.responses.calls), before)
+
+    def test_default_preparation_does_not_enable_native_mode_from_the_environment(self):
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "PENNILOGIC_NATIVE_SOURCE_TOKEN": self.TOKEN}),
+            mock.patch.object(interop.sources, "ReadOnlyClient", side_effect=self.client) as constructor,
+        ):
+            code, stdout, stderr = self.invoke("prepare")
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(json.loads(stdout)["requests"], 4)
+            constructor.assert_called_once_with(interop.catalog(self.root))
+            self.assertEqual(os.environ["PENNILOGIC_NATIVE_SOURCE_TOKEN"], self.TOKEN)
+        self.assertTrue(all("authorization" not in {name.lower() for name in call["headers"]}
+                            for call in self.responses.calls))
+
+    def test_existing_inputs_do_not_bypass_the_explicit_native_constructor(self):
+        self.prepared_inputs(self.root)
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "PENNILOGIC_NATIVE_SOURCE_TOKEN": self.TOKEN}),
+            mock.patch.object(interop.sources, "ReadOnlyClient", side_effect=self.client) as constructor,
+        ):
+            code, stdout, stderr = self.invoke("prepare", "--native-fetch")
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(json.loads(stdout)["requests"], 0)
+            self.assertNotIn("PENNILOGIC_NATIVE_SOURCE_TOKEN", os.environ)
+            constructor.assert_called_once_with(interop.catalog(self.root), native_fetch=True)
+            constructor.reset_mock()
+            code, stdout, stderr = self.invoke("prepare", "--native-fetch")
+            self.assertEqual((code, stdout), (1, ""))
+            self.assertEqual(json.loads(stderr)["code"], "native-source-authentication")
+            constructor.assert_called_once_with(interop.catalog(self.root), native_fetch=True)
+        before = interop.inventory(self.root / interop.AREA)
+        for changes, refusal in (
+            ({"GITHUB_REPOSITORY": "PenniLogic/contracts"}, "native-source-context"),
+            ({"GITHUB_REPOSITORY_ID": "1"}, "native-source-context"),
+            ({"GITHUB_EVENT_NAME": "pull_request_target"}, "native-source-context"),
+            ({"PENNILOGIC_NATIVE_SOURCE_TOKEN": "short"}, "native-source-authentication"),
+            ({"PENNILOGIC_NATIVE_SOURCE_TOKEN": self.TOKEN + "\n"}, "native-source-authentication"),
+        ):
+            with (
+                self.subTest(changes=tuple(changes)),
+                mock.patch.dict(os.environ, {"PENNILOGIC_NATIVE_SOURCE_TOKEN": self.TOKEN, **changes}),
+                mock.patch.object(interop.sources, "ReadOnlyClient", side_effect=self.client) as constructor,
+            ):
+                code, stdout, stderr = self.invoke("prepare", "--native-fetch")
+                self.assertEqual((code, stdout), (1, ""))
+                self.assertEqual(json.loads(stderr)["code"], refusal)
+                self.assertNotIn("PENNILOGIC_NATIVE_SOURCE_TOKEN", os.environ)
+                self.assertNotIn(self.TOKEN, stderr)
+                constructor.assert_called_once_with(interop.catalog(self.root), native_fetch=True)
+        self.assertEqual(self.responses.calls, [])
+        self.assertEqual(before, interop.inventory(self.root / interop.AREA))
+        interop.verify_sources(self.root)
+        interop.verify_acquisition(self.root)
+
+    def test_native_selection_rejects_other_commands_and_offline_source_before_dispatch(self):
+        for arguments in (
+            ("run", "--native-fetch"), ("verify", "--native-fetch"),
+            ("_run", "--run-id", self.run_id, "--native-fetch"),
+            ("prepare", "--offline-source", str(self.root), "--native-fetch"),
+            ("prepare", "--native-fetch", "--require-prepared"),
+            ("prepare", "--require-prepared", "--offline-source", str(self.root)),
+            ("verify", "--require-prepared"),
+        ):
+            with self.subTest(arguments=arguments), contextlib.ExitStack() as stack:
+                handlers = [stack.enter_context(mock.patch.object(interop, name))
+                            for name in ("prepare", "verify", "run_gate", "launch_run")]
+                constructor = stack.enter_context(mock.patch.object(interop.sources, "ReadOnlyClient"))
+                code, stdout, stderr = self.invoke(*arguments)
+                self.assertEqual((code, stdout), (1, ""))
+                self.assertEqual(json.loads(stderr)["code"], "argument-mode")
+                for handler in (*handlers, constructor):
+                    handler.assert_not_called()
+        for options in (
+            {"offline_source": self.root, "native_fetch": True},
+            {"offline_source": self.root, "require_prepared": True},
+            {"native_fetch": True, "require_prepared": True},
+            {"native_fetch": 1}, {"require_prepared": 1}, {"require_prepared": "false"},
+        ):
+            with self.subTest(options=options), mock.patch.object(interop.sources, "ReadOnlyClient") as constructor:
+                with self.assertRaisesRegex(interop.InteropError, "^argument-mode$"):
+                    interop.prepare(self.root, **options)
+                constructor.assert_not_called()
+
+    def test_native_refusal_has_no_anonymous_fallback_or_partial_publication(self):
+        headers = Message()
+        headers["X-RateLimit-Remaining"] = "0"
+        failure = urllib.error.HTTPError("https://api.github.com", 403, "synthetic", headers, io.BytesIO())
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "PENNILOGIC_NATIVE_SOURCE_TOKEN": self.TOKEN}),
+            mock.patch.object(interop.sources, "ReadOnlyClient", side_effect=self.client) as constructor,
+            mock.patch.object(self.responses, "open", side_effect=failure) as opener,
+        ):
+            code, stdout, stderr = self.invoke("prepare", "--native-fetch")
+        self.assertEqual((code, stdout), (1, ""))
+        self.assertEqual(json.loads(stderr)["code"], "source-rate-exhausted")
+        constructor.assert_called_once_with(interop.catalog(self.root), native_fetch=True)
+        self.assertEqual(opener.call_count, 1)
+        self.assertFalse((self.root / interop.AREA / "inputs").exists())
+        self.assertFalse((self.root / interop.AREA / "acquisition.json").exists())
+        self.assertNotIn(self.TOKEN, stderr)
+
+    def test_native_archive_redirect_refuses_without_forwarding_authorization(self):
+        opened = self.responses.open
+        archive_requests = []
+        body = io.BytesIO(b"synthetic-private-redirect")
+
+        def redirect(request, timeout):
+            if request.full_url != interop.ARCHIVE_URL:
+                return opened(request, timeout)
+            archive_requests.append(request)
+            return interop.sources.NoRedirect().redirect_request(
+                request, body, 302, "synthetic", Message(), "https://example.invalid/redirect",
+            )
+
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "PENNILOGIC_NATIVE_SOURCE_TOKEN": self.TOKEN}),
+            mock.patch.object(interop.sources, "ReadOnlyClient", side_effect=self.client),
+            mock.patch.object(self.responses, "open", side_effect=redirect),
+        ):
+            code, stdout, stderr = self.invoke("prepare", "--native-fetch")
+        self.assertEqual((code, stdout), (1, ""))
+        self.assertEqual(json.loads(stderr)["code"], "source-redirect")
+        self.assertEqual(self.responses.api_requests, 3)
+        self.assertEqual(len(archive_requests), 1)
+        self.assertFalse(archive_requests[0].has_header("Authorization"))
+        self.assertTrue(body.closed)
+        self.assertFalse((self.root / interop.AREA / "inputs").exists())
+        self.assertNotIn(self.TOKEN, stderr)
+
+    def test_required_preparation_verifies_only_inputs_without_tools_or_source_writes(self):
+        self.prepared_inputs(self.root)
+        before = interop.inventory(self.root / interop.AREA)
+        with (
+            mock.patch.object(interop.sources, "ReadOnlyClient", side_effect=AssertionError("unexpected acquisition")),
+            mock.patch.object(interop, "prepare_tools", side_effect=AssertionError("unexpected tools")),
+            mock.patch.object(interop, "verify", side_effect=AssertionError("unexpected execution verification")),
+            mock.patch.object(interop.process_budget, "run", side_effect=AssertionError("unexpected child")),
+        ):
+            code, stdout, stderr = self.invoke("prepare", "--require-prepared")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout), {
+            "event": "money_client_inputs", "status": "verified_existing", "inputs": 39, "requests": 0,
+        })
+        self.assertEqual(before, interop.inventory(self.root / interop.AREA))
+        self.assertEqual(self.responses.calls, [])
+
+    def test_required_preparation_refuses_absent_or_partial_inputs_without_acquisition(self):
+        for state in ("absent", "inputs-missing", "receipt-missing", "file-missing", "tampered", "extra", "receipt-tampered"):
+            with self.subTest(state=state):
+                root = self.root / state
+                interop.write_file(root, interop.FIXTURES / "source-inputs.json",
+                                   interop.read_file(ROOT / interop.FIXTURES / "source-inputs.json"))
+                if state != "absent":
+                    self.prepared_inputs(root)
+                    inputs = root / interop.AREA / "inputs"
+                    receipt = root / interop.AREA / "acquisition.json"
+                    first = inputs / next(iter(interop.source_bindings(interop.catalog(root))))
+                    if state == "inputs-missing":
+                        shutil.rmtree(inputs)
+                    elif state == "receipt-missing":
+                        receipt.unlink()
+                    elif state == "file-missing":
+                        first.unlink()
+                    elif state == "tampered":
+                        first.write_bytes(b"tampered")
+                    elif state == "extra":
+                        (inputs / "unexpected").write_bytes(b"unexpected")
+                    else:
+                        receipt.write_bytes(b"{}")
+                before = interop.inventory(root)
+                with (
+                    mock.patch.object(interop, "acquire", side_effect=AssertionError("unexpected acquisition")) as acquire,
+                    mock.patch.object(interop.sources, "ReadOnlyClient") as constructor,
+                ):
+                    code, stdout, stderr = self.invoke("prepare", "--require-prepared", root=root)
+                self.assertEqual((code, stdout), (1, ""))
+                self.assertEqual(json.loads(stderr)["status"], "refused")
+                self.assertNotEqual(json.loads(stderr)["code"], "argument-mode")
+                acquire.assert_not_called()
+                constructor.assert_not_called()
+                self.assertEqual(before, interop.inventory(root))
+
+    def test_run_propagates_only_the_requested_non_secret_flag_with_unchanged_budget_and_environment(self):
+        for selected in (False, True):
+            with (
+                self.subTest(selected=selected),
+                mock.patch.dict(os.environ, {"PENNILOGIC_NATIVE_SOURCE_TOKEN": self.TOKEN}),
+                mock.patch.object(interop.process_budget, "run", return_value=subprocess.CompletedProcess([], 1)) as run,
+            ):
+                arguments = ("--require-prepared",) if selected else ()
+                code, stdout, stderr = self.invoke("run", *arguments)
+                self.assertEqual((code, stdout), (1, ""))
+                self.assertEqual(json.loads(stderr)["code"], "gate-refused")
+                current = interop.read_json(self.root / interop.AREA / "current.json")
+                expected = [sys.executable, "-I", "-S", "-B", str(Path(interop.__file__).absolute()),
+                            "_run", "--run-id", current["run_id"], *arguments]
+                run.assert_called_once_with(expected, self.root, interop.SECONDS, env=interop.process_budget.environment())
+                self.assertNotIn("PENNILOGIC_NATIVE_SOURCE_TOKEN", run.call_args.kwargs["env"])
+                self.assertNotIn("--native-fetch", expected)
+                self.assertEqual(current["status"], "refused")
+                self.assertFalse((self.root / interop.AREA / "run.lock").exists())
+
+    def test_worker_refuses_disappearance_after_initial_verification_without_reacquiring(self):
+        for state in ("both-missing", "receipt-missing", "file-missing"):
+            with self.subTest(state=state):
+                root = self.root / state
+                interop.write_file(root, interop.FIXTURES / "source-inputs.json",
+                                   interop.read_file(ROOT / interop.FIXTURES / "source-inputs.json"))
+                self.prepared_inputs(root)
+                code, stdout, stderr = self.invoke("prepare", "--require-prepared", root=root)
+                self.assertEqual((code, stderr), (0, ""))
+                self.assertEqual(json.loads(stdout)["requests"], 0)
+                inputs = root / interop.AREA / "inputs"
+                receipt = root / interop.AREA / "acquisition.json"
+                if state == "both-missing":
+                    shutil.rmtree(inputs)
+                    receipt.unlink()
+                elif state == "receipt-missing":
+                    receipt.unlink()
+                else:
+                    (inputs / next(iter(interop.source_bindings(interop.catalog(root))))).unlink()
+                workers = []
+
+                def worker(command, cwd, seconds, *, env):
+                    self.assertEqual((cwd, seconds), (root, interop.SECONDS))
+                    self.assertEqual(command[5], "_run")
+                    self.assertEqual(command.count("--require-prepared"), 1)
+                    self.assertNotIn("PENNILOGIC_NATIVE_SOURCE_TOKEN", env)
+                    result = self.invoke(*command[5:], root=root)
+                    workers.append(result)
+                    return subprocess.CompletedProcess(command, result[0])
+
+                with (
+                    mock.patch.object(interop.process_budget, "run", side_effect=worker),
+                    mock.patch.object(interop, "acquire", side_effect=AssertionError("unexpected acquisition")) as acquire,
+                    mock.patch.object(interop.sources, "ReadOnlyClient") as constructor,
+                    mock.patch.object(interop, "prepare_tools", side_effect=AssertionError("unexpected tools")),
+                    mock.patch.object(interop, "prepare", wraps=interop.prepare) as prepare,
+                ):
+                    code, stdout, stderr = self.invoke("run", "--require-prepared", root=root)
+                    prepare.assert_called_once_with(root, require_prepared=True)
+                self.assertEqual((code, stdout), (1, ""))
+                self.assertEqual(json.loads(stderr)["code"], "gate-refused")
+                self.assertEqual(len(workers), 1)
+                self.assertEqual(workers[0][:2], (1, ""))
+                self.assertEqual(json.loads(workers[0][2])["status"], "refused")
+                acquire.assert_not_called()
+                constructor.assert_not_called()
+                self.assertEqual(interop.read_json(root / interop.AREA / "current.json")["status"], "refused")
+                self.assertFalse((root / interop.AREA / "run.lock").exists())
 
 
 class ArchiveAcquisitionTest(InteropTest):

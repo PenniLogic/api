@@ -332,7 +332,7 @@ def archive_contents(content, snapshot, bindings):
                       "archive_canonicalized_paths": canonicalized}
 
 
-def acquire(data, root=ROOT):
+def acquire(data, root=ROOT, *, client=None):
     """Reuse verified provider inputs, then prove one bounded public archive against the native Git tree."""
     sources.verify_inputs(root)
     sources.verify_provider(root)
@@ -347,7 +347,8 @@ def acquire(data, root=ROOT):
         else:
             missing.append(entry)
     require(len(contents) == 10 and len(missing) == 29, "shared-input-inventory")
-    client = sources.ReadOnlyClient(data)
+    if client is None:
+        client = sources.ReadOnlyClient(data)
     snapshot = sources.GitSnapshot(client, data["sources"][0], 335295566)
     require(snapshot.root == SOURCE_TREE, "source-tree-binding")
     downloaded, archive = archive_contents(fetch_archive(client), snapshot, {entry["path"]: entry for entry in missing})
@@ -361,16 +362,20 @@ def acquire(data, root=ROOT):
     }
 
 
-def prepare(root=ROOT, offline_source=None):
+def prepare(root=ROOT, offline_source=None, *, native_fetch=False, require_prepared=False):
+    require(type(native_fetch) is bool and type(require_prepared) is bool
+            and not (native_fetch and require_prepared)
+            and not (offline_source is not None and (native_fetch or require_prepared)), "argument-mode")
     data = catalog(root)
+    client = sources.ReadOnlyClient(data, native_fetch=True) if native_fetch else None
     target = owned(root, AREA / "inputs")
-    if target.exists():
+    if target.exists() or require_prepared:
         verify_sources(root)
         verify_acquisition(root)
         return {"event": "money_client_inputs", "status": "verified_existing", "inputs": 39, "requests": 0}
     require(not owned(root, AREA / "acquisition.json").exists(), "acquisition-output-partial")
     if offline_source is None:
-        contents, provenance = acquire(data, root)
+        contents, provenance = acquire(data, root, client=client)
     else:
         offline_source = offline_source.absolute()
         sources.verify_directory(offline_source.parent, Path(offline_source.name), source_bindings(data))
@@ -911,7 +916,7 @@ def verify_transports(root, directory, run_id):
         validate_disagreement(read_json(owned(root, directory / (language + "-disagreement.json"))), expected)
 
 
-def run_gate(root, run_id):
+def run_gate(root, run_id, *, require_prepared=False):
     require(re.fullmatch(r"[0-9a-f]{32}", run_id) is not None, "run-identity")
     current = read_json(owned(root, AREA / "current.json"))
     require(current == {"schema": REPORT_SCHEMA, "status": "running", "run_id": run_id}, "run-stale")
@@ -920,7 +925,7 @@ def run_gate(root, run_id):
     require(not owned(root, directory).exists(), "run-reused")
     owned(root, directory).mkdir(parents=True)
     runner = Runner(root, directory, inherit_tree=True)
-    prepare(root)
+    prepare(root, require_prepared=require_prepared)
     sources.verify_provider(root)
     source = producer(root)
     pl = module_at("interop_accepted_pl", source / "scripts/pl_contracts.py")
@@ -1100,7 +1105,7 @@ def exclusive_run(root, run_id):
         sources.rollback_attempt(root, [(relative, identity)])
 
 
-def launch_run(root, args):
+def launch_run(root, args, *, require_prepared=False):
     run_id = uuid.uuid4().hex
     with exclusive_run(root, run_id):
         write_json(root, AREA / "current.json", {"schema": REPORT_SCHEMA, "status": "running", "run_id": run_id}, replace=True)
@@ -1111,9 +1116,11 @@ def launch_run(root, args):
                     "java": args.java, "classpath": args.classpath.split(os.pathsep),
                     "python": str(Path(sys.executable).absolute()), "node": node, "npm": npm,
                 }, replace=True)
-            completed = process_budget.run([sys.executable, "-I", "-S", "-B", str(Path(__file__).absolute()),
-                                            "_run", "--run-id", run_id], root, SECONDS,
-                                           env=process_budget.environment())
+            command = [sys.executable, "-I", "-S", "-B", str(Path(__file__).absolute()),
+                       "_run", "--run-id", run_id]
+            if require_prepared:
+                command.append("--require-prepared")
+            completed = process_budget.run(command, root, SECONDS, env=process_budget.environment())
             require(completed.returncode == 0, "gate-refused")
             # The owned worker already verified every binding before returning. Recheck its
             # exact completion, not the entire inventory a second time outside the process budget.
@@ -1128,6 +1135,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("prepare", "run", "verify", "_run"))
     parser.add_argument("--offline-source", type=Path)
+    parser.add_argument("--native-fetch", action="store_true", help="Prepare using the canonical native source client")
+    parser.add_argument("--require-prepared", action="store_true", help="Verify prepared inputs without acquiring them")
     parser.add_argument("--backend-input-file", type=Path)
     parser.add_argument("--java")
     parser.add_argument("--node", type=Path)
@@ -1136,6 +1145,10 @@ def main():
     args = parser.parse_args()
     try:
         require(args.offline_source is None or args.command == "prepare", "argument-mode")
+        require(not args.native_fetch or args.command == "prepare"
+                and args.offline_source is None and not args.require_prepared, "argument-mode")
+        require(not args.require_prepared or args.command in ("prepare", "run", "_run")
+                and args.offline_source is None, "argument-mode")
         require(args.run_id is None or args.command == "_run", "argument-mode")
         require(args.node is None or args.command == "run" and args.java is not None, "argument-mode")
         if args.java is not None or args.classpath is not None:
@@ -1144,14 +1157,15 @@ def main():
         if args.backend_input_file is not None:
             require(args.command == "run" and args.backend_input_file.absolute() == owned(ROOT, AREA / "backend-launch.json"), "backend-launch-path")
         if args.command == "prepare":
-            result = prepare(offline_source=args.offline_source)
+            result = prepare(ROOT, offline_source=args.offline_source, native_fetch=args.native_fetch,
+                             require_prepared=args.require_prepared)
         elif args.command == "verify":
             result = verify()
         elif args.command == "_run":
             require(args.run_id is not None, "run-identity")
-            result = run_gate(ROOT, args.run_id)
+            result = run_gate(ROOT, args.run_id, require_prepared=args.require_prepared)
         else:
-            launch_run(ROOT, args)
+            launch_run(ROOT, args, require_prepared=args.require_prepared)
             return 0
         print(json.dumps(result, sort_keys=True))
         return 0
