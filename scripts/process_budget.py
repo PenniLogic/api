@@ -251,8 +251,8 @@ class WindowsJob:
                 ("pids", ctypes.c_size_t * MAX_JOB_MEMBERS),
             ]
 
-        def function(name, arguments, result):
-            value = getattr(self.api, name)
+        def function(name, arguments, result, *, provider=None):
+            value = getattr(self.api if provider is None else provider, name)
             value.argtypes, value.restype = arguments, result
             return value
 
@@ -313,8 +313,11 @@ class WindowsJob:
                                                 wintypes.HANDLE)
                         in_job = function("IsProcessInJob", [wintypes.HANDLE, wintypes.HANDLE,
                                                             ctypes.POINTER(ctypes.c_int32)], ctypes.c_int32)
+                        comparison_api = ctypes.WinDLL(
+                            "KernelBase.dll", use_last_error=True, winmode=0x800,  # LOAD_LIBRARY_SEARCH_SYSTEM32
+                        )
                         same_object = function("CompareObjectHandles", [wintypes.HANDLE, wintypes.HANDLE],
-                                               ctypes.c_int32)
+                                               ctypes.c_int32, provider=comparison_api)
                         image_name = function("QueryFullProcessImageNameW", [
                             wintypes.HANDLE, ctypes.c_uint32, wintypes.LPWSTR, ctypes.POINTER(ctypes.c_uint32),
                         ], ctypes.c_int32)

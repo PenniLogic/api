@@ -1455,6 +1455,21 @@ class FakeJobObservationApi:
             ("QueryFullProcessImageNameW", self.image), ("CloseHandle", self.close),
         ):
             setattr(self, name, Mock(side_effect=handler))
+        self.kernel32 = SimpleNamespace(**{
+            name: getattr(self, name) for name in (
+                "QueryInformationJobObject", "OpenProcess", "IsProcessInJob", "QueryFullProcessImageNameW", "CloseHandle",
+            )
+        })
+        self.kernelbase = SimpleNamespace(CompareObjectHandles=self.CompareObjectHandles)
+        self.load_library = Mock(side_effect=self.library)
+
+    def library(self, name, *, use_last_error, winmode=None):
+        assert use_last_error is True
+        if name == "kernel32":
+            assert winmode is None
+            return self.kernel32
+        assert name == "KernelBase.dll" and winmode == 0x800
+        return self.kernelbase
 
     def query(self, job, kind, output, size, returned):
         assert job == self.JOB and kind in (1, 3)
@@ -1537,7 +1552,7 @@ class FakeJobObservationApi:
 class ProcessBudgetJobObservationTest(unittest.TestCase):
     def job(self, api):
         job = process_budget.WindowsJob.__new__(process_budget.WindowsJob)
-        job.api, job.handle = api, api.JOB
+        job.api, job.handle = api.kernel32, api.JOB
         return job
 
     def decode(self, note):
@@ -1584,7 +1599,10 @@ class ProcessBudgetJobObservationTest(unittest.TestCase):
 
     def observe(self, api, *, command=None, environment=None, job=None):
         job = self.job(api) if job is None else job
-        with patch.object(process_budget.ctypes, "get_last_error", side_effect=lambda: api.last_error, create=True):
+        with (
+            patch.object(process_budget.ctypes, "get_last_error", side_effect=lambda: api.last_error, create=True),
+            patch.object(process_budget.ctypes, "WinDLL", side_effect=api.load_library, create=True),
+        ):
             note = job.observation(
                 SimpleNamespace(pid=11, _handle=api.BOOTSTRAP),
                 [api.SHELL] if command is None else command,
@@ -1592,6 +1610,76 @@ class ProcessBudgetJobObservationTest(unittest.TestCase):
             )
         self.assertFalse(api.opened)
         return self.decode(note)
+
+    def test_comparison_uses_documented_system_provider_with_separate_exports(self):
+        api = FakeJobObservationApi()
+        self.assertFalse(hasattr(api.kernel32, "CompareObjectHandles"))
+        self.assertEqual(set(vars(api.kernelbase)), {"CompareObjectHandles"})
+        job = self.job(api)
+        value = self.observe(api, job=job)
+        self.assertEqual(value["members"], {
+            "status": "observed", "listed": 3, "bootstrap": 1,
+            "system_approved_shell": 1, "other": 1, "unclassified": 0,
+        })
+        self.assertEqual(value["accounting"], {"status": "observed", "total_assigned": 3, "active": 3})
+        api.load_library.assert_called_once_with("KernelBase.dll", use_last_error=True, winmode=0x800)
+        self.assertIs(job.api, api.kernel32)
+        self.assertEqual(api.QueryInformationJobObject.call_count, 2)
+        self.assertEqual(api.CompareObjectHandles.call_count, 3)
+        self.assertEqual(api.CloseHandle.call_count, 3)
+        self.assertEqual(api.CompareObjectHandles.argtypes, [ctypes.wintypes.HANDLE, ctypes.wintypes.HANDLE])
+        self.assertIs(api.CompareObjectHandles.restype, ctypes.c_int32)
+
+    def test_job_construction_and_attachment_do_not_load_the_comparison_provider(self):
+        api = FakeJobObservationApi()
+        api.kernel32.CreateJobObjectW = Mock(return_value=api.JOB)
+        api.kernel32.SetInformationJobObject = Mock(return_value=1)
+        api.kernel32.AssignProcessToJobObject = Mock(return_value=1)
+        api.kernel32.OpenProcess = Mock(return_value=100011)
+        api.kernel32.CloseHandle = Mock(return_value=1)
+        with patch.object(process_budget.ctypes, "WinDLL", side_effect=api.load_library, create=True):
+            job = process_budget.WindowsJob()
+            job.attach(SimpleNamespace(pid=11))
+            job.close()
+        api.load_library.assert_called_once_with("kernel32", use_last_error=True)
+        api.kernel32.OpenProcess.assert_called_once_with(0x0101, False, 11)
+        api.kernel32.AssignProcessToJobObject.assert_called_once_with(api.JOB, 100011)
+        self.assertEqual([call.args[0] for call in api.kernel32.CloseHandle.call_args_list], [100011, api.JOB])
+        self.assertIsNone(job.handle)
+        api.CompareObjectHandles.assert_not_called()
+        api.QueryInformationJobObject.assert_not_called()
+
+    def test_comparison_provider_is_not_loaded_without_usable_members(self):
+        for case in ("missing-job", "empty", "oversized", "refused"):
+            with self.subTest(case=case):
+                api = FakeJobObservationApi(() if case == "empty" else (11, 22))
+                job = self.job(api)
+                if case == "missing-job":
+                    job.handle = None
+                elif case == "oversized":
+                    api.assigned = 17
+                elif case == "refused":
+                    api.query_errors[3] = 5
+                self.observe(api, job=job)
+                api.load_library.assert_not_called()
+                api.OpenProcess.assert_not_called()
+
+    def test_missing_comparison_provider_and_export_preserve_component_refusals(self):
+        for missing, expected in (("library", "unavailable"), ("export", "unsupported")):
+            with self.subTest(missing=missing):
+                api = FakeJobObservationApi()
+                if missing == "library":
+                    api.load_library.side_effect = OSError("synthetic-private-missing-provider")
+                else:
+                    del api.kernelbase.CompareObjectHandles
+                value = self.observe(api)
+                self.assertEqual(value["accounting"], {"status": "observed", "total_assigned": 3, "active": 3})
+                self.assertEqual(value["members"], {"status": expected})
+                api.load_library.assert_called_once_with("KernelBase.dll", use_last_error=True, winmode=0x800)
+                self.assertEqual(api.QueryInformationJobObject.call_count, 2)
+                api.OpenProcess.assert_not_called()
+                api.CompareObjectHandles.assert_not_called()
+                api.CloseHandle.assert_not_called()
 
     def test_exact_wire_roles_and_fixed_queries_use_only_owned_handles(self):
         api = FakeJobObservationApi()
@@ -1750,7 +1838,7 @@ class ProcessBudgetJobObservationTest(unittest.TestCase):
                         "QueryFullProcessImageNameW", "CloseHandle", "OpenProcess"):
             with self.subTest(missing=missing):
                 api = FakeJobObservationApi()
-                delattr(api, missing)
+                delattr(api.kernelbase if missing == "CompareObjectHandles" else api.kernel32, missing)
                 value = self.observe(api)
                 self.assertEqual(value["members"], {"status": "unsupported"})
                 self.assertEqual(value["accounting"]["status"],
@@ -1820,6 +1908,7 @@ class ProcessBudgetJobObservationTest(unittest.TestCase):
             options = {"side_effect": effect} if isinstance(effect, Exception) else {"return_value": effect}
             with self.subTest(effect=type(effect).__name__), \
                     patch.object(process_budget.ctypes, "get_last_error", return_value=0, create=True), \
+                    patch.object(process_budget.ctypes, "WinDLL", side_effect=api.load_library, create=True), \
                     patch.object(process_budget.json, "dumps", **options):
                 note = self.job(api).observation(
                     SimpleNamespace(_handle=api.BOOTSTRAP), [api.SHELL], {"COMSPEC": api.COMSPEC},
@@ -1830,12 +1919,17 @@ class ProcessBudgetJobObservationTest(unittest.TestCase):
 
 
 class ProcessBudgetJobRunTest(unittest.TestCase):
-    def run_mocked(self, *, platform="nt", failure="elapsed", exit_code=0, inherit_tree=False, query_error=0):
+    def run_mocked(self, *, platform="nt", failure="elapsed", exit_code=0, inherit_tree=False, query_error=0,
+                   missing_provider=None):
         events = []
         api = FakeJobObservationApi((11, 22))
         api.query_errors[3] = query_error
+        if missing_provider == "library":
+            api.load_library.side_effect = OSError("synthetic-private-missing-provider")
+        elif missing_provider == "export":
+            del api.kernelbase.CompareObjectHandles
         job = process_budget.WindowsJob.__new__(process_budget.WindowsJob)
-        job.api, job.handle = api, api.JOB
+        job.api, job.handle = api.kernel32, api.JOB
         process = Mock(pid=11, _handle=api.BOOTSTRAP)
         process.returncode = exit_code if failure is None else None
         process.poll.side_effect = lambda: process.returncode
@@ -1888,6 +1982,7 @@ class ProcessBudgetJobRunTest(unittest.TestCase):
             patch.object(process_budget, "budget_observation", side_effect=v1) as state_call,
             patch.object(process_budget.time, "monotonic", side_effect=times) as clock,
             patch.object(process_budget.ctypes, "get_last_error", side_effect=lambda: api.last_error, create=True),
+            patch.object(process_budget.ctypes, "WinDLL", side_effect=api.load_library, create=True),
         ):
             try:
                 result = process_budget.run(["powershell.exe"], SCRIPTS, 10, capture=True,
@@ -1922,10 +2017,38 @@ class ProcessBudgetJobRunTest(unittest.TestCase):
         captured.stop.set.assert_called()
         captured.snapshot.assert_called_once_with(True)
         self.assertFalse(api.opened)
+        if platform == "nt" and failure == "elapsed" and not query_error:
+            api.load_library.assert_called_once_with("KernelBase.dll", use_last_error=True, winmode=0x800)
+        else:
+            api.load_library.assert_not_called()
         return SimpleNamespace(
             exception=raised, result=result, events=events, job=job, api=api,
             state_call=state_call, reader=reader, fake_os=fake_os, process=process, streams=streams,
         )
+
+    def test_missing_comparison_provider_preserves_timeout_notes_and_cleanup(self):
+        for missing, expected in (("library", "unavailable"), ("export", "unsupported")):
+            with self.subTest(missing=missing):
+                observed = self.run_mocked(missing_provider=missing)
+                self.assertIs(type(observed.exception), process_budget.BudgetExceeded)
+                self.assertEqual(observed.exception.args, ("Owned process tree exceeded its enforced elapsed budget",))
+                self.assertEqual((observed.exception.output, observed.exception.stderr, observed.exception.streams),
+                                 (b"out", b"err", observed.streams))
+                notes = observed.exception.__notes__
+                self.assertEqual(len(notes), 2)
+                self.assertEqual(json.loads(notes[0][len(process_budget.JOB_STATE_PREFIX):])["members"],
+                                 {"status": expected})
+                self.assertEqual(notes[1], (
+                    'process_budget_state={"capture_readers":1,"capture_readers_alive":1,"elapsed_ms":10025,'
+                    '"process_running":true,"returncode":null,"schema":"pennilogic.process-budget-state/1",'
+                    '"setup_ms":25,"status":"observed","wait_ms":10000}'
+                ))
+                observed.job.observation.assert_called_once()
+                self.assertEqual([name for name, _ in observed.events],
+                                 ["attach", "v1_observation", "job_observation", "terminate", "terminate"])
+                observed.api.OpenProcess.assert_not_called()
+                observed.api.CloseHandle.assert_not_called()
+                observed.reader.join.assert_called_once_with(timeout=10)
 
     def test_elapsed_failure_observes_once_before_termination_and_keeps_v1_bytes(self):
         observed = self.run_mocked()

@@ -389,6 +389,15 @@ Each returned PID is opened at most once with limited-query access. Membership
 in this exact Job is checked before metadata and again afterwards; observer-owned
 handles are closed even on refusal, never the borrowed Job/bootstrap handles.
 Bootstrap identity uses the retained process object, not its PID or image name.
+Its [`CompareObjectHandles` function](https://learn.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-compareobjecthandles)
+is resolved lazily from the fixed system `KernelBase.dll` provider with
+`LOAD_LIBRARY_SEARCH_SYSTEM32`. Job ownership, accounting, membership and the
+other handle/image APIs remain on `kernel32`; no provider is loaded for this
+comparison until a usable nonempty member list needs classification. A missing
+comparison library leaves membership unavailable; a missing export leaves it
+unsupported. Neither replaces the original timeout or changes cleanup. Regression
+fakes use separate strict DLL namespaces rather than assuming one DLL exports
+every function.
 An approved-shell role requires a positive image-path match to the already
 resolved requested shell and its already-established system location. Unknown
 or ambiguous identities remain unclassified, without filesystem discovery,
