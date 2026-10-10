@@ -384,6 +384,16 @@ failed new attempt.
 The current report schema is `pennilogic.api-money-client-interop/2`; older
 reports cannot stand in for the strengthened execution boundary.
 
+Within one final `verify` call, the complete output inventory retains bounded
+command records/streams, transports, scratch specification and generated manifests.
+Their hashes and semantic checks use those same freshly read bytes; reuse still
+checks path links, file kind and size. Other files remain fully inventoried.
+Each `api_inputs` call likewise retains its own fixture binding map rather than
+hashing those fixtures twice. Neither reuse crosses a call boundary: standalone
+verification and pre/post-execution, report-publication and final-verification
+checks remain fresh. Read-count regressions are source-only evidence, not measured
+latency savings or acceptance of any outstanding runtime, timing or skipped gate.
+
 Live and retained/offline transports compare nested values through the existing
 canonical JSON helper, not Python container equality: Boolean, integer and
 floating-point neighbors remain distinct. Retained source/classpath/output

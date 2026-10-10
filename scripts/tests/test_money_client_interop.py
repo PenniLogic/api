@@ -1661,5 +1661,430 @@ class ExecutionEvidenceTest(InteropTest):
                 interop.classpath(entries)
 
 
+class PreparedInputsTest(InteropTest):
+    """Copied, reverified source data for I/O controls, never acquisition or execution evidence."""
+
+    def setUp(self):
+        super().setUp()
+        data = interop.verify_sources(ROOT)
+        interop.verify_acquisition(ROOT)
+        interop.sources.verify_provider(ROOT)
+        self.fixture_names = {
+            (interop.FIXTURES / name).as_posix() for name in interop.inventory(ROOT / interop.FIXTURES)
+        }
+        self.input_names = {
+            "build.gradle.kts", "gradle.lockfile", "gradle/verification-metadata.xml", interop.BACKEND.as_posix(),
+            "scripts/money_client_interop.py", "scripts/materialize_money_sources.py", "scripts/process_budget.py",
+            (interop.AREA / "acquisition.json").as_posix(),
+        } | self.fixture_names
+        self.input_names.update((interop.AREA / "inputs" / name).as_posix() for name in interop.source_bindings(data))
+        self.input_names.update(
+            (interop.sources.PROVIDER / name).as_posix()
+            for name in interop.sources.provider_bindings(interop.sources.CATALOG)
+        )
+        for name in sorted(self.input_names):
+            interop.write_file(self.root, Path(name), interop.read_file(ROOT / name))
+        for name in ("java", "node", "npm", "backend.jar", "client.jar"):
+            interop.write_file(self.root, Path("source-only") / name, b"synthetic, never executed\n")
+        self.launch = {
+            "java": str(self.root / "source-only/java"), "python": str(Path(sys.executable).absolute()),
+            "node": str(self.root / "source-only/node"), "npm": str(self.root / "source-only/npm"),
+            "classpath": [str(self.root / "source-only/backend.jar")],
+        }
+        interop.write_json(self.root, interop.AREA / "backend-launch.json", self.launch)
+        self.input_names.add((interop.AREA / "backend-launch.json").as_posix())
+        self.reference_inputs = self.input_bindings()
+        interop.verify_sources(self.root)
+        interop.verify_acquisition(self.root)
+        interop.sources.verify_provider(self.root)
+
+    def input_bindings(self):
+        return {name: interop.binding(self.root / name) for name in sorted(self.input_names)}
+
+
+class ApiInputBindingTest(PreparedInputsTest):
+    def test_complete_fixture_bindings_are_read_once_per_call_and_refreshed_on_later_calls(self):
+        observations = []
+
+        def check(expected):
+            with mock.patch.object(interop, "binding", wraps=interop.binding) as bindings, \
+                    mock.patch.object(interop, "read_file", wraps=interop.read_file) as reads:
+                result = interop.api_inputs(self.root)
+            self.assertEqual(result, expected)
+            self.assertEqual(list(result), sorted(expected))
+            counts = {
+                name: sum(call.args[0] == self.root / name for call in bindings.call_args_list)
+                for name in self.fixture_names
+            }
+            self.assertEqual(counts, dict.fromkeys(self.fixture_names, 1))
+            catalog_reads = sum(
+                call.args[0] == self.root / interop.FIXTURES / "source-inputs.json"
+                for call in reads.call_args_list
+            )
+            self.assertEqual(catalog_reads, 2, "The independent catalog validation must not reuse fixture bindings")
+            observations.append({"fixture_binding_reads": counts, "catalog_reads": catalog_reads})
+            return result
+
+        first = check(self.reference_inputs)
+        check(self.reference_inputs)
+        name = (interop.FIXTURES / "envelope.yaml").as_posix()
+        path = self.root / name
+        path.write_bytes(path.read_bytes() + b"\n")
+        first[name]["bytes"] = False
+        fresh = self.input_bindings()
+        self.assertNotEqual(fresh[name], self.reference_inputs[name])
+        check(fresh)
+        self.io_observations = observations
+
+    def test_later_fixture_additions_and_hardlinks_are_not_hidden_by_prior_bindings(self):
+        self.assertEqual(interop.api_inputs(self.root), self.reference_inputs)
+        relative = interop.FIXTURES / "extra-data.txt"
+        path = interop.write_file(self.root, relative, b"new fixture\n")
+        expected = {**self.reference_inputs, relative.as_posix(): interop.binding(path)}
+        self.assertEqual(interop.api_inputs(self.root), expected)
+        linked = self.root / interop.FIXTURES / "linked-data.txt"
+        os.link(path, linked)
+        with self.assertRaisesRegex(interop.InteropError, "^input-kind$"):
+            interop.api_inputs(self.root)
+
+
+class OutputVerificationTest(PreparedInputsTest):
+    """Real retained-file validators with synthetic commands/models and two corpus rows; no runtimes execute."""
+
+    def setUp(self):
+        super().setUp()
+        self.directory = interop.AREA / "runs" / self.run_id
+        self.values = interop.corpus(self.root)["values"][:2]
+        self.expected = interop.transport(self.run_id, self.values)
+        invalid = interop.transport(
+            self.run_id, interop.read_json(
+                self.root / interop.AREA / "inputs/spec/fixtures/money-wire-fixtures.v1.json",
+            )["invalid"], interop.INVALID_SHA256,
+        )
+        plant = copy.deepcopy(self.expected)
+        plant["cases"][0]["envelope"]["total"] = copy.deepcopy(self.expected["cases"][1]["envelope"]["total"])
+        rejected = {
+            **invalid, "schema": interop.REJECTIONS_SCHEMA,
+            "cases": [{"id": row["id"], "status": "rejected"} for row in invalid["cases"]],
+        }
+        documents = {"backend.json": self.expected, "invalid.json": invalid}
+        for language in interop.LANGUAGES:
+            documents.update({
+                language + ".json": self.expected, language + "-recovered.json": self.expected,
+                language + "-rejected.json": rejected, language + "-disagreement.json": plant,
+            })
+        for name, value in documents.items():
+            interop.write_json(self.root, self.directory / name, value)
+        self.semantic_names = set(documents) | {"spec/openapi.yaml"}
+        self.specification = interop.scratch_spec(self.root, self.directory)
+        source = interop.producer(self.root)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            pl = interop.module_at("retained_fixture_pl", source / "scripts/pl_contracts.py")
+        pins = interop.read_json(source / "toolchain/versions.json")
+        clients = []
+        for language in interop.LANGUAGES:
+            relative = self.directory / "generated" / language
+            model = interop.MODELS[language]
+            model_bytes = b"synthetic generated-model data, never compiled\n"
+            interop.write_file(self.root, relative / model, model_bytes)
+            files = {model: interop.digest(model_bytes)}
+            config = source / "generator" / (language + ".json")
+            manifest = {
+                "schema_version": 1, "target": language, "spec_version": "0.1.0",
+                "spec_sha256": interop.digest(interop.read_file(self.specification)),
+                "currency_registry_sha256": interop.digest(interop.read_file(source / "spec/currency-registry.v1.json")),
+                "generator": {
+                    "name": "openapi-generator-cli", "version": pins["openapi_generator"]["version"],
+                    "jar_sha256": pins["openapi_generator"]["sha256"],
+                    "generator_name": interop.read_json(config)["generatorName"],
+                    "config": f"generator/{language}.json", "config_sha256": interop.digest(interop.read_file(config)),
+                    "ignore_override_sha256": interop.digest(interop.read_file(source / "generator/openapi-generator-ignore")),
+                    "template_override_sha256": (
+                        pl.tree_hash(source / "generator/templates" / language)[0] if language != "typescript" else None
+                    ),
+                },
+                "runtime_sha256": pl.tree_hash(source / "runtime" / language)[0],
+                "file_count": 1, "tree_sha256": pl.combined_digest(files),
+                "files": [{"path": name, "sha256": sha} for name, sha in files.items()],
+            }
+            manifest_file = interop.write_json(self.root, relative / "contracts-manifest.json", manifest)
+            self.semantic_names.add(f"generated/{language}/contracts-manifest.json")
+            clients.append({
+                "target": language, "model": model, "model_sha256": files[model],
+                "manifest_sha256": interop.binding(manifest_file)["sha256"], "tree_sha256": manifest["tree_sha256"],
+                "round_trip": interop.COUNT, "invalid_rejected": interop.INVALID_COUNT,
+                "disagreement_refused": True, "recovery": interop.COUNT, "skipped": 0,
+            })
+        runtime = interop.AREA / "runtimes" / self.run_id
+        scripts = "Scripts" if os.name == "nt" else "bin"
+        library = "Lib" if os.name == "nt" else f"lib/python{sys.version_info.major}.{sys.version_info.minor}"
+        for name in ("venv/pyvenv.cfg", f"venv/{scripts}/fixture", f"venv/{library}/site-packages/fixture.py", "node/fixture"):
+            interop.write_file(self.root, runtime / name, b"synthetic runtime-inventory data\n")
+        interop.write_json(self.root, self.directory / "runtime-inputs.json",
+                           interop.runtime_inputs(self.root, self.directory, self.launch))
+        client_classpath = [str(self.root / "source-only/client.jar")]
+        interop.write_json(self.root, self.directory / "kotlin-launch.json", {"classpath": client_classpath})
+        self.report = {
+            "schema": interop.REPORT_SCHEMA, "status": "passed", "run_id": self.run_id,
+            "scope": "api-test-only-generated-model-round-trip", "release_consumed": False,
+            "source_ref": interop.SOURCE, "source_tree": interop.SOURCE_TREE, "catalog_sha256": interop.CATALOG_SHA256,
+            "spec_version": "0.1.0", "scratch_spec_sha256": interop.digest(interop.read_file(self.specification)),
+            "corpus_sha256": interop.CORPUS_SHA256, "canonical_sha256": interop.CANONICAL_SHA256,
+            "case_count": interop.COUNT, "generated_count": 10000, "boundary_count": 30,
+            "invalid_count": interop.INVALID_COUNT, "currencies": ["INR", "JPY", "KWD"],
+            "default_money_model_emitted": False, "languages": clients, "inputs": self.reference_inputs,
+            "backend_classpath": interop.classpath_bindings(self.launch["classpath"]),
+            "client_classpath": interop.classpath_bindings(client_classpath),
+            "commands": self.command_records(pins["typescript"]["version"]), "elapsed_seconds": 1.0,
+        }
+        self.refresh_report()
+
+    def command_records(self, typescript_version):
+        protocols = {
+            "python-ready": ({"missing": 0, "wrong": 0}, None),
+            "backend-emit": (interop.receipt("backend", "emit", interop.COUNT, self.run_id), None),
+            "backend-reject": (interop.receipt("backend", "reject", interop.INVALID_COUNT, self.run_id), None),
+        }
+        for language in interop.LANGUAGES:
+            for label, operation in (("convert", "convert"), ("recover", "convert"), ("disagree", "disagree"), ("reject", "reject")):
+                count = interop.INVALID_COUNT if operation == "reject" else interop.COUNT
+                protocols[language + "-" + label] = (interop.receipt(language, operation, count, self.run_id), None)
+            for label in ("consume", "consume-recovery"):
+                protocols[language + "-" + label] = (interop.receipt("backend", "consume", interop.COUNT, self.run_id), None)
+            protocols[language + "-refuse-disagreement"] = (None, interop.DISAGREEMENT)
+        records = ExecutionEvidenceTest.records(self)
+        for index, record in enumerate(records):
+            prefix = self.directory / "commands" / f"{index:02d}-{record['label']}"
+            contents = [b"" if value is None else interop.json_bytes(value)
+                        for value in protocols.get(record["label"], (None, None))]
+            if record["label"] == "typescript-ready":
+                contents[0] = ("Version " + typescript_version + "\n").encode("ascii")
+            if record["label"] == "compile-kotlin":
+                contents[0] = b"> Task :compileKotlin\n"
+            for name, content in zip(("stdout", "stderr"), contents):
+                path = Path(str(prefix) + "." + name + ".txt")
+                interop.write_file(self.root, path, content)
+                self.semantic_names.add(path.relative_to(self.directory).as_posix())
+                record[name] = {"path": path.as_posix(), "bytes": len(content), "sha256": interop.digest(content)}
+            path = Path(str(prefix) + ".json")
+            interop.write_json(self.root, path, record)
+            self.semantic_names.add(path.relative_to(self.directory).as_posix())
+        return records
+
+    def refresh_report(self):
+        files = interop.inventory(self.root / self.directory)
+        files.pop("report.json", None)
+        self.report["outputs"] = files
+        path = interop.write_json(self.root, self.directory / "report.json", self.report, replace=True)
+        interop.write_json(self.root, interop.AREA / "current.json", {
+            "schema": interop.REPORT_SCHEMA, "status": "passed", "run_id": self.run_id,
+            "report_sha256": interop.binding(path)["sha256"],
+        }, replace=True)
+
+    def verify_report(self):
+        with mock.patch.object(interop, "corpus", return_value={"values": self.values}), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return interop.verify(self.root)
+
+    def test_verification_binds_and_validates_each_semantic_artifact_from_one_read(self):
+        with mock.patch.object(interop, "read_file", wraps=interop.read_file) as reads:
+            result = self.verify_report()
+        self.assertEqual(result, {
+            "event": "money_client_interop", "status": "verified", "run_id": self.run_id, "case_count": interop.COUNT,
+        })
+        counts = {
+            name: sum(call.args[0] == self.root / self.directory / name for call in reads.call_args_list)
+            for name in sorted(self.semantic_names)
+        }
+        self.assertEqual(counts, dict.fromkeys(sorted(self.semantic_names), 1))
+        self.io_observations = {"semantic_artifact_reads": counts}
+
+    def test_hashed_bytes_supply_semantics_but_a_later_verification_reads_again(self):
+        path = self.root / self.directory / "kotlin.json"
+        changed = copy.deepcopy(self.expected)
+        changed["cases"][0]["envelope"]["total"]["amount"] = "changed after the bound read"
+        original_read = interop.read_file
+        reads = []
+
+        def mutate_after_read(candidate, limit=interop.MAX_DOCUMENT):
+            content = original_read(candidate, limit)
+            if candidate == path:
+                reads.append(interop.digest(content))
+                path.write_bytes(interop.json_bytes(changed))
+            return content
+
+        with mock.patch.object(interop, "read_file", side_effect=mutate_after_read):
+            self.verify_report()
+        self.assertEqual(reads, [self.report["outputs"]["kotlin.json"]["sha256"]])
+        with self.assertRaisesRegex(interop.InteropError, "^evidence-outputs$"):
+            self.verify_report()
+        self.io_observations = {"first_pass_transport_reads": len(reads), "next_pass_refusal": "evidence-outputs"}
+
+    def test_matching_new_hashes_do_not_hide_malformed_or_incorrect_semantics(self):
+        controls = (
+            ("kotlin.json", lambda value: value.update(run_id="b" * 32), "transport-run-id"),
+            ("kotlin-disagreement.json", lambda value: value["cases"][0]["envelope"].update(booked_on="2026-10-01"), "fault-not-planted"),
+            ("python-recovered.json", lambda value: value["cases"][0]["envelope"]["total"].update(amount="wrong"), "wire-disagreement"),
+            ("typescript-rejected.json", lambda value: value["cases"][0].update(status="skipped"), "case-unexecuted"),
+            ("generated/kotlin/contracts-manifest.json", lambda value: value.update(schema_version=True), "generated-version"),
+            ("generated/typescript/contracts-manifest.json", lambda value: value.update(files=[]), "generated-inventory"),
+            ("generated/python/contracts-manifest.json", lambda value: value.pop("target"), "generated-manifest-shape"),
+            ("commands/00-generator-golden.json", lambda value: value.update(executed=1), "command-record-binding"),
+        )
+        for name, mutate, cause in controls:
+            path = self.root / self.directory / name
+            original = path.read_bytes()
+            value = interop.sources.json_document(original)
+            mutate(value)
+            try:
+                path.write_bytes(interop.json_bytes(value))
+                self.refresh_report()
+                with self.subTest(artifact=name), self.assertRaisesRegex(interop.InteropError, "^" + cause + "$"):
+                    self.verify_report()
+            finally:
+                path.write_bytes(original)
+        self.refresh_report()
+        self.verify_report()
+
+    def test_rebound_negative_and_recovery_command_streams_still_require_exact_receipts(self):
+        for label, stream in (("kotlin-refuse-disagreement", "stderr"), ("python-consume-recovery", "stdout")):
+            index = next(index for index, record in enumerate(self.report["commands"]) if record["label"] == label)
+            record = self.report["commands"][index]
+            record_path = self.root / self.directory / "commands" / f"{index:02d}-{label}.json"
+            path = self.root / record[stream]["path"]
+            original_record, original_content = copy.deepcopy(record), path.read_bytes()
+            try:
+                path.write_bytes(b"{}\n")
+                record[stream].update(interop.binding(path))
+                record_path.write_bytes(interop.json_bytes(record))
+                self.refresh_report()
+                with self.subTest(label=label), self.assertRaisesRegex(interop.InteropError, "^command-receipt$"):
+                    self.verify_report()
+            finally:
+                path.write_bytes(original_content)
+                record_path.write_bytes(interop.json_bytes(original_record))
+                self.report["commands"][index] = original_record
+        self.refresh_report()
+        self.verify_report()
+
+    def test_missing_extra_and_tampered_artifacts_cannot_match_the_full_inventory(self):
+        path = self.root / self.directory / "kotlin.json"
+        original = path.read_bytes()
+        extra = self.root / self.directory / "undeclared.bin"
+        for kind in ("missing", "extra", "tampered"):
+            try:
+                if kind == "missing":
+                    path.unlink()
+                elif kind == "extra":
+                    extra.write_bytes(b"undeclared")
+                else:
+                    path.write_bytes(b"{}\n")
+                with self.subTest(kind=kind), self.assertRaisesRegex(interop.InteropError, "^evidence-outputs$"):
+                    self.verify_report()
+            finally:
+                path.write_bytes(original)
+                extra.unlink(missing_ok=True)
+        self.verify_report()
+
+    def test_cached_artifacts_still_refuse_missing_nonregular_hardlinked_and_linked_paths(self):
+        _, reader = interop.output_snapshot(self.root, self.directory, self.report["commands"])
+        path = self.root / self.directory / "kotlin.json"
+        original = path.read_bytes()
+        link = self.root / "after-snapshot-hardlink"
+        path.unlink()
+        with self.assertRaises(FileNotFoundError):
+            reader(path)
+        path.mkdir()
+        with self.assertRaisesRegex(interop.InteropError, "^input-kind$"):
+            reader(path)
+        path.rmdir()
+        path.write_bytes(original)
+        os.link(path, link)
+        try:
+            with self.assertRaisesRegex(interop.InteropError, "^input-kind$"):
+                reader(path)
+            with self.assertRaisesRegex(interop.InteropError, "^input-kind$"):
+                self.verify_report()
+        finally:
+            link.unlink()
+        for method in ("is_symlink", "is_junction"):
+            real_check = getattr(Path, method)
+            with self.subTest(kind=method), mock.patch.object(
+                Path, method, autospec=True, side_effect=lambda candidate: candidate == path or real_check(candidate),
+            ):
+                with self.assertRaisesRegex(interop.InteropError, "^linked-input$"):
+                    reader(path)
+                with self.assertRaisesRegex(interop.sources.MaterializationError, "^output-path-linked$"):
+                    self.verify_report()
+        self.assertEqual(reader(path), original)
+
+    def test_oversized_semantic_bytes_cannot_be_replaced_by_a_later_smaller_read(self):
+        path = self.root / self.directory / "kotlin.json"
+        original = path.read_bytes()
+        path.write_bytes(b" " * (interop.MAX_DOCUMENT + 1))
+        self.refresh_report()
+        original_read = interop.read_file
+        reads = []
+
+        def shrink_after_read(candidate, limit=interop.MAX_DOCUMENT):
+            content = original_read(candidate, limit)
+            if candidate == path:
+                reads.append(len(content))
+                path.write_bytes(original)
+            return content
+
+        with mock.patch.object(interop, "read_file", side_effect=shrink_after_read), \
+                self.assertRaisesRegex(interop.InteropError, "^document-size$"):
+            self.verify_report()
+        self.assertEqual(reads, [interop.MAX_DOCUMENT + 1])
+        self.io_observations = {"oversized_artifact_reads": reads}
+
+    def test_a_missing_artifact_added_after_inventory_is_not_an_unbound_semantic_input(self):
+        path = self.root / self.directory / "backend.json"
+        original = path.read_bytes()
+        path.unlink()
+        self.refresh_report()
+        commands = interop.verify_commands
+
+        def add_after_inventory(*args, **kwargs):
+            path.write_bytes(original)
+            return commands(*args, **kwargs)
+
+        with mock.patch.object(interop, "verify_commands", side_effect=add_after_inventory), \
+                self.assertRaisesRegex(interop.InteropError, "^evidence-outputs$"):
+            self.verify_report()
+
+    def test_independent_verification_refreshes_source_provider_input_classpath_runtime_and_producer(self):
+        self.verify_report()
+        mutations = (
+            (interop.AREA / "inputs/toolchain/versions.json", interop.sources.MaterializationError, "source-bytes"),
+            (interop.sources.PROVIDER / next(iter(interop.sources.provider_bindings(interop.sources.CATALOG))),
+             interop.sources.MaterializationError, "source-bytes"),
+            (interop.FIXTURES / "envelope.yaml", interop.InteropError, "evidence-stale-inputs"),
+            (Path("source-only/backend.jar"), interop.InteropError, "evidence-backend"),
+            (Path("source-only/client.jar"), interop.InteropError, "evidence-client"),
+            (interop.AREA / "runtimes" / self.run_id / "node/fixture", interop.InteropError, "evidence-runtime-inputs"),
+            (interop.AREA / "producer/scripts/pl_contracts.py", interop.InteropError, "producer-source-inventory"),
+        )
+        for relative, error_type, cause in mutations:
+            path = self.root / relative
+            original = path.read_bytes()
+            try:
+                path.write_bytes(original + b"\n")
+                with self.subTest(path=relative.as_posix()), self.assertRaisesRegex(error_type, "^" + cause + "$"):
+                    self.verify_report()
+            finally:
+                path.write_bytes(original)
+        self.verify_report()
+
+    def test_stale_run_identity_is_refused_before_the_output_snapshot(self):
+        self.report["run_id"] = "b" * 32
+        self.refresh_report()
+        with mock.patch.object(interop, "output_snapshot", wraps=interop.output_snapshot) as snapshot, \
+                self.assertRaisesRegex(interop.InteropError, "^evidence-stale$"):
+            self.verify_report()
+        snapshot.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
