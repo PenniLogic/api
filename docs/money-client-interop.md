@@ -357,6 +357,52 @@ The canonical Infra qualifier owns transport within the matching unittest
 `ERROR` block; a note is neither an exception-allowlist extension nor evidence
 of a complete inventory or a passing test.
 
+On Windows, the same elapsed-failure boundary also queries only the already-owned
+Job. It attaches `process_budget_job_state=` immediately before the unchanged
+final v1 note. Version `pennilogic.process-budget-job-state/1` has exactly
+`schema`, `accounting` and `members`, encoded as recursively sorted compact ASCII
+JSON, at most 512 bytes including the prefix. The existing canonical v1 decoder
+ignores this distinct earlier line; transport of the new fields requires a
+separate official Infra decoder adoption. Neither note changes the original
+`BudgetExceeded`, refusal or incomplete-outcome treatment.
+
+Accounting uses one query: an `observed` block contains `status`,
+`total_assigned` (the Job's cumulative process count) and `active`, with unsigned
+32-bit integers and active no greater than total. Membership uses one fixed
+16-entry query without sizing, retry or further enumeration. An `observed` or
+`partial` block contains `status`, `listed`, `bootstrap`,
+`system_approved_shell`, `other` and `unclassified`. Counts are integers from 0
+through 16, bootstrap is at most one, and the four roles sum to listed.
+Booleans are not integers. Unclassified entries, an incomplete list or a
+disagreement with actually observed active accounting make membership partial;
+cumulative total is never compared with listed. An unavailable accounting
+component supplies no invented active count.
+
+Unavailable or unsupported components contain only their corresponding
+`status`; an oversized membership component contains only
+`{"status":"oversized"}`. Missing evidence is not observed zeroes. Expected
+query or encoding refusals preserve the original failure and cleanup, with no
+raw exception text. No identities, handles, creation times, paths or their
+hashes, argv, environment or command output are emitted.
+
+Each returned PID is opened at most once with limited-query access. Membership
+in this exact Job is checked before metadata and again afterwards; observer-owned
+handles are closed even on refusal, never the borrowed Job/bootstrap handles.
+Bootstrap identity uses the retained process object, not its PID or image name.
+An approved-shell role requires a positive image-path match to the already
+resolved requested shell and its already-established system location. Unknown
+or ambiguous identities remain unclassified, without filesystem discovery,
+image-buffer resizing or runtime substitution.
+
+The two queries and per-handle checks are not an atomic census. PID reuse within
+the Job or exit after opening can prevent a handle classification from describing
+the earlier accounting instant. Counts do not establish per-role liveness,
+absence throughout execution, binary authenticity, lifecycle history or a wait
+cause. Fixed query counts and buffers bound work, not operating-system latency;
+no extra wait, prewarm, retry or execution-budget extension is added. Portable
+fake-Win32 and mocked-run regressions exercise this contract, not live kernel
+behavior, a timeout repair, native acceptance or the five-minute requirement.
+
 The separate `quality.py gate-self-test` command copies
 `scripts/money_client_interop.py`, `scripts/tests/fixtures/money_client_interop`,
 and `build/source-materialization` into its isolated working directory. Its final

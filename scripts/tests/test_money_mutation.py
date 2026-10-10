@@ -1,6 +1,7 @@
 """Synthetic report probes test the consumer, never stand in for real PIT results."""
 
 from collections import Counter
+import ctypes
 import errno
 import hashlib
 import importlib.util
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 import xml.etree.ElementTree as ET
@@ -1293,10 +1295,13 @@ class ProcessBudgetObservationTest(unittest.TestCase):
             if parent_exits:
                 self.assertTrue(marker.is_file())
             notes = getattr(raised.exception, "__notes__", [])
-            self.assertEqual(len(notes), 1)
-            for private in ("synthetic-private", str(root), str(sys.executable), "time.sleep"):
-                self.assertNotIn(private, notes[0])
-            return self.state(notes[0])
+            self.assertEqual(len(notes), 2 if os.name == "nt" else 1)
+            if os.name == "nt":
+                ProcessBudgetJobObservationTest().decode(notes[0])
+            for note in notes:
+                for private in ("synthetic-private", str(root), str(sys.executable), "time.sleep"):
+                    self.assertNotIn(private, note)
+            return self.state(notes[-1])
 
     def test_running_process_is_observed_before_termination_with_setup_time(self):
         environment = process_budget.environment
@@ -1428,6 +1433,566 @@ class ProcessBudgetObservationTest(unittest.TestCase):
                                SCRIPTS, 10, capture=True, separate=True)
         observe.assert_not_called()
         self.assertEqual(getattr(raised.exception, "__notes__", []), [])
+
+
+class FakeJobObservationApi:
+    JOB, BOOTSTRAP = 9000, 9001
+    COMSPEC = r"C:\Windows\System32\cmd.exe"
+    SHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+
+    def __init__(self, pids=(11, 22, 33)):
+        self.pids = list(pids)
+        self.total = self.active = self.assigned = self.listed = len(pids)
+        self.query_errors, self.query_lengths = {}, {}
+        self.last_error, self.events, self.opened = 0, [], set()
+        self.entries = {
+            pid: {"bootstrap": pid == 11, "image": self.SHELL if pid == 22 else r"C:\synthetic-private\worker.exe"}
+            for pid in pids
+        }
+        for name, handler in (
+            ("QueryInformationJobObject", self.query), ("OpenProcess", self.open),
+            ("IsProcessInJob", self.membership), ("CompareObjectHandles", self.compare),
+            ("QueryFullProcessImageNameW", self.image), ("CloseHandle", self.close),
+        ):
+            setattr(self, name, Mock(side_effect=handler))
+
+    def query(self, job, kind, output, size, returned):
+        assert job == self.JOB and kind in (1, 3)
+        value = output._obj
+        self.events.append(("query", kind, size))
+        assert size == ctypes.sizeof(value)
+        if kind == 1:
+            assert size == 48
+            value.total, value.active = self.total, self.active
+            length = size
+        else:
+            assert type(value).pids.offset == 8
+            assert size == 8 + 16 * ctypes.sizeof(ctypes.c_size_t)
+            value.assigned, value.listed = self.assigned, self.listed
+            for index, pid in enumerate(self.pids[:16]):
+                value.pids[index] = pid
+            length = 8 + min(self.listed, 16) * ctypes.sizeof(ctypes.c_size_t)
+        returned._obj.value = self.query_lengths.get(kind, length)
+        self.last_error = self.query_errors.get(kind, 0)
+        if self.last_error == "raise":
+            raise OSError("synthetic-private-query")
+        return int(not self.last_error)
+
+    def open(self, access, inherit, pid):
+        assert access == 0x1000 and inherit is False and pid in self.pids
+        self.events.append(("open", pid))
+        error = self.entries[pid].get("open_error")
+        if error == "raise":
+            raise OSError("synthetic-private-open")
+        if error:
+            return 0
+        handle = pid + 100000
+        self.opened.add(handle)
+        return handle
+
+    def membership(self, handle, job, belongs):
+        assert handle in self.opened and job == self.JOB
+        self.events.append(("membership", handle))
+        entry = self.entries[handle - 100000]
+        states = entry.get("membership")
+        state = states.pop(0) if states else True
+        if state == "raise":
+            raise OSError("synthetic-private-membership")
+        if state == "denied":
+            return 0
+        belongs._obj.value = int(state)
+        return 1
+
+    def compare(self, handle, bootstrap):
+        assert handle in self.opened and bootstrap == self.BOOTSTRAP
+        self.events.append(("compare", handle))
+        entry = self.entries[handle - 100000]
+        if entry.get("compare_error"):
+            raise OSError("synthetic-private-object")
+        return int(entry["bootstrap"])
+
+    def image(self, handle, flags, buffer, size):
+        assert handle in self.opened and flags == 0 and size._obj.value == len(buffer) == 32768
+        self.events.append(("image", handle))
+        entry = self.entries[handle - 100000]
+        if entry.get("image_error") == "raise":
+            raise OSError("synthetic-private-image")
+        if entry.get("image_error"):
+            return 0
+        if not entry.get("no_image_write"):
+            buffer.value = entry["image"]
+        size._obj.value = entry.get("image_length", len(entry["image"]))
+        return 1
+
+    def close(self, handle):
+        assert handle in self.opened and handle not in (self.JOB, self.BOOTSTRAP)
+        self.events.append(("close", handle))
+        self.opened.remove(handle)
+        refusal = self.entries[handle - 100000].get("close_error")
+        if refusal == "raise":
+            raise OSError("synthetic-private-close")
+        return int(not refusal)
+
+
+class ProcessBudgetJobObservationTest(unittest.TestCase):
+    def job(self, api):
+        job = process_budget.WindowsJob.__new__(process_budget.WindowsJob)
+        job.api, job.handle = api, api.JOB
+        return job
+
+    def decode(self, note):
+        self.assertIs(type(note), str)
+        self.assertLessEqual(len(note.encode("ascii")), 512)
+        self.assertTrue(note.startswith(process_budget.JOB_STATE_PREFIX))
+        value = json.loads(note[len(process_budget.JOB_STATE_PREFIX):])
+        self.assertEqual(note, process_budget.JOB_STATE_PREFIX + json.dumps(
+            value, sort_keys=True, separators=(",", ":"),
+        ))
+        self.assertEqual(set(value), {"schema", "accounting", "members"})
+        self.assertEqual(value["schema"], "pennilogic.process-budget-job-state/1")
+        for private in ("synthetic-private", r"C:\Windows", "powershell.exe", "worker.exe", "9000", "9001"):
+            self.assertNotIn(private, note)
+        accounting, members = value["accounting"], value["members"]
+        if accounting["status"] == "observed":
+            self.assertEqual(set(accounting), {"status", "total_assigned", "active"})
+            for key in ("total_assigned", "active"):
+                self.assertIs(type(accounting[key]), int)
+                self.assertTrue(0 <= accounting[key] <= 4294967295)
+            self.assertLessEqual(accounting["active"], accounting["total_assigned"])
+        else:
+            self.assertIn(accounting["status"], ("unavailable", "unsupported"))
+            self.assertEqual(set(accounting), {"status"})
+        if members["status"] in ("observed", "partial"):
+            self.assertEqual(set(members), {
+                "status", "listed", "bootstrap", "system_approved_shell", "other", "unclassified",
+            })
+            for key in set(members) - {"status"}:
+                self.assertIs(type(members[key]), int)
+                self.assertIn(members[key], range(17))
+            self.assertLessEqual(members["bootstrap"], 1)
+            self.assertEqual(members["listed"], sum(
+                members[key] for key in ("bootstrap", "system_approved_shell", "other", "unclassified")
+            ))
+            if members["status"] == "observed":
+                self.assertEqual(members["unclassified"], 0)
+                if accounting["status"] == "observed":
+                    self.assertEqual(members["listed"], accounting["active"])
+        else:
+            self.assertIn(members["status"], ("unavailable", "unsupported", "oversized"))
+            self.assertEqual(set(members), {"status"})
+        return value
+
+    def observe(self, api, *, command=None, environment=None, job=None):
+        job = self.job(api) if job is None else job
+        with patch.object(process_budget.ctypes, "get_last_error", side_effect=lambda: api.last_error, create=True):
+            note = job.observation(
+                SimpleNamespace(pid=11, _handle=api.BOOTSTRAP),
+                [api.SHELL] if command is None else command,
+                {"COMSPEC": api.COMSPEC} if environment is None else environment,
+            )
+        self.assertFalse(api.opened)
+        return self.decode(note)
+
+    def test_exact_wire_roles_and_fixed_queries_use_only_owned_handles(self):
+        api = FakeJobObservationApi()
+        value = self.observe(api)
+        self.assertEqual(value["accounting"], {"status": "observed", "total_assigned": 3, "active": 3})
+        self.assertEqual(value["members"], {
+            "status": "observed", "listed": 3, "bootstrap": 1,
+            "system_approved_shell": 1, "other": 1, "unclassified": 0,
+        })
+        self.assertEqual([call.args[1] for call in api.QueryInformationJobObject.call_args_list], [1, 3])
+        self.assertEqual(api.OpenProcess.call_count, 3)
+        self.assertEqual(api.IsProcessInJob.call_count, 6)
+        self.assertEqual(api.CompareObjectHandles.call_count, 3)
+        self.assertEqual(api.QueryFullProcessImageNameW.call_count, 2)
+        self.assertEqual(api.CloseHandle.call_count, 3)
+        for pid in api.pids:
+            handle = pid + 100000
+            events = [event[0] for event in api.events if event[1] == handle]
+            self.assertEqual(events, ["membership", "compare", *([] if pid == 11 else ["image"]),
+                                      "membership", "close"])
+        self.assertEqual(ctypes.sizeof(api.IsProcessInJob.argtypes[2]._type_), 4)
+
+    def test_bootstrap_requires_retained_object_identity_not_pid_or_image(self):
+        api = FakeJobObservationApi((11, 22))
+        api.entries[11].update(bootstrap=False, image=r"C:\synthetic-private\python.exe")
+        api.entries[22]["bootstrap"] = True
+        value = self.observe(api)
+        self.assertEqual((value["members"]["bootstrap"], value["members"]["other"]), (1, 1))
+        self.assertEqual([call.args[0] for call in api.QueryFullProcessImageNameW.call_args_list], [100011])
+        api = FakeJobObservationApi((11, 22))
+        api.entries[22]["bootstrap"] = True
+        self.assertEqual(self.observe(api)["members"], {"status": "unavailable"})
+        self.assertEqual(api.CloseHandle.call_count, 2)
+
+    def test_only_the_positive_requested_system_shell_image_is_approved(self):
+        for requested, image, expected in (
+            (FakeJobObservationApi.SHELL, FakeJobObservationApi.SHELL.upper(), "system_approved_shell"),
+            (FakeJobObservationApi.COMSPEC, FakeJobObservationApi.COMSPEC, "system_approved_shell"),
+            (FakeJobObservationApi.SHELL, FakeJobObservationApi.COMSPEC, "other"),
+            (r"C:\synthetic-private\powershell.exe", r"C:\synthetic-private\powershell.exe", "other"),
+            (FakeJobObservationApi.SHELL, r"C:\synthetic-private\powershell.exe", "other"),
+        ):
+            with self.subTest(requested=requested, image=image):
+                api = FakeJobObservationApi((22,))
+                api.entries[22]["image"] = image
+                members = self.observe(api, command=[requested])["members"]
+                self.assertEqual(members[expected], 1)
+                self.assertEqual(members["status"], "observed")
+
+    def test_ambiguous_images_and_context_are_unclassified_without_discovery(self):
+        for image in (
+            "powershell.exe", r"\\?\C:\Windows\System32\cmd.exe", r"\\server\synthetic-private\worker.exe",
+            r"C:\Windows\System32\..\cmd.exe", r"C:\WINDOW~1\System32\cmd.exe",
+            "C:\\Windows\\System32\\cmd.exe ", "C:\\Windows\\System32\\cmd.exe.",
+        ):
+            with self.subTest(image=image):
+                api = FakeJobObservationApi((22,))
+                api.entries[22]["image"] = image
+                self.assertEqual(self.observe(api)["members"]["unclassified"], 1)
+        for command, environment in (([], {}), (["powershell.exe"], {}), ([FakeJobObservationApi.SHELL], {})):
+            with self.subTest(command=command, environment=environment):
+                api = FakeJobObservationApi((22,))
+                self.assertEqual(self.observe(api, command=command, environment=environment)["members"]["unclassified"], 1)
+                api.QueryFullProcessImageNameW.assert_not_called()
+
+    def test_accounting_uint32_boundaries_are_not_membership_or_invented_zeroes(self):
+        for total, active, expected in ((0, 0, "observed"), (4294967295, 4294967295, "observed"),
+                                        (0, 1, "unavailable")):
+            with self.subTest(total=total, active=active):
+                api = FakeJobObservationApi(())
+                api.total, api.active = total, active
+                value = self.observe(api)
+                self.assertEqual(value["accounting"]["status"], expected)
+                self.assertEqual(value["members"]["status"], "partial" if active == 4294967295 else "observed")
+        api = FakeJobObservationApi((11, 22))
+        api.total = 4294967295
+        self.assertEqual(self.observe(api)["members"]["status"], "observed")
+
+    def test_active_mismatch_is_partial_but_missing_accounting_is_not_zero(self):
+        for active, accounting_error, expected in ((1, 0, "partial"), (3, 0, "partial"), (0, 5, "observed")):
+            with self.subTest(active=active, accounting_error=accounting_error):
+                api = FakeJobObservationApi((11, 22))
+                api.total, api.active = 3, active
+                api.query_errors[1] = accounting_error
+                value = self.observe(api)
+                self.assertEqual(value["members"]["status"], expected)
+                self.assertEqual(value["members"]["listed"], 2)
+                self.assertEqual(value["members"]["unclassified"], 0)
+                if accounting_error:
+                    self.assertEqual(value["accounting"], {"status": "unavailable"})
+
+    def test_empty_and_sixteen_member_lists_are_complete_without_extra_queries(self):
+        for pids in ((), tuple(range(1, 17))):
+            with self.subTest(count=len(pids)):
+                api = FakeJobObservationApi(pids)
+                members = self.observe(api)["members"]
+                self.assertEqual(members["status"], "observed")
+                self.assertEqual(members["listed"], len(pids))
+                self.assertEqual(api.QueryInformationJobObject.call_count, 2)
+                self.assertEqual(api.OpenProcess.call_count, len(pids))
+
+    def test_oversized_membership_never_opens_truncated_pids_or_resizes(self):
+        for field, number, error in (("assigned", 17, 0), ("listed", 17, 0), ("assigned", 4294967295, 0),
+                                      ("assigned", 3, 234)):
+            with self.subTest(field=field, number=number, error=error):
+                api = FakeJobObservationApi()
+                setattr(api, field, number)
+                api.query_errors[3] = error
+                value = self.observe(api)
+                self.assertEqual(value["members"], {"status": "oversized"})
+                self.assertEqual(value["accounting"]["status"], "observed")
+                self.assertEqual(api.QueryInformationJobObject.call_count, 2)
+                api.OpenProcess.assert_not_called()
+
+    def test_malformed_lengths_counts_and_pids_do_not_publish_zeroes(self):
+        cases = [{"query_lengths": {3: length}} for length in (0, 7, 8, 10000)]
+        cases += [{"assigned": 1}, {"pids": [0, 22, 33]}, {"pids": [11, 11, 33]}]
+        if ctypes.sizeof(ctypes.c_size_t) > 4:
+            cases.append({"pids": [4294967296, 22, 33]})
+        for changes in cases:
+            with self.subTest(changes=changes):
+                api = FakeJobObservationApi()
+                for key, value in changes.items():
+                    setattr(api, key, value)
+                self.assertEqual(self.observe(api)["members"], {"status": "unavailable"})
+                api.OpenProcess.assert_not_called()
+        for length in (0, 47, 49):
+            with self.subTest(accounting_length=length):
+                api = FakeJobObservationApi(())
+                api.query_lengths[1] = length
+                self.assertEqual(self.observe(api)["accounting"], {"status": "unavailable"})
+
+    def test_valid_incomplete_list_retains_only_genuinely_returned_roles(self):
+        api = FakeJobObservationApi((11, 22))
+        api.assigned, api.active, api.total = 3, 3, 3
+        members = self.observe(api)["members"]
+        self.assertEqual(members, {
+            "status": "partial", "listed": 2, "bootstrap": 1,
+            "system_approved_shell": 1, "other": 0, "unclassified": 0,
+        })
+        self.assertEqual(api.OpenProcess.call_count, 2)
+
+    def test_unsupported_and_unavailable_components_are_independent(self):
+        for kind in (1, 3):
+            for code, expected in ((5, "unavailable"), (50, "unsupported"), (120, "unsupported"), ("raise", "unavailable")):
+                with self.subTest(kind=kind, code=code):
+                    api = FakeJobObservationApi()
+                    api.query_errors[kind] = code
+                    value = self.observe(api)
+                    self.assertEqual(value["accounting" if kind == 1 else "members"], {"status": expected})
+                    self.assertEqual(value["members" if kind == 1 else "accounting"]["status"], "observed")
+                    self.assertEqual(api.QueryInformationJobObject.call_count, 2)
+                    if kind == 3:
+                        api.OpenProcess.assert_not_called()
+        for missing in ("QueryInformationJobObject", "IsProcessInJob", "CompareObjectHandles",
+                        "QueryFullProcessImageNameW", "CloseHandle", "OpenProcess"):
+            with self.subTest(missing=missing):
+                api = FakeJobObservationApi()
+                delattr(api, missing)
+                value = self.observe(api)
+                self.assertEqual(value["members"], {"status": "unsupported"})
+                self.assertEqual(value["accounting"]["status"],
+                                 "unsupported" if missing == "QueryInformationJobObject" else "observed")
+                self.assertFalse(any(event[0] == "open" for event in api.events))
+
+    def test_disappeared_denied_and_reused_nonmembers_get_no_image_metadata(self):
+        for changes in (
+            {"open_error": True}, {"open_error": "raise"},
+            {"membership": [False]}, {"membership": ["denied"]}, {"membership": ["raise"]},
+        ):
+            with self.subTest(changes=changes):
+                api = FakeJobObservationApi((22,))
+                api.entries[22].update(changes)
+                members = self.observe(api)["members"]
+                self.assertEqual((members["status"], members["listed"], members["unclassified"]), ("partial", 1, 1))
+                api.CompareObjectHandles.assert_not_called()
+                api.QueryFullProcessImageNameW.assert_not_called()
+                self.assertEqual(api.CloseHandle.call_count, int("open_error" not in changes))
+
+    def test_post_metadata_membership_refusal_discards_positive_roles(self):
+        for pid in (11, 22, 33):
+            for second in (False, "denied", "raise"):
+                with self.subTest(pid=pid, second=second):
+                    api = FakeJobObservationApi((pid,))
+                    api.entries[pid]["membership"] = [True, second]
+                    members = self.observe(api)["members"]
+                    self.assertEqual(members["unclassified"], 1)
+                    self.assertEqual(members["status"], "partial")
+                    self.assertEqual(api.IsProcessInJob.call_count, 2)
+                    self.assertEqual(api.CloseHandle.call_count, 1)
+
+    def test_metadata_and_close_refusals_are_partial_without_leaking_or_retrying(self):
+        for changes in (
+            {"compare_error": True}, {"image_error": True}, {"image_error": "raise"},
+            {"image_length": 0}, {"image_length": 32768}, {"image_length": 4294967295},
+            {"image_length": len(FakeJobObservationApi.SHELL) - 4},
+            {"image": "synthetic-private\0image"}, {"close_error": True}, {"close_error": "raise"},
+        ):
+            with self.subTest(changes=changes):
+                api = FakeJobObservationApi((22,))
+                api.entries[22].update(changes)
+                members = self.observe(api)["members"]
+                self.assertEqual((members["status"], members["unclassified"]), ("partial", 1))
+                self.assertEqual(api.OpenProcess.call_count, 1)
+                self.assertEqual(api.CloseHandle.call_count, 1)
+
+    def test_reused_image_buffer_cannot_classify_unwritten_stale_payload(self):
+        api = FakeJobObservationApi((22, 33))
+        api.entries[33].update(no_image_write=True, image=api.SHELL)
+        members = self.observe(api)["members"]
+        self.assertEqual((members["system_approved_shell"], members["unclassified"]), (1, 1))
+        self.assertEqual(members["status"], "partial")
+
+    def test_missing_job_and_encoding_refusals_return_the_exact_unavailable_envelope(self):
+        api = FakeJobObservationApi()
+        job = self.job(api)
+        job.handle = None
+        self.assertEqual(self.observe(api, job=job), {
+            "schema": "pennilogic.process-budget-job-state/1",
+            "accounting": {"status": "unavailable"}, "members": {"status": "unavailable"},
+        })
+        api.QueryInformationJobObject.assert_not_called()
+        for effect in (TypeError("synthetic-private-encoding"), ValueError("synthetic-private-encoding"),
+                       "x" * 513, "\u2603", None):
+            api = FakeJobObservationApi()
+            options = {"side_effect": effect} if isinstance(effect, Exception) else {"return_value": effect}
+            with self.subTest(effect=type(effect).__name__), \
+                    patch.object(process_budget.ctypes, "get_last_error", return_value=0, create=True), \
+                    patch.object(process_budget.json, "dumps", **options):
+                note = self.job(api).observation(
+                    SimpleNamespace(_handle=api.BOOTSTRAP), [api.SHELL], {"COMSPEC": api.COMSPEC},
+                )
+            self.assertEqual(note, process_budget.JOB_STATE_UNAVAILABLE)
+            self.decode(note)
+            self.assertFalse(api.opened)
+
+
+class ProcessBudgetJobRunTest(unittest.TestCase):
+    def run_mocked(self, *, platform="nt", failure="elapsed", exit_code=0, inherit_tree=False, query_error=0):
+        events = []
+        api = FakeJobObservationApi((11, 22))
+        api.query_errors[3] = query_error
+        job = process_budget.WindowsJob.__new__(process_budget.WindowsJob)
+        job.api, job.handle = api, api.JOB
+        process = Mock(pid=11, _handle=api.BOOTSTRAP)
+        process.returncode = exit_code if failure is None else None
+        process.poll.side_effect = lambda: process.returncode
+        process.stdin = Mock() if platform == "nt" else None
+        process.stdout, process.stderr = Mock(), Mock()
+        process.kill.side_effect = lambda: setattr(process, "returncode", -9)
+        job.attach = Mock(side_effect=lambda value: events.append(("attach", value)))
+
+        def terminate():
+            events.append(("terminate", None))
+            job.handle = None
+            process.returncode = -9 if process.returncode is None else process.returncode
+
+        job.close = Mock(side_effect=terminate)
+        original = job.observation
+
+        def observe(*args):
+            events.append(("job_observation", None))
+            self.assertEqual(job.handle, api.JOB)
+            return original(*args)
+
+        job.observation = Mock(side_effect=observe)
+        reader = Mock()
+        reader.is_alive.return_value = failure is not None
+        reader.join.side_effect = lambda **_options: setattr(reader.is_alive, "return_value", False)
+        captured = Mock(threads=[reader], exceeded=failure == "output", failed=failure == "capture")
+        streams = {"stdout": {"bytes": 3, "sha256": hashlib.sha256(b"out").hexdigest()},
+                   "stderr": {"bytes": 3, "sha256": hashlib.sha256(b"err").hexdigest()}}
+        captured.snapshot.return_value = (b"out", b"err", streams)
+        fake_os = SimpleNamespace(name=platform, pathsep=";" if platform == "nt" else ":",
+                                  killpg=Mock(side_effect=lambda *_: terminate()))
+        environment = {"COMSPEC": api.COMSPEC, "PATH": "synthetic-private-approved-path"}
+        resolved = [api.SHELL, "-NoProfile", "-NonInteractive", "-Command", "synthetic-private-command"]
+        times = [0, 0.025, 10.025, 10.025] if failure == "elapsed" else [0, 0.025, 0.5]
+        raised, result = None, None
+        original_observation = process_budget.budget_observation
+
+        def v1(*args):
+            events.append(("v1_observation", None))
+            return original_observation(*args)
+
+        with (
+            patch.object(process_budget, "os", fake_os),
+            patch.object(process_budget, "signal", SimpleNamespace(SIGKILL=9)),
+            patch.object(process_budget, "environment", return_value=environment) as environment_call,
+            patch.object(process_budget, "resolve_command", return_value=resolved) as resolve_call,
+            patch.object(process_budget, "WindowsJob", return_value=job) as constructor,
+            patch.object(process_budget.subprocess, "Popen", return_value=process) as popen,
+            patch.object(process_budget, "Capture", return_value=captured),
+            patch.object(process_budget, "budget_observation", side_effect=v1) as state_call,
+            patch.object(process_budget.time, "monotonic", side_effect=times) as clock,
+            patch.object(process_budget.ctypes, "get_last_error", side_effect=lambda: api.last_error, create=True),
+        ):
+            try:
+                result = process_budget.run(["powershell.exe"], SCRIPTS, 10, capture=True,
+                                            separate=True, inherit_tree=inherit_tree)
+            except (process_budget.BudgetExceeded, OSError) as error:
+                raised = error
+        environment_call.assert_called_once()
+        self.assertEqual(list(environment_call.call_args.kwargs["runtime_dirs"]), [])
+        resolve_call.assert_called_once_with(["powershell.exe"], environment)
+        self.assertEqual(clock.call_count, len(times))
+        if platform == "nt":
+            constructor.assert_called_once_with()
+        else:
+            constructor.assert_not_called()
+        self.assertEqual(popen.call_count, 1)
+        self.assertEqual(popen.call_args.args[0], [
+            sys.executable, "-I", "-S", "-B", "-c", process_budget.WINDOWS_BOOTSTRAP, *resolved,
+        ] if platform == "nt" else resolved)
+        self.assertEqual(popen.call_args.kwargs, {
+            "cwd": SCRIPTS, "env": environment, "bufsize": 0,
+            "stdin": subprocess.PIPE if platform == "nt" else None,
+            "stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
+            "start_new_session": platform != "nt" and not inherit_tree,
+        })
+        if platform == "nt":
+            job.attach.assert_called_once_with(process)
+            process.stdin.write.assert_called_once_with(b"1")
+            self.assertEqual(process.stdin.close.call_count, 2)
+        self.assertEqual(process.stdout.close.call_count, 1)
+        self.assertEqual(process.stderr.close.call_count, 1)
+        process.wait.assert_called_once_with(timeout=10)
+        captured.stop.set.assert_called()
+        captured.snapshot.assert_called_once_with(True)
+        self.assertFalse(api.opened)
+        return SimpleNamespace(
+            exception=raised, result=result, events=events, job=job, api=api,
+            state_call=state_call, reader=reader, fake_os=fake_os, process=process, streams=streams,
+        )
+
+    def test_elapsed_failure_observes_once_before_termination_and_keeps_v1_bytes(self):
+        observed = self.run_mocked()
+        self.assertIs(type(observed.exception), process_budget.BudgetExceeded)
+        self.assertEqual((observed.exception.output, observed.exception.stderr, observed.exception.streams),
+                         (b"out", b"err", observed.streams))
+        observed.job.observation.assert_called_once()
+        observed.state_call.assert_called_once()
+        events = [name for name, _ in observed.events]
+        self.assertEqual(events, ["attach", "v1_observation", "job_observation", "terminate", "terminate"])
+        notes = observed.exception.__notes__
+        self.assertEqual(len(notes), 2)
+        self.assertTrue(notes[0].startswith("process_budget_job_state="))
+        self.assertEqual(notes[1], (
+            'process_budget_state={"capture_readers":1,"capture_readers_alive":1,"elapsed_ms":10025,'
+            '"process_running":true,"returncode":null,"schema":"pennilogic.process-budget-state/1",'
+            '"setup_ms":25,"status":"observed","wait_ms":10000}'
+        ))
+        observed.reader.join.assert_called_once_with(timeout=10)
+
+    def test_unavailable_job_query_preserves_original_timeout_and_existing_cleanup(self):
+        observed = self.run_mocked(query_error=5)
+        self.assertIs(type(observed.exception), process_budget.BudgetExceeded)
+        self.assertEqual(observed.exception.args, ("Owned process tree exceeded its enforced elapsed budget",))
+        note = observed.exception.__notes__[0]
+        self.assertEqual(json.loads(note[len(process_budget.JOB_STATE_PREFIX):])["members"], {"status": "unavailable"})
+        self.assertEqual(observed.job.close.call_count, 2)
+        self.assertEqual(observed.api.QueryInformationJobObject.call_count, 2)
+        observed.api.OpenProcess.assert_not_called()
+
+    def test_non_windows_elapsed_path_remains_v1_only_for_both_tree_modes(self):
+        for inherit in (False, True):
+            with self.subTest(inherit_tree=inherit):
+                observed = self.run_mocked(platform="posix", inherit_tree=inherit)
+                self.assertIs(type(observed.exception), process_budget.BudgetExceeded)
+                self.assertEqual(len(observed.exception.__notes__), 1)
+                self.assertTrue(observed.exception.__notes__[0].startswith("process_budget_state="))
+                observed.job.observation.assert_not_called()
+                observed.api.QueryInformationJobObject.assert_not_called()
+                observed.reader.join.assert_called_once_with(timeout=0.1 if inherit else 10)
+                if inherit:
+                    observed.fake_os.killpg.assert_not_called()
+                    observed.process.kill.assert_called_once_with()
+                else:
+                    self.assertEqual(observed.fake_os.killpg.call_count, 2)
+
+    def test_success_and_nonzero_exit_do_not_query_or_attach_either_note(self):
+        for platform in ("nt", "posix"):
+            for code in (0, 3):
+                with self.subTest(platform=platform, code=code):
+                    observed = self.run_mocked(platform=platform, failure=None, exit_code=code)
+                    self.assertIsNone(observed.exception)
+                    self.assertEqual(observed.result.returncode, code)
+                    self.assertEqual((observed.result.stdout, observed.result.stderr), (b"out", b"err"))
+                    observed.state_call.assert_not_called()
+                    observed.job.observation.assert_not_called()
+                    observed.api.QueryInformationJobObject.assert_not_called()
+
+    def test_output_and_capture_refusals_keep_their_exception_without_observing(self):
+        for failure in ("output", "capture"):
+            with self.subTest(failure=failure):
+                observed = self.run_mocked(failure=failure)
+                self.assertIs(type(observed.exception), process_budget.OutputExceeded if failure == "output" else OSError)
+                self.assertEqual(getattr(observed.exception, "__notes__", []), [])
+                observed.state_call.assert_not_called()
+                observed.job.observation.assert_not_called()
+                observed.api.QueryInformationJobObject.assert_not_called()
 
 
 if __name__ == "__main__":

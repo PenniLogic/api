@@ -4,6 +4,7 @@ import ctypes
 import hashlib
 import json
 import math
+import ntpath
 import os
 from pathlib import Path
 import signal
@@ -26,6 +27,14 @@ def launch_command(command):
 
 
 MAX_CAPTURE_BYTES = 4 * 1024 * 1024
+JOB_STATE_PREFIX = "process_budget_job_state="
+JOB_STATE_SCHEMA = "pennilogic.process-budget-job-state/1"
+JOB_STATE_UNAVAILABLE = (
+    JOB_STATE_PREFIX + '{"accounting":{"status":"unavailable"},"members":{"status":"unavailable"},'
+    '"schema":"' + JOB_STATE_SCHEMA + '"}'
+)
+MAX_JOB_MEMBERS = 16
+MAX_JOB_IMAGE_CHARS = 32768
 ENVIRONMENT_KEYS = {
     "HOME", "USERPROFILE", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL",
     "JAVA_HOME", "GRADLE_USER_HOME", "CI", "GITHUB_ACTIONS",
@@ -225,6 +234,168 @@ class WindowsJob:
         finally:
             self.api.CloseHandle(handle)
 
+    def observation(self, process, command, child_environment):
+        errors = (OSError, RuntimeError, AttributeError, TypeError, ValueError, OverflowError, ctypes.ArgumentError)
+
+        class Accounting(ctypes.Structure):
+            _fields_ = [
+                ("user_time", ctypes.c_int64), ("kernel_time", ctypes.c_int64),
+                ("period_user_time", ctypes.c_int64), ("period_kernel_time", ctypes.c_int64),
+                ("page_faults", ctypes.c_uint32), ("total", ctypes.c_uint32),
+                ("active", ctypes.c_uint32), ("terminated", ctypes.c_uint32),
+            ]
+
+        class Members(ctypes.Structure):
+            _fields_ = [
+                ("assigned", ctypes.c_uint32), ("listed", ctypes.c_uint32),
+                ("pids", ctypes.c_size_t * MAX_JOB_MEMBERS),
+            ]
+
+        def function(name, arguments, result):
+            value = getattr(self.api, name)
+            value.argtypes, value.restype = arguments, result
+            return value
+
+        def read(kind, value):
+            returned = ctypes.c_uint32()
+            if not query(self.handle, kind, ctypes.byref(value), ctypes.sizeof(value), ctypes.byref(returned)):
+                code = ctypes.get_last_error()
+                status = ("oversized" if kind == 3 and code == 234 else
+                          "unsupported" if code in (50, 120) else "unavailable")
+                return status, None
+            return "observed", returned.value
+
+        def accounting():
+            try:
+                value = Accounting()
+                status, length = read(1, value)
+                if status != "observed":
+                    return {"status": status}
+                if length != ctypes.sizeof(value) or value.active > value.total:
+                    return {"status": "unavailable"}
+                return {"status": "observed", "total_assigned": value.total, "active": value.active}
+            except errors:
+                return {"status": "unavailable"}
+
+        def image_key(value):
+            if type(value) is not str or "\0" in value:
+                return None
+            value = value.replace("/", "\\")
+            drive, tail = ntpath.splitdrive(value)
+            if (len(drive) != 2 or drive[0] not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                    or drive[1] != ":" or not tail.startswith("\\")):
+                return None
+            parts = tail[1:].split("\\")
+            if any(not part or part in (".", "..") or part.endswith((" ", ".")) or "~" in part for part in parts):
+                return None
+            return ntpath.normcase(value)
+
+        def members():
+            try:
+                value = Members()
+                status, length = read(3, value)
+                if status != "observed":
+                    return {"status": status}
+                if not Members.pids.offset <= length <= ctypes.sizeof(value):
+                    return {"status": "unavailable"}
+                if max(value.assigned, value.listed) > MAX_JOB_MEMBERS:
+                    return {"status": "oversized"}
+                if (value.assigned < value.listed
+                        or length < Members.pids.offset + value.listed * ctypes.sizeof(ctypes.c_size_t)):
+                    return {"status": "unavailable"}
+                pids = list(value.pids[:value.listed])
+                if len(set(pids)) != len(pids) or any(not 0 < pid <= 4294967295 for pid in pids):
+                    return {"status": "unavailable"}
+                counts = {"bootstrap": 0, "system_approved_shell": 0, "other": 0, "unclassified": 0}
+                if pids:
+                    try:
+                        open_process = function("OpenProcess", [ctypes.c_uint32, ctypes.c_int32, ctypes.c_uint32],
+                                                wintypes.HANDLE)
+                        in_job = function("IsProcessInJob", [wintypes.HANDLE, wintypes.HANDLE,
+                                                            ctypes.POINTER(ctypes.c_int32)], ctypes.c_int32)
+                        same_object = function("CompareObjectHandles", [wintypes.HANDLE, wintypes.HANDLE],
+                                               ctypes.c_int32)
+                        image_name = function("QueryFullProcessImageNameW", [
+                            wintypes.HANDLE, ctypes.c_uint32, wintypes.LPWSTR, ctypes.POINTER(ctypes.c_uint32),
+                        ], ctypes.c_int32)
+                        close = function("CloseHandle", [wintypes.HANDLE], ctypes.c_int32)
+                    except AttributeError:
+                        return {"status": "unsupported"}
+                    bootstrap = process._handle
+                    requested = image_key(command[0] if command else None)
+                    comspec = image_key(child_environment.get("COMSPEC"))
+                    approved = None
+                    if comspec is not None:
+                        powershell = image_key(ntpath.join(
+                            ntpath.dirname(comspec), "WindowsPowerShell", "v1.0", "powershell.exe",
+                        ))
+                        if requested in (comspec, powershell):
+                            approved = requested
+                    buffer = ctypes.create_unicode_buffer(MAX_JOB_IMAGE_CHARS)
+
+                    def owned(handle):
+                        belongs = ctypes.c_int32()
+                        return bool(in_job(handle, self.handle, ctypes.byref(belongs)) and belongs.value == 1)
+
+                    for pid in pids:
+                        handle, role = None, "unclassified"
+                        try:
+                            handle = open_process(0x1000, False, pid)
+                            if handle and owned(handle):
+                                candidate = "unclassified"
+                                if bootstrap and same_object(handle, bootstrap):
+                                    candidate = "bootstrap"
+                                elif bootstrap and requested is not None and comspec is not None:
+                                    size = ctypes.c_uint32(len(buffer))
+                                    buffer.value = ""
+                                    if (image_name(handle, 0, buffer, ctypes.byref(size))
+                                            and 0 < size.value < len(buffer) and buffer[size.value] == "\0"):
+                                        image = image_key(buffer[:size.value])
+                                        if image is not None:
+                                            candidate = "system_approved_shell" if image == approved else "other"
+                                if owned(handle):
+                                    role = candidate
+                        except errors:
+                            role = "unclassified"
+                        finally:
+                            if handle:
+                                try:
+                                    if not close(handle):
+                                        role = "unclassified"
+                                except errors:
+                                    role = "unclassified"
+                        counts[role] += 1
+                if counts["bootstrap"] > 1:
+                    return {"status": "unavailable"}
+                return {
+                    "status": "partial" if counts["unclassified"] or value.assigned != value.listed else "observed",
+                    "listed": value.listed, **counts,
+                }
+            except errors:
+                return {"status": "unavailable"}
+
+        try:
+            if not self.handle:
+                return JOB_STATE_UNAVAILABLE
+            state = {"schema": JOB_STATE_SCHEMA}
+            try:
+                query = function("QueryInformationJobObject", [
+                    wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
+                ], ctypes.c_int32)
+            except AttributeError:
+                state.update(accounting={"status": "unsupported"}, members={"status": "unsupported"})
+            else:
+                state.update(accounting=accounting(), members=members())
+                if (state["accounting"]["status"] == "observed" and state["members"]["status"] == "observed"
+                        and state["accounting"]["active"] != state["members"]["listed"]):
+                    state["members"]["status"] = "partial"
+            note = JOB_STATE_PREFIX + json.dumps(state, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            if len(note.encode("ascii")) > 512:
+                return JOB_STATE_UNAVAILABLE
+            return note
+        except errors:
+            return JOB_STATE_UNAVAILABLE
+
     def close(self):
         if self.handle:
             if not self.api.CloseHandle(self.handle):
@@ -301,6 +472,7 @@ def run(command, root, seconds, capture=False, *, env=None, separate=False, inhe
         if failure is not None:
             if failure == "elapsed":
                 observation = budget_observation(process, captured, started, waiting)
+                job_observation = job.observation(process, command, child_environment) if job is not None else None
             terminate()
             if captured:
                 if failure != "elapsed":
@@ -314,6 +486,8 @@ def run(command, root, seconds, capture=False, *, env=None, separate=False, inhe
             raise OSError("Owned process output capture failed")
         if failure == "elapsed":
             error = BudgetExceeded(stdout, stderr, streams)
+            if job_observation is not None:
+                error.add_note(job_observation)
             error.add_note(observation)
             raise error
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr if separate else None)
