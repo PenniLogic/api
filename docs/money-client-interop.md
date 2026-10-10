@@ -99,6 +99,7 @@ approved Node executable without relying on ambient Gradle properties:
 
 ```text
 python scripts/quality.py build --money-client-interop-node "<approved absolute Node executable>"
+python scripts/quality.py build --base "<full trusted base SHA>" --money-client-interop-node "<approved absolute Node executable>"
 python scripts/quality.py coverage --base "<full trusted base SHA>" --money-client-interop-node "<approved absolute Node executable>"
 python scripts/quality.py gate-self-test --artifact-dir "<owned parent>" --money-client-interop-node "<approved absolute Node executable>"
 ```
@@ -138,9 +139,16 @@ Each owned baseline/candidate copy must run its own quality script with its own
 working directory and self-test artifact parent. Only the explicit SDK path is
 shared, not launch files, generated output or runtime evidence. `coverage --base`
 reads the named Git baseline; it does not build another checkout, and forwarding
-this option does not add interoperability to the coverage task graph. Canonical
-Infra setup must provision the supported SDK and explicitly supply its path only
-after this manual bridge is accepted; this change does not activate generated CI.
+this option does not add interoperability to the coverage task graph.
+The canonical CI adoption from accepted Infra `6b1e4baf403f25e6c4c695a5676e995f1ecb259e`
+keeps the isolated SDK preparation and passes its path to a single `build --base`
+invocation. That command runs the existing build/install graph and test metrics,
+then both general and Money reviewed-base comparisons before terminal mutation
+verification, without starting another Gradle/PIT graph. Omitting `--base`
+preserves the manual build behavior. After the normal CLI and optional Node
+guards, explicitly empty, malformed, missing or non-commit bases fail before
+provider/budget reads, Gradle or test metrics, rather than disabling comparisons.
+Standalone `coverage` and explicit baseline regeneration remain available.
 
 The budgeted quality caller also admits the standard Windows Docker Desktop CLI
 directory on the approved system drive (`Program Files\Docker\Docker\resources\bin`).
@@ -192,6 +200,45 @@ pipeline therefore uses **48 REST requests plus one archive request**, not 80
 REST requests. This does not reserve quota against unrelated users or excuse
 actual exhaustion: there is no retry, backoff, proxy, token fallback or endpoint
 lottery.
+
+`prepare --native-fetch` is a separate, explicit preparation-only selector for
+the reviewed canonical `ReadOnlyClient(data, native_fetch=True)` interface.
+The caller does not read credentials or infer the mode from its environment.
+The canonical client validates the native context and consumes
+`PENNILOGIC_NATIVE_SOURCE_TOKEN` before any existing-input short-circuit; that
+same client is reused for cold acquisition. The selector requires the matching
+accepted canonical client and workflow policy; the API caller alone neither
+implements nor authorizes native authentication. It is refused for `run`,
+`verify`, `_run`, or in combination with `--offline-source` or
+`--require-prepared`. Default preparation remains anonymous, with no token
+fallback. Archive requests retain their separate credential-free headers.
+Official generation from accepted Infra
+`687d4d9acbd8a0f801c9ac4267230c8c67735eb0` supplies the matching client and
+workflow steps. Offline tests use that client with synthetic credentials and
+responses; they do not establish hosted authentication or quota availability.
+
+The canonical native workflow must keep its two token-scoped acquisition steps
+on either side of the existing credential-free Money provider preparation and
+verification. Interop still verifies those provider inputs before its three
+metadata GETs; provider execution must not be moved into a token-scoped step.
+After acquisition, `prepare --require-prepared` verifies the complete 39-input
+inventory and acquisition receipt with zero requests and without executing
+Node, JVM or the full interop gate. Missing, partial or changed inputs/receipt
+refuse rather than reacquire.
+
+The same non-secret `--require-prepared` flag on `quality.py build` or
+`quality.py test` forwards `-PmoneyClientInteropRequirePrepared=true` to Gradle.
+The interop task forwards it through `run` into the isolated `_run` worker,
+which repeats strict preparation before using the inputs. Disappearance after
+the preceding verification therefore cannot enable anonymous reacquisition.
+That same explicit Gradle condition removes `--fetch` from the existing
+database preparation task, using its offline prepared-input verification at
+the later build use point as well. Money provider source/strategy validation
+already refuses missing inputs without any remote acquisition fallback.
+No environment variable or marker selects this condition. Omitted flags keep
+the existing manual/Conformance behavior; other quality commands and full
+interop `verify` do not accept this selector. This input condition does not
+replace SDK, execution, coverage, mutation or native acceptance checks.
 
 The API-owned binary reader reuses the native no-proxy/no-redirect opener,
 framing checks and budget primitives; the native reader itself decodes JSON and
@@ -283,6 +330,33 @@ Python/JVM/Node startup options, package-manager configuration and unrelated
 credentials are not forwarded. The Windows process-budget bootstrap itself
 uses `-I -S -B` and cannot spawn its child before its owned Job is attached.
 
+An elapsed-budget failure samples bounded process state immediately before the
+existing owned termination, then attaches one ASCII `process_budget_state=` JSON
+note to the original `BudgetExceeded`. Successful commands, nonzero exits and
+other refusal branches do not collect or emit it. The note is diagnostic only;
+it changes no deadline, command, environment, capture, cleanup or acceptance rule.
+The Windows process is the bootstrap; on POSIX it is the direct owned command.
+
+Version `pennilogic.process-budget-state/1` has exactly `schema`, `status`,
+`process_running`, `returncode`, `capture_readers`, `capture_readers_alive`,
+`setup_ms`, `wait_ms` and `elapsed_ms` when `status` is `observed`.
+`process_running` is boolean; `returncode` is null iff running, otherwise an
+integer from -2147483648 through 4294967295. Reader counts are integers from 0
+through 2, with alive no greater than total. Monotonic elapsed values are
+integers from 0 through 86400000 milliseconds, with setup plus wait equal to
+elapsed. Setup includes launch, Job attachment, capture setup and bootstrap
+release; wait starts afterwards. This observation bound does not extend any
+execution budget. Booleans are not accepted as integer values.
+
+Unavailable, malformed or out-of-range samples instead emit only
+`{"schema":"pennilogic.process-budget-state/1","status":"unavailable"}` after the
+same prefix. Notes use compact sorted JSON and are at most 384 ASCII bytes.
+They contain no PID, command, path, environment, raw output, exception text or
+stack content. Sampling failure preserves the original timeout and cleanup.
+The canonical Infra qualifier owns transport within the matching unittest
+`ERROR` block; a note is neither an exception-allowlist extension nor evidence
+of a complete inventory or a passing test.
+
 The separate `quality.py gate-self-test` command copies
 `scripts/money_client_interop.py`, `scripts/tests/fixtures/money_client_interop`,
 and `build/source-materialization` into its isolated working directory. Its final
@@ -309,6 +383,16 @@ unexecuted and skipped evidence fails closed. Old success cannot rescue a
 failed new attempt.
 The current report schema is `pennilogic.api-money-client-interop/2`; older
 reports cannot stand in for the strengthened execution boundary.
+
+Within one final `verify` call, the complete output inventory retains bounded
+command records/streams, transports, scratch specification and generated manifests.
+Their hashes and semantic checks use those same freshly read bytes; reuse still
+checks path links, file kind and size. Other files remain fully inventoried.
+Each `api_inputs` call likewise retains its own fixture binding map rather than
+hashing those fixtures twice. Neither reuse crosses a call boundary: standalone
+verification and pre/post-execution, report-publication and final-verification
+checks remain fresh. Read-count regressions are source-only evidence, not measured
+latency savings or acceptance of any outstanding runtime, timing or skipped gate.
 
 Live and retained/offline transports compare nested values through the existing
 canonical JSON helper, not Python container equality: Boolean, integer and

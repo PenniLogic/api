@@ -64,12 +64,14 @@ def check_windows_batch_operands(operands):
         raise ValueError("Windows Gradle batch operands contain unsupported shell characters")
 
 
-def gradle(*tasks, root=ROOT, capture=False, budget=None, money_client_interop_node=None):
+def gradle(*tasks, root=ROOT, capture=False, budget=None, money_client_interop_node=None, require_prepared=False):
     wrapper = root / ("gradlew.bat" if os.name == "nt" else "gradlew")
     command = [str(wrapper)] if os.name == "nt" else ["sh", str(wrapper)]
     properties = [] if money_client_interop_node is None else [
         "-PmoneyClientInteropNode=" + str(money_client_interop_node),
     ]
+    if require_prepared:
+        properties.append("-PmoneyClientInteropRequirePrepared=true")
     arguments = [
         *command, "--no-daemon", "--console=plain", "-Pkotlin.compiler.execution.strategy=in-process", *properties, *tasks,
     ]
@@ -134,11 +136,15 @@ def changed_line_numbers(diff):
     return numbers
 
 
-def check_coverage(base, write_baseline=False):
+def check_coverage_base(base):
     # No origin/main or environment fallback: the caller must name its reviewed base.
     if not base or not re.fullmatch(r"[0-9a-fA-F]{40}", base):
         raise ValueError("coverage requires --base with the full trusted base commit SHA")
     run(["git", "cat-file", "-e", f"{base}^{{commit}}"])
+
+
+def check_coverage(base, write_baseline=False):
+    check_coverage_base(base)
     counters, executable = read_report(ROOT / REPORT)
     sources = {path.relative_to(ROOT).as_posix() for path in (ROOT / "src/main/kotlin").rglob("*.kt")}
     if sources != set(executable):
@@ -566,15 +572,20 @@ def main():
             "money-mutation", "money-mutation-report",
         ],
     )
-    parser.add_argument("--base", help="Full trusted PR base commit SHA; required for coverage")
+    parser.add_argument("--base", help="Full trusted base commit SHA; required for coverage, optional for build")
     parser.add_argument("--write-baseline", action="store_true")
     parser.add_argument("--artifact-dir", type=Path, help="Parent directory for isolated gate self-test copies")
     parser.add_argument("--money-client-interop-node", type=Path, help="Approved absolute Node executable for Gradle commands")
+    parser.add_argument("--require-prepared", action="store_true", help="Require prepared source inputs for build/test")
     args = parser.parse_args()
     started = time.monotonic()
     budget = None
     try:
         gradle_options = {}
+        if args.require_prepared:
+            if args.command not in ("build", "test"):
+                parser.error("--require-prepared requires build or test")
+            gradle_options["require_prepared"] = True
         if args.money_client_interop_node is not None:
             if args.command in ("money-guard", "money-coverage-report", "money-mutation-report"):
                 parser.error("--money-client-interop-node requires a Gradle-producing command")
@@ -586,9 +597,14 @@ def main():
         elif args.command == "install":
             gradle("resolveDependencies", **gradle_options)
         elif args.command == "build":
+            if args.base is not None:
+                check_coverage_base(args.base)
             budget = money_budget(money_provider_module())["enforced_seconds"]
             gradle("build", "installDist", budget=budget - (time.monotonic() - started), **gradle_options)
             test_metrics()
+            if args.base is not None:
+                check_coverage(args.base, args.write_baseline)
+                check_money_coverage(args.base, args.write_baseline)
         elif args.command == "test":
             run([sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests", "-v"])
             gradle("test", **gradle_options)

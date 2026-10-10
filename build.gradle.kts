@@ -29,12 +29,21 @@ application {
     mainClass.set("com.pennilogic.bootstrap.ApplicationKt")
 }
 
+val requirePreparedSources =
+    providers
+        .gradleProperty("moneyClientInteropRequirePrepared")
+        .map(String::toBooleanStrict)
+        .orElse(false)
+
 val prepareDatabaseAdmission =
     tasks.register<Exec>("prepareDatabaseAdmission") {
         description = "Explicitly fetches or verifies the exact accepted database-admission source bundle."
         group = "verification"
         workingDir(rootDir)
-        commandLine("python", "-I", "-S", "-B", "scripts/prepare_database_admission.py", "prepare", "--fetch")
+        commandLine("python", "-I", "-S", "-B", "scripts/prepare_database_admission.py", "prepare")
+        if (!requirePreparedSources.get()) {
+            args("--fetch")
+        }
         mustRunAfter(tasks.clean)
     }
 
@@ -299,6 +308,7 @@ val generatedClientInterop =
         val backendClasspath = sourceSets.test.get().runtimeClasspath
         val configuredPython = providers.gradleProperty("moneyClientInteropPython")
         val configuredNode = providers.gradleProperty("moneyClientInteropNode")
+        val requirePrepared = requirePreparedSources.get()
         doFirst {
             val windows = System.getProperty("os.name").startsWith("Windows")
             val pythonLocation = System.getenv("pythonLocation")
@@ -358,6 +368,9 @@ val generatedClientInterop =
                 backendClasspath.filter { it.exists() }.asPath,
             )
             configuredNode.orNull?.let { args("--node", it) }
+            if (requirePrepared) {
+                args("--require-prepared")
+            }
         }
     }
 

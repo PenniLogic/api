@@ -186,10 +186,10 @@
   },
   "gate": "T-PLT-01-DATABASE-EXTENSION-GATE",
   "launcher": {
-    "bytes": 18089,
+    "bytes": 18587,
     "mode": "100644",
     "path": "scripts/prepare_database_admission.py",
-    "sha256": "9863087791d8715c9802bab8b1f7d72c42b9208f7a312c5894eb695d76b167da"
+    "sha256": "fdcab20a76569fc4b03991003e06918f9d03d4f845e2562b844ee76dcc50ab49"
   },
   "runtime": "R4_LINUX_DOCKER_NFTABLES",
   "schema": "pennilogic.database-admission.installation/1"

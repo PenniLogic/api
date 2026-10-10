@@ -22,7 +22,7 @@
   },
   "jobs": {
     "ci": {
-      "name": "CI",
+      "name": "Linux qualification",
       "runs-on": "ubuntu-24.04",
       "timeout-minutes": 30,
       "steps": [
@@ -61,15 +61,116 @@
           "run": "set -o pipefail\nif ! /usr/bin/env -0 2>/dev/null | while IFS= read -r -d '' setting; do\n  name=\"${setting%%=*}\"\n  case \"${name^^}\" in\n    NODE_OPTIONS|NODE_PATH|NPM_CONFIG_NODE_OPTIONS|NPM_CONFIG_NODE-OPTIONS) exit 1 ;;\n  esac\ndone; then\n  echo \"::error::API Node SDK startup environment check failed.\" >&2\n  exit 1\nfi\ncase \"${RUNNER_TOOL_CACHE-}\" in\n  /*) ;;\n  *) echo \"::error::API runner tool cache must be absolute.\" >&2; exit 1 ;;\nesac\ncase \"$RUNNER_TOOL_CACHE\" in\n  *$'\\n'*|*$'\\r'*) echo \"::error::API runner tool cache must be one line.\" >&2; exit 1 ;;\nesac\nsdk=\"$RUNNER_TOOL_CACHE/node/24.14.0/x64\"\nnode=\"$sdk/bin/node\"\nnpm=\"$sdk/lib/node_modules/npm/bin/npm-cli.js\"\nif [ ! -f \"$node\" ] || [ ! -x \"$node\" ] || [ ! -f \"$npm\" ]; then\n  echo \"::error::API Node SDK or bundled npm is missing.\" >&2\n  exit 1\nfi\nif ! version=\"$(\"$node\" --version)\" || [ \"$version\" != \"v24.14.0\" ]; then\n  echo \"::error::API Node SDK version check failed.\" >&2\n  exit 1\nfi\nif ! version=\"$(\"$node\" \"$npm\" --version)\" || [ \"$version\" != \"11.9.0\" ]; then\n  echo \"::error::API bundled npm version check failed.\" >&2\n  exit 1\nfi\nprintf 'MONEY_CLIENT_INTEROP_NODE=%s\\n' \"$node\" >> \"${GITHUB_ENV:?GitHub step environment is missing}\"\n"
         },
         {
-          "name": "Run checks",
-          "run": "python scripts/check_repository.py\npython scripts/materialize_money_sources.py\npython scripts/money_provider.py --source-root \"build/source-materialization/contracts-aa8d90cb98cec9b6dd08c91b3a4d869e47362662\" --strategy-file \"build/source-materialization/docs-a700e639585c61a4610e7b99dbd02b2dab28bdcc/governance/test-strategy.json\"\npython scripts/money_provider.py --verify\npython scripts/materialize_money_sources.py --verify\npython -I -S -B scripts/prepare_database_admission.py prepare --fetch\npython -I -S -B scripts/prepare_database_admission.py verify\npython scripts/quality.py build --money-client-interop-node \"${MONEY_CLIENT_INTEROP_NODE:?API Node SDK was not prepared}\"\npython -m unittest discover -s scripts/tests"
+          "name": "Check repository",
+          "run": "python scripts/check_repository.py"
         },
         {
-          "name": "Coverage against explicit base",
+          "name": "Prepare pinned Money sources",
+          "env": {
+            "PENNILOGIC_NATIVE_SOURCE_TOKEN": "${{ github.token }}"
+          },
+          "run": "python -I -S -B scripts/materialize_money_sources.py --native-fetch"
+        },
+        {
+          "name": "Prepare verified Money provider",
+          "run": "python scripts/materialize_money_sources.py --verify-inputs\npython scripts/money_provider.py --source-root \"build/source-materialization/contracts-aa8d90cb98cec9b6dd08c91b3a4d869e47362662\" --strategy-file \"build/source-materialization/docs-a700e639585c61a4610e7b99dbd02b2dab28bdcc/governance/test-strategy.json\"\npython scripts/money_provider.py --verify\npython scripts/materialize_money_sources.py --verify"
+        },
+        {
+          "name": "Prepare pinned database and interop sources",
+          "env": {
+            "PENNILOGIC_NATIVE_SOURCE_TOKEN": "${{ github.token }}"
+          },
+          "run": "python -I -S -B scripts/prepare_database_admission.py prepare --fetch --native-fetch\npython -I -S -B scripts/money_client_interop.py prepare --native-fetch"
+        },
+        {
+          "name": "Run checks",
+          "run": "python -I -S -B scripts/prepare_database_admission.py prepare\npython -I -S -B scripts/prepare_database_admission.py verify\npython scripts/quality.py build --base \"$BASE_SHA\" --require-prepared --money-client-interop-node \"${MONEY_CLIENT_INTEROP_NODE:?API Node SDK was not prepared}\"\npython -m unittest discover -s scripts/tests",
           "env": {
             "BASE_SHA": "${{ github.event.pull_request.base.sha || github.sha }}"
+          }
+        }
+      ]
+    },
+    "windows": {
+      "name": "Windows qualification",
+      "runs-on": "windows-2025",
+      "timeout-minutes": 30,
+      "steps": [
+        {
+          "name": "Checkout",
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "persist-credentials": false,
+            "fetch-depth": 0
+          }
+        },
+        {
+          "name": "Python",
+          "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+          "with": {
+            "python-version": "3.14"
+          }
+        },
+        {
+          "name": "Node",
+          "uses": "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+          "with": {
+            "node-version-file": ".nvmrc"
+          }
+        },
+        {
+          "name": "JDK",
+          "uses": "actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6",
+          "with": {
+            "distribution": "temurin",
+            "java-version": "21"
+          }
+        },
+        {
+          "name": "Check repository",
+          "run": "python scripts\\check_repository.py\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+        },
+        {
+          "name": "Prepare pinned Money sources",
+          "env": {
+            "PENNILOGIC_NATIVE_SOURCE_TOKEN": "${{ github.token }}"
           },
-          "run": "python scripts/quality.py coverage --base \"$BASE_SHA\" --money-client-interop-node \"${MONEY_CLIENT_INTEROP_NODE:?API Node SDK was not prepared}\""
+          "run": "python -I -S -B scripts\\materialize_money_sources.py --native-fetch\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+        },
+        {
+          "name": "Prepare verified Money provider",
+          "run": "python scripts\\materialize_money_sources.py --verify-inputs\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\npython scripts\\money_provider.py --source-root \"build\\source-materialization\\contracts-aa8d90cb98cec9b6dd08c91b3a4d869e47362662\" --strategy-file \"build\\source-materialization\\docs-a700e639585c61a4610e7b99dbd02b2dab28bdcc\\governance\\test-strategy.json\"\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\npython scripts\\money_provider.py --verify\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\npython scripts\\materialize_money_sources.py --verify\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+        },
+        {
+          "name": "Prepare pinned database and interop sources",
+          "env": {
+            "PENNILOGIC_NATIVE_SOURCE_TOKEN": "${{ github.token }}"
+          },
+          "run": "python -I -S -B scripts\\prepare_database_admission.py prepare --fetch --native-fetch\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\npython -I -S -B scripts\\money_client_interop.py prepare --native-fetch\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+        },
+        {
+          "name": "Run Windows owning suites",
+          "run": "python -I -S -B scripts\\prepare_database_admission.py prepare\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\npython -I -S -B scripts\\prepare_database_admission.py verify\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\npython -I -S -B scripts\\money_client_interop.py prepare --require-prepared\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\npython scripts\\qualify_windows.py --require-prepared\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+        }
+      ]
+    },
+    "ci-result": {
+      "name": "CI",
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 1,
+      "needs": [
+        "ci",
+        "windows"
+      ],
+      "if": "always()",
+      "steps": [
+        {
+          "name": "Require both qualification results",
+          "env": {
+            "LINUX_RESULT": "${{ needs.ci.result }}",
+            "WINDOWS_RESULT": "${{ needs.windows.result }}"
+          },
+          "run": "if [ \"${LINUX_RESULT-}\" != success ] || [ \"${WINDOWS_RESULT-}\" != success ]; then\n  echo \"::error::API CI requires successful Linux and Windows qualification.\" >&2\n  exit 1\nfi"
         }
       ]
     }

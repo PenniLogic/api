@@ -73,12 +73,17 @@ def owned(root, relative):
     return sources.owned_path(root, relative)
 
 
-def read_file(path, limit=MAX_DOCUMENT):
+def file_metadata(path, limit):
     for component in (path, *path.parents):
         require(not component.is_symlink() and not component.is_junction(), "linked-input")
     metadata = path.stat(follow_symlinks=False)
     require(stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1, "input-kind")
     require(metadata.st_size <= limit, "document-size")
+    return metadata
+
+
+def read_file(path, limit=MAX_DOCUMENT):
+    metadata = file_metadata(path, limit)
     with path.open("rb") as stream:
         content = stream.read(metadata.st_size + 1)
     require(len(content) == metadata.st_size, "input-changed")
@@ -89,8 +94,8 @@ sources = module_at("interop_source_primitives", ROOT / "scripts/materialize_mon
 process_budget = module_at("interop_process_budget", ROOT / "scripts/process_budget.py")
 
 
-def read_json(path):
-    return sources.json_document(read_file(path))
+def read_json(path, *, reader=None):
+    return sources.json_document((read_file if reader is None else reader)(path))
 
 
 def write_file(root, relative, content, replace=False):
@@ -112,12 +117,12 @@ def write_json(root, relative, value, replace=False):
     return write_file(root, relative, json_bytes(value), replace)
 
 
-def binding(path):
-    content = read_file(path, 256 * 1024 * 1024)
+def binding(path, *, reader=None):
+    content = (read_file if reader is None else reader)(path, 256 * 1024 * 1024)
     return {"bytes": len(content), "sha256": digest(content)}
 
 
-def inventory(root, *, ignored=(), limit=4096):
+def inventory(root, *, ignored=(), limit=4096, reader=None):
     require(root.is_dir(), "inventory-missing")
     files, pending, count = {}, [root], 0
     while pending:
@@ -132,7 +137,7 @@ def inventory(root, *, ignored=(), limit=4096):
                     if relative not in ignored:
                         pending.append(path)
                 else:
-                    files[relative] = binding(path)
+                    files[relative] = binding(path) if reader is None else binding(path, reader=reader)
     return dict(sorted(files.items()))
 
 
@@ -332,7 +337,7 @@ def archive_contents(content, snapshot, bindings):
                       "archive_canonicalized_paths": canonicalized}
 
 
-def acquire(data, root=ROOT):
+def acquire(data, root=ROOT, *, client=None):
     """Reuse verified provider inputs, then prove one bounded public archive against the native Git tree."""
     sources.verify_inputs(root)
     sources.verify_provider(root)
@@ -347,7 +352,8 @@ def acquire(data, root=ROOT):
         else:
             missing.append(entry)
     require(len(contents) == 10 and len(missing) == 29, "shared-input-inventory")
-    client = sources.ReadOnlyClient(data)
+    if client is None:
+        client = sources.ReadOnlyClient(data)
     snapshot = sources.GitSnapshot(client, data["sources"][0], 335295566)
     require(snapshot.root == SOURCE_TREE, "source-tree-binding")
     downloaded, archive = archive_contents(fetch_archive(client), snapshot, {entry["path"]: entry for entry in missing})
@@ -361,16 +367,20 @@ def acquire(data, root=ROOT):
     }
 
 
-def prepare(root=ROOT, offline_source=None):
+def prepare(root=ROOT, offline_source=None, *, native_fetch=False, require_prepared=False):
+    require(type(native_fetch) is bool and type(require_prepared) is bool
+            and not (native_fetch and require_prepared)
+            and not (offline_source is not None and (native_fetch or require_prepared)), "argument-mode")
     data = catalog(root)
+    client = sources.ReadOnlyClient(data, native_fetch=True) if native_fetch else None
     target = owned(root, AREA / "inputs")
-    if target.exists():
+    if target.exists() or require_prepared:
         verify_sources(root)
         verify_acquisition(root)
         return {"event": "money_client_inputs", "status": "verified_existing", "inputs": 39, "requests": 0}
     require(not owned(root, AREA / "acquisition.json").exists(), "acquisition-output-partial")
     if offline_source is None:
-        contents, provenance = acquire(data, root)
+        contents, provenance = acquire(data, root, client=client)
     else:
         offline_source = offline_source.absolute()
         sources.verify_directory(offline_source.parent, Path(offline_source.name), source_bindings(data))
@@ -474,16 +484,16 @@ def scratch_spec(root, directory):
     return write_file(root, directory / "spec/openapi.yaml", original.replace(anchor, fragment + anchor))
 
 
-def generated(root, directory, specification, language, pl, *, scratch=True):
+def generated(root, directory, specification, language, pl, *, scratch=True, reader=None):
     base = owned(root, directory / "generated" / language)
-    manifest = read_json(base / "contracts-manifest.json")
+    manifest = read_json(base / "contracts-manifest.json", reader=reader)
     require(set(manifest) == {
         "schema_version", "target", "spec_version", "spec_sha256", "currency_registry_sha256",
         "generator", "runtime_sha256", "file_count", "tree_sha256", "files",
     }, "generated-manifest-shape")
     require(type(manifest["schema_version"]) is int and manifest["schema_version"] == 1
             and manifest["target"] == language and manifest["spec_version"] == "0.1.0", "generated-version")
-    require(manifest["spec_sha256"] == digest(read_file(specification)), "generated-spec")
+    require(manifest["spec_sha256"] == digest((read_file if reader is None else reader)(specification)), "generated-spec")
     inputs = owned(root, AREA / "inputs")
     pins = read_json(inputs / "toolchain/versions.json")
     config = read_json(inputs / "generator" / (language + ".json"))
@@ -499,7 +509,7 @@ def generated(root, directory, specification, language, pl, *, scratch=True):
     require(manifest["generator"] == expected_generator, "generated-toolchain")
     require(manifest["currency_registry_sha256"] == digest(read_file(inputs / "spec/currency-registry.v1.json"))
             and manifest["runtime_sha256"] == pl.tree_hash(inputs / "runtime" / language)[0], "generated-seams")
-    actual = inventory(base)
+    actual = inventory(base) if reader is None else inventory(base, reader=reader)
     del actual["contracts-manifest.json"]
     entries = [{"path": name, "sha256": entry["sha256"]} for name, entry in actual.items()]
     require(manifest["files"] == entries and type(manifest["file_count"]) is int
@@ -514,7 +524,7 @@ def generated(root, directory, specification, language, pl, *, scratch=True):
                 and {name: entry["sha256"] for name, entry in actual.items()} == golden["files"], "default-generation-tampered")
     return {"target": language, "model": MODELS[language] if scratch else None,
             "model_sha256": actual[MODELS[language]]["sha256"] if scratch else None,
-            "manifest_sha256": binding(base / "contracts-manifest.json")["sha256"], "tree_sha256": manifest["tree_sha256"]}
+            "manifest_sha256": binding(base / "contracts-manifest.json", reader=reader)["sha256"], "tree_sha256": manifest["tree_sha256"]}
 
 
 def verify_default_outputs(root, source, pl):
@@ -582,10 +592,11 @@ def api_inputs(root=ROOT):
         "scripts/money_client_interop.py", "scripts/materialize_money_sources.py", "scripts/process_budget.py",
         (AREA / "backend-launch.json").as_posix(), (AREA / "acquisition.json").as_posix(),
     }
-    names.update((FIXTURES / name).as_posix() for name in inventory(owned(root, FIXTURES)))
+    fixtures = {(FIXTURES / name).as_posix(): entry for name, entry in inventory(owned(root, FIXTURES)).items()}
+    names.update(fixtures)
     names.update((AREA / "inputs" / name).as_posix() for name in source_bindings(catalog(root)))
     names.update((sources.PROVIDER / name).as_posix() for name in sources.provider_bindings(sources.CATALOG))
-    return {name: binding(owned(root, Path(name))) for name in sorted(names)}
+    return {name: fixtures[name] if name in fixtures else binding(owned(root, Path(name))) for name in sorted(names)}
 
 
 def receipt(target, operation, count, run_id):
@@ -866,7 +877,7 @@ def validate_commands(records):
         require(record["stdout"]["bytes"] + record["stderr"]["bytes"] <= MAX_DOCUMENT, "commands-stream")
 
 
-def verify_commands(root, directory, records, run_id):
+def verify_commands(root, directory, records, run_id, *, reader=None):
     validate_commands(records)
     protocols = {
         "python-ready": ({"missing": 0, "wrong": 0}, None),
@@ -881,13 +892,13 @@ def verify_commands(root, directory, records, run_id):
         protocols[language + "-refuse-disagreement"] = (None, DISAGREEMENT)
     for index, record in enumerate(records):
         prefix = directory / "commands" / f"{index:02d}-{record['label']}"
-        require(json_bytes(read_json(owned(root, Path(str(prefix) + ".json")))) == json_bytes(record),
+        require(json_bytes(read_json(owned(root, Path(str(prefix) + ".json")), reader=reader)) == json_bytes(record),
                 "command-record-binding")
         for offset, name in enumerate(("stdout", "stderr")):
             path = Path(str(prefix) + "." + name + ".txt")
             stream = record[name]
             require(stream["path"] == path.as_posix(), "command-stream-path")
-            content = read_file(owned(root, path))
+            content = (read_file if reader is None else reader)(owned(root, path))
             require(len(content) == stream["bytes"] and digest(content) == stream["sha256"], "command-stream-binding")
             if record["label"] in protocols:
                 expected = protocols[record["label"]][offset]
@@ -899,19 +910,19 @@ def verify_commands(root, directory, records, run_id):
                 require(content.splitlines().count(b"> Task :compileKotlin") == 1, "command-receipt")
 
 
-def verify_transports(root, directory, run_id):
+def verify_transports(root, directory, run_id, *, reader=None):
     expected = transport(run_id, corpus(root)["values"])
     invalid = transport(run_id, read_json(owned(root, AREA / "inputs/spec/fixtures/money-wire-fixtures.v1.json"))["invalid"], INVALID_SHA256)
-    validate_transport(read_json(owned(root, directory / "backend.json")), expected)
-    validate_transport(read_json(owned(root, directory / "invalid.json")), invalid)
+    validate_transport(read_json(owned(root, directory / "backend.json"), reader=reader), expected)
+    validate_transport(read_json(owned(root, directory / "invalid.json"), reader=reader), invalid)
     for language in LANGUAGES:
         for suffix in (".json", "-recovered.json"):
-            validate_transport(read_json(owned(root, directory / (language + suffix))), expected)
-        validate_transport(read_json(owned(root, directory / (language + "-rejected.json"))), invalid, rejections=True)
-        validate_disagreement(read_json(owned(root, directory / (language + "-disagreement.json"))), expected)
+            validate_transport(read_json(owned(root, directory / (language + suffix)), reader=reader), expected)
+        validate_transport(read_json(owned(root, directory / (language + "-rejected.json")), reader=reader), invalid, rejections=True)
+        validate_disagreement(read_json(owned(root, directory / (language + "-disagreement.json")), reader=reader), expected)
 
 
-def run_gate(root, run_id):
+def run_gate(root, run_id, *, require_prepared=False):
     require(re.fullmatch(r"[0-9a-f]{32}", run_id) is not None, "run-identity")
     current = read_json(owned(root, AREA / "current.json"))
     require(current == {"schema": REPORT_SCHEMA, "status": "running", "run_id": run_id}, "run-stale")
@@ -920,7 +931,7 @@ def run_gate(root, run_id):
     require(not owned(root, directory).exists(), "run-reused")
     owned(root, directory).mkdir(parents=True)
     runner = Runner(root, directory, inherit_tree=True)
-    prepare(root)
+    prepare(root, require_prepared=require_prepared)
     sources.verify_provider(root)
     source = producer(root)
     pl = module_at("interop_accepted_pl", source / "scripts/pl_contracts.py")
@@ -1043,6 +1054,43 @@ def completion(root, run_id=None):
     return directory, report
 
 
+def output_snapshot(root, directory, records):
+    base = owned(root, directory)
+    names = {"backend.json", "invalid.json", "spec/openapi.yaml"}
+    for language in LANGUAGES:
+        names.update(language + suffix for suffix in (".json", "-recovered.json", "-rejected.json", "-disagreement.json"))
+        names.add("generated/" + language + "/contracts-manifest.json")
+    if type(records) is list and len(records) <= len(required_commands()) + 3:
+        for index, record in enumerate(records):
+            if type(record) is dict and type(record.get("label")) is str:
+                prefix = f"commands/{index:02d}-{record['label']}"
+                names.update(prefix + suffix for suffix in (".json", ".stdout.txt", ".stderr.txt"))
+    selected = {base / name for name in names}
+    contents, files = {}, None
+
+    def read(path, limit=MAX_DOCUMENT):
+        key = str(path)
+        if key in contents:
+            file_metadata(path, limit)
+            content = contents[key]
+            require(content is not None and len(content) <= limit, "document-size")
+            return content
+        content = read_file(path, limit)
+        if path in selected:
+            if files is not None:
+                relative = path.relative_to(base).as_posix()
+                expected = files.get(relative)
+                if expected is None:
+                    expected = next((entry for name, entry in files.items() if base / name == path), None)
+                require(expected == {"bytes": len(content), "sha256": digest(content)}, "evidence-outputs")
+            # Retain only bounded semantic artifacts, not binaries or oversized document payloads.
+            contents[key] = content if len(content) <= MAX_DOCUMENT else None
+        return content
+
+    files = inventory(base, reader=read)
+    return files, read
+
+
 def verify(root=ROOT):
     verify_sources(root)
     sources.verify_provider(root)
@@ -1062,17 +1110,17 @@ def verify(root=ROOT):
         read_json(owned(root, directory / "kotlin-launch.json"))["classpath"])), "evidence-client")
     require(json_bytes(read_json(owned(root, directory / "runtime-inputs.json"))) == json_bytes(runtime_inputs(root, directory, backend_launch(root))),
             "evidence-runtime-inputs")
-    files = inventory(owned(root, directory))
+    files, reader = output_snapshot(root, directory, report["commands"])
     del files["report.json"]
     require(json_bytes(report["outputs"]) == json_bytes(files), "evidence-outputs")
-    verify_commands(root, directory, report["commands"], report["run_id"])
-    verify_transports(root, directory, report["run_id"])
+    verify_commands(root, directory, report["commands"], report["run_id"], reader=reader)
+    verify_transports(root, directory, report["run_id"], reader=reader)
     require(type(report["languages"]) is list and [client["target"] for client in report["languages"]] == list(LANGUAGES), "evidence-languages")
     pl = module_at("interop_verify_pl", producer(root) / "scripts/pl_contracts.py")
     specification = owned(root, directory / "spec/openapi.yaml")
-    require(report["scratch_spec_sha256"] == digest(read_file(specification)), "evidence-spec")
+    require(report["scratch_spec_sha256"] == digest(reader(specification)), "evidence-spec")
     for client in report["languages"]:
-        expected = generated(root, directory, specification, client["target"], pl)
+        expected = generated(root, directory, specification, client["target"], pl, reader=reader)
         expected.update({"round_trip": COUNT, "invalid_rejected": INVALID_COUNT, "disagreement_refused": True, "recovery": COUNT, "skipped": 0})
         require(client == expected and client["disagreement_refused"] is True
                 and all(type(client[key]) is int for key in ("round_trip", "invalid_rejected", "recovery", "skipped")),
@@ -1100,7 +1148,7 @@ def exclusive_run(root, run_id):
         sources.rollback_attempt(root, [(relative, identity)])
 
 
-def launch_run(root, args):
+def launch_run(root, args, *, require_prepared=False):
     run_id = uuid.uuid4().hex
     with exclusive_run(root, run_id):
         write_json(root, AREA / "current.json", {"schema": REPORT_SCHEMA, "status": "running", "run_id": run_id}, replace=True)
@@ -1111,9 +1159,11 @@ def launch_run(root, args):
                     "java": args.java, "classpath": args.classpath.split(os.pathsep),
                     "python": str(Path(sys.executable).absolute()), "node": node, "npm": npm,
                 }, replace=True)
-            completed = process_budget.run([sys.executable, "-I", "-S", "-B", str(Path(__file__).absolute()),
-                                            "_run", "--run-id", run_id], root, SECONDS,
-                                           env=process_budget.environment())
+            command = [sys.executable, "-I", "-S", "-B", str(Path(__file__).absolute()),
+                       "_run", "--run-id", run_id]
+            if require_prepared:
+                command.append("--require-prepared")
+            completed = process_budget.run(command, root, SECONDS, env=process_budget.environment())
             require(completed.returncode == 0, "gate-refused")
             # The owned worker already verified every binding before returning. Recheck its
             # exact completion, not the entire inventory a second time outside the process budget.
@@ -1128,6 +1178,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("prepare", "run", "verify", "_run"))
     parser.add_argument("--offline-source", type=Path)
+    parser.add_argument("--native-fetch", action="store_true", help="Prepare using the canonical native source client")
+    parser.add_argument("--require-prepared", action="store_true", help="Verify prepared inputs without acquiring them")
     parser.add_argument("--backend-input-file", type=Path)
     parser.add_argument("--java")
     parser.add_argument("--node", type=Path)
@@ -1136,6 +1188,10 @@ def main():
     args = parser.parse_args()
     try:
         require(args.offline_source is None or args.command == "prepare", "argument-mode")
+        require(not args.native_fetch or args.command == "prepare"
+                and args.offline_source is None and not args.require_prepared, "argument-mode")
+        require(not args.require_prepared or args.command in ("prepare", "run", "_run")
+                and args.offline_source is None, "argument-mode")
         require(args.run_id is None or args.command == "_run", "argument-mode")
         require(args.node is None or args.command == "run" and args.java is not None, "argument-mode")
         if args.java is not None or args.classpath is not None:
@@ -1144,14 +1200,15 @@ def main():
         if args.backend_input_file is not None:
             require(args.command == "run" and args.backend_input_file.absolute() == owned(ROOT, AREA / "backend-launch.json"), "backend-launch-path")
         if args.command == "prepare":
-            result = prepare(offline_source=args.offline_source)
+            result = prepare(ROOT, offline_source=args.offline_source, native_fetch=args.native_fetch,
+                             require_prepared=args.require_prepared)
         elif args.command == "verify":
             result = verify()
         elif args.command == "_run":
             require(args.run_id is not None, "run-identity")
-            result = run_gate(ROOT, args.run_id)
+            result = run_gate(ROOT, args.run_id, require_prepared=args.require_prepared)
         else:
-            launch_run(ROOT, args)
+            launch_run(ROOT, args, require_prepared=args.require_prepared)
             return 0
         print(json.dumps(result, sort_keys=True))
         return 0

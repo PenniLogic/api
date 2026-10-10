@@ -1212,5 +1212,223 @@ class ProcessBudgetTest(unittest.TestCase):
             self.assertIn("exceeded", errors.getvalue())
 
 
+class ProcessBudgetObservationTest(unittest.TestCase):
+    PREFIX = "process_budget_state="
+    SCHEMA = "pennilogic.process-budget-state/1"
+
+    def state(self, note):
+        self.assertIs(type(note), str)
+        self.assertTrue(note.startswith(self.PREFIX))
+        self.assertLessEqual(len(note.encode("ascii")), 384)
+        value = json.loads(note[len(self.PREFIX):])
+        self.assertEqual(value["schema"], self.SCHEMA)
+        self.assertEqual(note, self.PREFIX + json.dumps(value, sort_keys=True, separators=(",", ":")))
+        if value["status"] == "unavailable":
+            self.assertEqual(set(value), {"schema", "status"})
+            return value
+        self.assertEqual(value["status"], "observed")
+        self.assertEqual(set(value), {
+            "schema", "status", "process_running", "returncode", "capture_readers",
+            "capture_readers_alive", "setup_ms", "wait_ms", "elapsed_ms",
+        })
+        self.assertIs(type(value["process_running"]), bool)
+        self.assertEqual(value["process_running"], value["returncode"] is None)
+        if value["returncode"] is not None:
+            self.assertIs(type(value["returncode"]), int)
+            self.assertGreaterEqual(value["returncode"], -2147483648)
+            self.assertLessEqual(value["returncode"], 4294967295)
+        for name in ("capture_readers", "capture_readers_alive"):
+            self.assertIs(type(value[name]), int)
+            self.assertIn(value[name], range(3))
+        self.assertLessEqual(value["capture_readers_alive"], value["capture_readers"])
+        for name in ("setup_ms", "wait_ms", "elapsed_ms"):
+            self.assertIs(type(value[name]), int)
+            self.assertGreaterEqual(value[name], 0)
+            self.assertLessEqual(value[name], 86400000)
+        self.assertEqual(value["setup_ms"] + value["wait_ms"], value["elapsed_ms"])
+        return value
+
+    def timeout_state(self, *, parent_exits=False, capture=True):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            marker = root / "synthetic-private-child-started"
+            worker = "import time; time.sleep(60)"
+            if parent_exits:
+                child = f"import pathlib,time; pathlib.Path({str(marker)!r}).write_text('started'); time.sleep(60)"
+                worker = "import subprocess,sys; " + f"subprocess.Popen([sys.executable,'-I','-S','-B','-c',{child!r}])"
+            if capture:
+                worker = "print('synthetic-private-output',flush=True); " + worker
+            processes, captures = [], []
+            popen, capture_class = subprocess.Popen, process_budget.Capture
+
+            def remember(*args, **kwargs):
+                process = popen(*args, **kwargs)
+                processes.append(process)
+                return process
+
+            def remember_capture(process):
+                value = capture_class(process)
+                captures.append(value)
+                return value
+
+            with (
+                patch.object(process_budget.subprocess, "Popen", side_effect=remember),
+                patch.object(process_budget, "Capture", side_effect=remember_capture),
+                self.assertRaisesRegex(process_budget.BudgetExceeded, "enforced elapsed budget") as raised,
+            ):
+                process_budget.run([sys.executable, "-I", "-S", "-B", "-c", worker],
+                                   root, 1, capture=capture, separate=True)
+            self.assertIs(type(raised.exception), process_budget.BudgetExceeded)
+            self.assertEqual(len(processes), 1)
+            self.assertIsNotNone(processes[0].poll())
+            self.assertTrue(all(stream.closed for stream in (
+                processes[0].stdin, processes[0].stdout, processes[0].stderr,
+            ) if stream is not None))
+            self.assertEqual(len(captures), int(capture))
+            self.assertTrue(all(not thread.is_alive() for value in captures for thread in value.threads))
+            if capture:
+                self.assertIn(b"synthetic-private-output", raised.exception.output)
+                self.assertEqual(raised.exception.stderr, b"")
+                self.assertEqual(raised.exception.streams["stdout"]["bytes"], len(raised.exception.output))
+            if parent_exits:
+                self.assertTrue(marker.is_file())
+            notes = getattr(raised.exception, "__notes__", [])
+            self.assertEqual(len(notes), 1)
+            for private in ("synthetic-private", str(root), str(sys.executable), "time.sleep"):
+                self.assertNotIn(private, notes[0])
+            return self.state(notes[0])
+
+    def test_running_process_is_observed_before_termination_with_setup_time(self):
+        environment = process_budget.environment
+
+        def delayed_environment(*args, **kwargs):
+            time.sleep(0.2)
+            return environment(*args, **kwargs)
+
+        with patch.object(process_budget, "environment", side_effect=delayed_environment):
+            state = self.timeout_state()
+        self.assertEqual(state["status"], "observed")
+        self.assertTrue(state["process_running"])
+        self.assertIsNone(state["returncode"])
+        self.assertEqual((state["capture_readers"], state["capture_readers_alive"]), (2, 2))
+        self.assertGreaterEqual(state["setup_ms"], 200)
+        self.assertGreater(state["wait_ms"], 0)
+        self.assertGreaterEqual(state["elapsed_ms"], 1000)
+
+    def test_exited_parent_with_held_pipe_is_observed_before_termination(self):
+        state = self.timeout_state(parent_exits=True)
+        self.assertEqual(state["status"], "observed")
+        self.assertFalse(state["process_running"])
+        self.assertEqual(state["returncode"], 0)
+        self.assertEqual((state["capture_readers"], state["capture_readers_alive"]), (2, 2))
+        self.assertGreaterEqual(state["elapsed_ms"], 1000)
+
+    def test_unavailable_sample_preserves_original_timeout_and_cleanup(self):
+        observe = process_budget.budget_observation
+
+        for malformed in (False, True):
+            def unavailable(_process, captured, started, waiting):
+                process = Mock()
+                if malformed:
+                    process.poll.return_value = True
+                else:
+                    process.poll.side_effect = OSError("synthetic-private-observation-error")
+                return observe(process, captured, started, waiting)
+
+            with self.subTest(malformed=malformed), patch.object(process_budget, "budget_observation", side_effect=unavailable):
+                self.assertEqual(self.timeout_state(), {"schema": self.SCHEMA, "status": "unavailable"})
+
+    def test_timeout_without_capture_has_no_readers(self):
+        state = self.timeout_state(capture=False)
+        self.assertTrue(state["process_running"])
+        self.assertEqual((state["capture_readers"], state["capture_readers_alive"]), (0, 0))
+
+    def test_valid_samples_are_exact_and_bounded(self):
+        for code in (None, -2147483648, 0, 4294967295):
+            for alive in ([], [False], [True], [False, True], [True, True]):
+                process = Mock()
+                process.poll.return_value = code
+                captured = Mock(threads=[Mock(is_alive=Mock(return_value=value)) for value in alive])
+                with self.subTest(code=code, alive=alive), patch.object(process_budget.time, "monotonic", return_value=86400):
+                    state = self.state(process_budget.budget_observation(process, captured, 0, 1))
+                self.assertEqual(state, {
+                    "schema": self.SCHEMA, "status": "observed", "process_running": code is None,
+                    "returncode": code, "capture_readers": len(alive), "capture_readers_alive": sum(alive),
+                    "setup_ms": 1000, "wait_ms": 86399000, "elapsed_ms": 86400000,
+                })
+
+    def test_malformed_and_unavailable_samples_never_emit_private_values(self):
+        cases = [
+            {"code": value} for value in (False, True, "synthetic-private-code", -2147483649, 4294967296, 1.0)
+        ] + [
+            {"alive": [True, True, True]}, {"alive": [1]}, {"alive": ["synthetic-private-reader"]},
+            {"started": True}, {"started": float("nan")}, {"waiting": float("inf")},
+            {"waiting": -1}, {"waiting": 3}, {"now": 86400.001},
+            {"poll_error": OSError}, {"poll_error": ValueError}, {"reader_error": RuntimeError},
+        ]
+        for case in cases:
+            process = Mock()
+            process.poll.return_value = case.get("code")
+            if "poll_error" in case:
+                process.poll.side_effect = case["poll_error"]("synthetic-private-observation-error")
+            readers = [Mock(is_alive=Mock(return_value=value)) for value in case.get("alive", [True])]
+            if "reader_error" in case:
+                readers[0].is_alive.side_effect = case["reader_error"]("synthetic-private-reader-error")
+            captured = Mock(threads=readers)
+            with self.subTest(case=case), patch.object(process_budget.time, "monotonic", return_value=case.get("now", 2)):
+                note = process_budget.budget_observation(process, captured, case.get("started", 0), case.get("waiting", 1))
+            self.assertEqual(self.state(note), {"schema": self.SCHEMA, "status": "unavailable"})
+            self.assertNotIn("synthetic-private", note)
+
+    def test_success_and_nonzero_exit_neither_collect_nor_emit_state(self):
+        for code in (0, 3):
+            with (
+                self.subTest(code=code),
+                patch.object(process_budget, "budget_observation", side_effect=AssertionError("unexpected observation")) as observe,
+                patch("sys.stdout", new_callable=io.StringIO) as stdout,
+                patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            ):
+                result = process_budget.run(
+                    [sys.executable, "-I", "-S", "-B", "-c",
+                     f"import sys; print('out'); print('err',file=sys.stderr); sys.exit({code})"],
+                    SCRIPTS, 10, capture=True, separate=True,
+                )
+            observe.assert_not_called()
+            self.assertEqual(result.returncode, code)
+            self.assertEqual((result.stdout, result.stderr), (b"out\r\n", b"err\r\n") if os.name == "nt" else (b"out\n", b"err\n"))
+            self.assertEqual((stdout.getvalue(), stderr.getvalue()), ("", ""))
+
+    def test_output_limit_does_not_collect_elapsed_state(self):
+        with (
+            patch.object(process_budget, "MAX_CAPTURE_BYTES", 1024),
+            patch.object(process_budget, "budget_observation", side_effect=AssertionError("unexpected observation")) as observe,
+            self.assertRaises(process_budget.OutputExceeded) as raised,
+        ):
+            process_budget.run([sys.executable, "-I", "-S", "-B", "-c",
+                                "import sys; sys.stdout.buffer.write(b'x'*4096)"], SCRIPTS, 10, capture=True)
+        observe.assert_not_called()
+        self.assertEqual(getattr(raised.exception, "__notes__", []), [])
+
+    def test_capture_failure_does_not_collect_elapsed_state(self):
+        read = process_budget.Capture.read
+
+        class BrokenStream:
+            def read(self, _count):
+                raise OSError("synthetic-private-capture-error")
+
+        def fail_stderr(capture, name, stream):
+            read(capture, name, BrokenStream() if name == "stderr" else stream)
+
+        with (
+            patch.object(process_budget.Capture, "read", fail_stderr),
+            patch.object(process_budget, "budget_observation", side_effect=AssertionError("unexpected observation")) as observe,
+            self.assertRaisesRegex(OSError, "^Owned process output capture failed$") as raised,
+        ):
+            process_budget.run([sys.executable, "-I", "-S", "-B", "-c", "import time; time.sleep(60)"],
+                               SCRIPTS, 10, capture=True, separate=True)
+        observe.assert_not_called()
+        self.assertEqual(getattr(raised.exception, "__notes__", []), [])
+
+
 if __name__ == "__main__":
     unittest.main()
