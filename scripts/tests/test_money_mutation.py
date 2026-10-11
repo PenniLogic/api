@@ -1296,7 +1296,26 @@ class ProcessBudgetObservationTest(unittest.TestCase):
                 self.assertTrue(marker.is_file())
             notes = getattr(raised.exception, "__notes__", [])
             self.assertEqual(len(notes), 3 if os.name == "nt" else 2)
-            ProcessBudgetCaptureObservationTest().state(notes[0])
+            capture_state = ProcessBudgetCaptureObservationTest().state(notes[0])
+            if capture:
+                self.assertEqual(capture_state, {
+                    "schema": ProcessBudgetCaptureObservationTest.SCHEMA,
+                    "status": "observed", "scope": "snapshot", "complete": False, "mode": "separate",
+                    "stdout": raised.exception.streams["stdout"],
+                    "stderr": raised.exception.streams["stderr"],
+                })
+                for name, output in (("stdout", raised.exception.output), ("stderr", raised.exception.stderr)):
+                    self.assertIs(type(output), bytes)
+                    self.assertEqual(capture_state[name], {
+                        "bytes": len(output), "sha256": hashlib.sha256(output).hexdigest(),
+                    })
+            else:
+                self.assertEqual(capture_state, {
+                    "schema": ProcessBudgetCaptureObservationTest.SCHEMA, "status": "unavailable",
+                })
+                self.assertIsNone(raised.exception.output)
+                self.assertIsNone(raised.exception.stderr)
+                self.assertIsNone(raised.exception.streams)
             if os.name == "nt":
                 ProcessBudgetJobObservationTest().decode(notes[-2])
             for note in notes:
