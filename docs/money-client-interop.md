@@ -362,8 +362,8 @@ also projects only the original `BudgetExceeded.streams` metadata into an
 additive `process_budget_capture_state=` note. It precedes the existing optional
 Job note and final v1 note, preserving Job-v1 adjacency. There are no new process,
 member or clock queries, output reads, rehashes, waits or changes to the exception.
-The current generated qualifier does not yet transport this new capture note;
-canonical consumer support and adoption are separate work.
+The adopted canonical qualifier transports this bounded capture note within the
+matching unittest `ERROR` block, preserving refusal and incomplete outcomes.
 
 Version `pennilogic.process-budget-capture-state/1` uses recursively sorted compact
 ASCII JSON, at most 512 bytes including the prefix. An observed envelope has
