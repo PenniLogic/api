@@ -1076,6 +1076,23 @@ class ProcessBudgetTest(unittest.TestCase):
         command = (["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Write-Output 'approved-shell'"]
                    if os.name == "nt" else ["/bin/sh", "-c", "printf 'approved-shell\\n'"])
         with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"PATH": temporary}):
+            if os.name == "nt":
+                boundary = SCRIPTS.parent / "build" / "diagnostics" / "api106-approved-shell-boundary.bin"
+                boundary.parent.mkdir(parents=True, exist_ok=True)
+                with boundary.open("xb"):
+                    pass
+                # One-shot diagnostic: keep checkpoints independent of the suspect output path.
+                command[-1] = (
+                    "$pennilogicBoundary='" + str(boundary).replace("'", "''") + "';"
+                    "[IO.File]::AppendAllText($pennilogicBoundary,'E',[Text.Encoding]::ASCII);"
+                    "$i=[Console]::IsInputRedirected;$o=[Console]::IsOutputRedirected;"
+                    "$e=[Console]::IsErrorRedirected;"
+                    "$r=if(($i -is [bool])-and($o -is [bool])-and($e -is [bool]))"
+                    "{'S{0}{1}{2}' -f [int]$i,[int]$o,[int]$e}else{'U'};"
+                    "[IO.File]::AppendAllText($pennilogicBoundary,$r,[Text.Encoding]::ASCII);"
+                    + command[-1] + ";"
+                    "[IO.File]::AppendAllText($pennilogicBoundary,'X',[Text.Encoding]::ASCII)"
+                )
             result = process_budget.run(command, SCRIPTS, 10, capture=True)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout.strip(), "approved-shell")
