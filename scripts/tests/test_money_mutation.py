@@ -933,6 +933,230 @@ class MutationNativeConsoleTest(unittest.TestCase):
             mutation.enforce(result, floors)
 
 
+APPROVED_SHELL_LOOKUP_SETUP = r"""
+$script:pennilogicLookup=@{File=$null;Clock=$null;Hash=$null;Write=$null;Bytes=0;Records=0;
+    Failed=$false;Armed=$false;Seen=$false;Done=$false;Start=$null;Pre=$null;Post=$null};
+try {
+    $s=$script:pennilogicLookup;
+    $attributes=[IO.File]::GetAttributes($pennilogicLookupPath);
+    if(($attributes -band ([IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Directory)) -ne 0){
+        throw 'capture-file-kind'
+    };
+    $s.File=[IO.File]::Open($pennilogicLookupPath,[IO.FileMode]::Open,
+        [IO.FileAccess]::Write,[IO.FileShare]::Read);
+    if($s.File.Length -ne 0){throw 'capture-not-empty'};
+    $s.Clock=[Diagnostics.Stopwatch]::StartNew();
+    $s.Hash=[Security.Cryptography.SHA256]::Create();
+    $s.Utf8=[Text.UTF8Encoding]::new($false,$true);
+    $s.System=[IO.Path]::GetFullPath([IO.Path]::Combine($PSHOME,'Modules')).TrimEnd('\');
+    $s.Invariant=[Globalization.CultureInfo]::InvariantCulture;
+    $s.Write=[Action[string]]{
+        param($fields)
+        $w=$script:pennilogicLookup;
+        if($w.Failed){return};
+        try {
+            if($fields -match '[^\x20-\x7e]'){throw 'capture-encoding'};
+            $bytes=[Text.Encoding]::ASCII.GetBytes('{"v":1,'+$fields+"}`n");
+            if($bytes.Length -gt 6144 -or $w.Records -ge 4 -or
+                $w.Bytes+$bytes.Length -gt 8192 -or $w.File.Length -ne $w.Bytes){
+                throw 'capture-limit'
+            };
+            $w.File.Write($bytes,0,$bytes.Length);$w.File.Flush();
+            $w.Bytes+=$bytes.Length;$w.Records++;
+        } catch {
+            $w.Failed=$true;
+            [Console]::Error.WriteLine('{"event":"api106_module_lookup_capture","status":"refused"}');
+        }
+    };
+    $rootsReady=$false;$rootCode='snapshot';
+    try {
+        $raw=[Environment]::GetEnvironmentVariable('PSModulePath','Process');
+        $entries=[Collections.Generic.List[string]]::new();
+        $seen=[Collections.Generic.Dictionary[string,int]]::new([StringComparer]::Ordinal);
+        $value='absent';
+        if($null -ne $raw){
+            $value='present';
+            if($raw.Length -gt 32768){$rootCode='input-limit';throw 'root-limit'};
+            $roots=$raw.Split([char[]]';',[StringSplitOptions]::None);
+            if($roots.Length -gt 32){$rootCode='input-limit';throw 'root-limit'};
+            for($n=0;$n -lt $roots.Length;$n++){
+                $root=$roots[$n];
+                if($root.Length -gt 2048){$rootCode='input-limit';throw 'root-limit'};
+                $kind='unknown';
+                if($root.Length -eq 0){$kind='empty'}
+                elseif([StringComparer]::OrdinalIgnoreCase.Equals(
+                    $root.Replace('/','\').TrimEnd('\'),$s.System)){$kind='pshome'};
+                $rootCode='encoding';$encoded=$s.Utf8.GetBytes($root);$rootCode='snapshot';
+                $hash=[BitConverter]::ToString($s.Hash.ComputeHash($encoded)).Replace('-','').ToLowerInvariant();
+                $duplicate='null';
+                if($seen.ContainsKey($root)){$duplicate=$seen[$root].ToString($s.Invariant)}
+                else{$seen.Add($root,$n)};
+                $entries.Add('{"i":'+$n.ToString($s.Invariant)+',"kind":"'+$kind+
+                    '","sha256":"'+$hash+'","duplicate_of":'+$duplicate+'}');
+            }
+        };
+        $s.Write.Invoke('"phase":"roots","status":"observed","value":"'+$value+
+            '","roots":['+[String]::Join(',',$entries)+']');
+        $rootsReady=-not $s.Failed;
+    } catch {
+        $s.Write.Invoke('"phase":"roots","status":"refused","code":"'+$rootCode+'"');
+    };
+    $observerStatus='unavailable';$observerCode='roots-refused';
+    if($rootsReady){
+        $observerCode='unsupported-api';
+        $s.Intrinsics=$ExecutionContext.InvokeCommand;
+        $intrinsicsType=[System.Management.Automation.CommandInvocationIntrinsics];
+        $eventType=[System.Management.Automation.CommandLookupEventArgs];
+        $s.PreProperty=$intrinsicsType.GetProperty('PreCommandLookupAction');
+        $s.PostProperty=$intrinsicsType.GetProperty('PostCommandLookupAction');
+        $s.NameProperty=$eventType.GetProperty('CommandName');
+        $s.CommandProperty=$eventType.GetProperty('Command');
+        $s.TypeProperty=[System.Management.Automation.CommandInfo].GetProperty('CommandType');
+        $s.ModuleProperty=[System.Management.Automation.CommandInfo].GetProperty('Module');
+        $s.PathProperty=[System.Management.Automation.PSModuleInfo].GetProperty('Path');
+        $supported=$true;
+        foreach($property in @($s.PreProperty,$s.PostProperty,$s.NameProperty,$s.CommandProperty,
+            $s.TypeProperty,$s.ModuleProperty,$s.PathProperty)){
+            if($null -eq $property -or $null -eq $property.GetGetMethod() -or
+                $property.GetGetMethod().IsVirtual){$supported=$false;break}
+        };
+        if($supported -and $null -ne $s.PreProperty.GetSetMethod() -and
+            $null -ne $s.PostProperty.GetSetMethod() -and
+            $s.PreProperty.PropertyType -eq [EventHandler[System.Management.Automation.CommandLookupEventArgs]] -and
+            $s.PostProperty.PropertyType -eq $s.PreProperty.PropertyType){
+            $observerCode='existing-hooks';
+            if($null -eq $s.PreProperty.GetValue($s.Intrinsics) -and
+                $null -eq $s.PostProperty.GetValue($s.Intrinsics)){
+                try {
+                    $s.Pre=[EventHandler[System.Management.Automation.CommandLookupEventArgs]]{
+                        param($sender,$lookupEvent)
+                        $p=$script:pennilogicLookup;
+                        if(-not $p.Armed -or $p.Done -or $p.Failed){return};
+                        try {
+                            if(-not [StringComparer]::OrdinalIgnoreCase.Equals(
+                                $p.NameProperty.GetValue($lookupEvent),'Write-Output')){return};
+                            if($p.Seen){
+                                $p.Done=$true;
+                                $p.Write.Invoke('"phase":"post","status":"unavailable","code":"nested-target"');
+                                return
+                            };
+                            $p.Seen=$true;$ms=$p.Clock.ElapsedMilliseconds;$time='null';
+                            if($ms -ge 0 -and $ms -le 600000){
+                                $p.Start=$ms;$time=$ms.ToString($p.Invariant)
+                            };
+                            $p.Write.Invoke('"phase":"pre","status":"observed","ms":'+$time);
+                        } catch {
+                            $p.Done=$true;
+                            $p.Write.Invoke('"phase":"post","status":"refused","code":"callback"');
+                        }
+                    };
+                    $s.Post=[EventHandler[System.Management.Automation.CommandLookupEventArgs]]{
+                        param($sender,$lookupEvent)
+                        $p=$script:pennilogicLookup;
+                        if(-not $p.Armed -or $p.Done -or $p.Failed){return};
+                        $code='callback';
+                        try {
+                            if(-not [StringComparer]::OrdinalIgnoreCase.Equals(
+                                $p.NameProperty.GetValue($lookupEvent),'Write-Output')){return};
+                            $p.Done=$true;
+                            if(-not $p.Seen){
+                                $p.Write.Invoke('"phase":"post","status":"unavailable","code":"post-without-pre"');
+                                return
+                            };
+                            $ms=$p.Clock.ElapsedMilliseconds;$time='null';$elapsed='null';
+                            if($ms -ge 0 -and $ms -le 600000 -and
+                                ($null -eq $p.Start -or $ms -ge $p.Start)){
+                                $time=$ms.ToString($p.Invariant);
+                                if($null -ne $p.Start -and $ms -ge $p.Start){
+                                    $elapsed=($ms-$p.Start).ToString($p.Invariant)
+                                }
+                            };
+                            $command=$p.CommandProperty.GetValue($lookupEvent);
+                            $type='null';$kind='no-command';$hash='null';
+                            if($null -ne $command){
+                                $number=[int]$p.TypeProperty.GetValue($command);
+                                if($number -notin @(1,2,4,8,16,32,64,128,256)){
+                                    $code='command-type';throw 'command-type'
+                                };
+                                $type=$number.ToString($p.Invariant);$kind='none';
+                                $module=$p.ModuleProperty.GetValue($command);
+                                if($null -ne $module){
+                                    $path=$p.PathProperty.GetValue($module);$kind='unknown';
+                                    if(-not [string]::IsNullOrEmpty($path)){
+                                        if($path.Length -gt 2048){$code='module-path-limit';throw 'module-path-limit'};
+                                        $hash='"'+[BitConverter]::ToString($p.Hash.ComputeHash(
+                                            $p.Utf8.GetBytes($path))).Replace('-','').ToLowerInvariant()+'"';
+                                        $kind='other';
+                                        if([IO.Path]::GetPathRoot($path).Length -ge 3 -and
+                                            [IO.Path]::GetFullPath($path).StartsWith(
+                                                $p.System+'\',[StringComparison]::OrdinalIgnoreCase)){$kind='pshome'}
+                                    }
+                                }
+                            };
+                            $p.Write.Invoke('"phase":"post","status":"observed","ms":'+$time+
+                                ',"lookup_ms":'+$elapsed+',"command_type":'+$type+
+                                ',"module_kind":"'+$kind+'","module_sha256":'+$hash);
+                        } catch {
+                            $p.Done=$true;
+                            $p.Write.Invoke('"phase":"post","status":"refused","code":"'+$code+'"');
+                        }
+                    };
+                    $s.PreProperty.SetValue($s.Intrinsics,$s.Pre);
+                    $s.PostProperty.SetValue($s.Intrinsics,$s.Post);
+                    if(-not [Object]::ReferenceEquals($s.PreProperty.GetValue($s.Intrinsics),$s.Pre) -or
+                        -not [Object]::ReferenceEquals($s.PostProperty.GetValue($s.Intrinsics),$s.Post)){
+                        throw 'observer-install'
+                    };
+                    $s.Armed=$true;$observerStatus='armed';
+                } catch {$observerStatus='refused';$observerCode='install'}
+            }
+        }
+    };
+    $fields='"phase":"observer","status":"'+$observerStatus+'"';
+    if($observerStatus -ne 'armed'){$fields+=',"code":"'+$observerCode+'"'};
+    $s.Write.Invoke($fields);
+} catch {
+    if(-not $script:pennilogicLookup.Failed){
+        $script:pennilogicLookup.Failed=$true;
+        [Console]::Error.WriteLine('{"event":"api106_module_lookup_capture","status":"refused"}');
+    }
+};
+"""
+
+APPROVED_SHELL_LOOKUP_FINISH = r"""
+;$s=$script:pennilogicLookup;
+try {
+    if($null -ne $s.Write -and -not $s.Done){
+        $s.Done=$true;$code='observer-unavailable';
+        if($s.Armed){$code=if($s.Seen){'no-post'}else{'no-pre'}};
+        $s.Write.Invoke('"phase":"post","status":"unavailable","code":"'+$code+'"');
+    };
+    if($null -ne $s.Pre -and [Object]::ReferenceEquals(
+        $s.PreProperty.GetValue($s.Intrinsics),$s.Pre)){$s.PreProperty.SetValue($s.Intrinsics,$null)};
+    if($null -ne $s.Post -and [Object]::ReferenceEquals(
+        $s.PostProperty.GetValue($s.Intrinsics),$s.Post)){$s.PostProperty.SetValue($s.Intrinsics,$null)};
+} catch {
+    if(-not $s.Failed){
+        $s.Failed=$true;
+        [Console]::Error.WriteLine('{"event":"api106_module_lookup_capture","status":"refused"}');
+    }
+} finally {
+    try {
+        try {if($null -ne $s.Hash){$s.Hash.Dispose()}}
+        finally {
+            try {if($null -ne $s.Clock){$s.Clock.Stop()}}
+            finally {if($null -ne $s.File){$s.File.Dispose()}}
+        }
+    } catch {
+        if(-not $s.Failed){
+            $s.Failed=$true;
+            [Console]::Error.WriteLine('{"event":"api106_module_lookup_capture","status":"refused"}');
+        }
+    }
+};
+"""
+
+
 class ProcessBudgetTest(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "win32", "Windows Docker Desktop executable boundary")
     def test_budgeted_quality_admits_only_the_approved_docker_directory(self):
@@ -1078,17 +1302,23 @@ class ProcessBudgetTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"PATH": temporary}):
             if os.name == "nt":
                 boundary = SCRIPTS.parent / "build" / "diagnostics" / "api106-approved-shell-boundary.bin"
+                for parent in (boundary.parent.parent, boundary.parent):
+                    self.assertFalse(parent.is_symlink() or parent.is_junction(), "diagnostic-area-reparse-point")
                 boundary.parent.mkdir(parents=True, exist_ok=True)
                 with boundary.open("xb"):
                     pass
+                lookup = boundary.with_name("api106-approved-shell-module-lookup.jsonl")
+                try:
+                    with lookup.open("xb"):
+                        pass
+                except OSError:
+                    raise AssertionError("diagnostic-capsule-exclusive-create-refused") from None
                 # One-shot diagnostic: keep checkpoints independent of the suspect output path.
                 command[-1] = (
                     "$pennilogicBoundary='" + str(boundary).replace("'", "''") + "';"
                     "[IO.File]::AppendAllText($pennilogicBoundary,'E',[Text.Encoding]::ASCII);"
-                    "$pennilogicModulePath=[IO.Path]::Combine($PSHOME,'Modules');"
-                    "$env:PSModulePath=$pennilogicModulePath;"
-                    "if($env:PSModulePath -cne $pennilogicModulePath)"
-                    "{throw 'Approved PowerShell module path was not applied'};"
+                    "$pennilogicLookupPath='" + str(lookup).replace("'", "''") + "';"
+                    + APPROVED_SHELL_LOOKUP_SETUP +
                     "$i=[Console]::IsInputRedirected;$o=[Console]::IsOutputRedirected;"
                     "$e=[Console]::IsErrorRedirected;"
                     "$r=if(($i -is [bool])-and($o -is [bool])-and($e -is [bool]))"
@@ -1096,6 +1326,7 @@ class ProcessBudgetTest(unittest.TestCase):
                     "[IO.File]::AppendAllText($pennilogicBoundary,$r,[Text.Encoding]::ASCII);"
                     + command[-1] + ";"
                     "[IO.File]::AppendAllText($pennilogicBoundary,'X',[Text.Encoding]::ASCII)"
+                    + APPROVED_SHELL_LOOKUP_FINISH
                 )
             result = process_budget.run(command, SCRIPTS, 10, capture=True)
         self.assertEqual(result.returncode, 0)

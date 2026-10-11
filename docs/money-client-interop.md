@@ -331,12 +331,70 @@ credentials are not forwarded. The Windows process-budget bootstrap itself
 uses `-I -S -B` and cannot spawn its child before its owned Job is attached.
 
 The temporary **DIAGNOSTIC COUNTERFACTUAL** in the approved-shell regression
-sets and verifies child-local `PSModulePath` to `$PSHOME\Modules` after startup,
-before the pre-output checkpoint. The original uncaptured `Write-Output` and
-post-expression `X` are restored. This does not identify the selected module or
-loaded aliases, prove a cause, or repair default launch behavior. A green run
-cannot release merge or acceptance; default launch still needs a supported
-correction and proper regression coverage.
+leaves the default `PSModulePath` untouched and keeps the original uncaptured
+`Write-Output`, 10-second call, return/output assertions and E/S-or-U/X grammar.
+It exclusively creates `build/diagnostics/api106-approved-shell-module-lookup.jsonl`
+outside JUnit selection. The child appends only bounded, flushed ASCII NDJSON:
+at most 8192 bytes, four records and 6144 bytes per LF-terminated record, with
+integer `v=1`. No raw paths, module names, commands, messages, credentials or ANSI
+are exported.
+
+The record order is `roots`, `observer`, optional `pre`, optional `post`, each
+at most once. `roots/observed` has `value` (`present` or `absent`) and `roots`:
+up to 32 entries with consecutive `i`, `kind` (`pshome`, `unknown`, `empty`),
+`sha256` and nullable `duplicate_of`. Hashes are lowercase SHA256 of each exact
+strict-UTF-8 component, without normalization; duplicates refer to the earliest
+identical ordinal string. Empty/trailing components remain in order. An empty
+value has one empty entry; absence has no entries. The environment string is
+capped at 32768 UTF-16 units and each component at 2048. `pshome` means a lexical
+case/slash/trailing-separator match to this child's `PSHOME\Modules`, not physical
+path identity. Refusal replaces those fields with `code`: `input-limit`,
+`encoding` or `snapshot`.
+
+`observer/armed` registers only the public WinPS5.1
+`PreCommandLookupAction`/`PostCommandLookupAction` APIs, without replacing
+existing hooks or initiating lookup. Their availability is documented in
+`Microsoft.PowerShell.5.1.ReferenceAssemblies`; the returned `CommandName`,
+`Command`, `CommandType`, `Module` and `Path` getters are read through their
+public reflection metadata, not alias resolution or command enumeration.
+Unavailable codes are `roots-refused`, `existing-hooks`, `unsupported-api`;
+installation failure is `observer/refused` with `code=install`.
+
+Only the first matching actual lookup is sampled. `pre/observed` adds nullable
+`ms`. `post/observed` adds nullable `ms`, `lookup_ms`, actual `command_type`
+(1,2,4,8,16,32,64,128,256, or null for no returned command), `module_kind` and
+`module_sha256`. Module kinds are `no-command`, `none`, `unknown`, `pshome`,
+`other`; only the latter two have a hash of the observed module path, capped at
+2048 UTF-16 units. `pshome` is lexical absolute containment below `PSHOME\Modules`,
+not module-byte or symlink attestation. Alias metadata describes its defining
+module, never its resolved target. Times are monotonic diagnostic-relative
+milliseconds in 0..600000 or null, not a changed deadline or method duration.
+The lookup interval includes callback/recording overhead. Nested target lookup
+invalidates pairing and emits no provenance.
+Both samples use `Stopwatch.ElapsedMilliseconds` without further rounding or
+clamping. An out-of-range sample is null; a post sample below a valid pre sample
+is also null. When both samples are nonnull, `post.ms >= pre.ms` and `lookup_ms`
+is exactly their integer difference. Otherwise `lookup_ms` is null; either or
+both samples may independently be null.
+
+Other `post` records have only `code`: unavailable codes are
+`observer-unavailable`, `no-pre`, `no-post`, `nested-target`, `post-without-pre`;
+refusal codes are `command-type`, `module-path-limit`, `callback`. All records
+also have `v`, `phase`, `status`; unknown fields are invalid. Writer/open failures
+emit only the fixed `api106_module_lookup_capture`/`refused` stderr event, never
+exception text or a success fallback. Successful finalization removes only the
+fixture's own delegates and closes its stream; process termination can leave a
+strict prefix.
+
+The canonical collector must read at most 8193 bytes and validate the entire
+capsule before emitting its safe projection. Reparse/nonregular files, I/O errors,
+oversize, incomplete lines, non-ASCII/BOM/ANSI, duplicate JSON keys, wrong types,
+unknown fields/enums, invalid hashes/duplicate indices and impossible phase
+relationships are explicit refusals, without echoing offending data. A valid
+prefix is partial/unknown: absent callbacks do not prove a cached lookup. The
+existing 2105-byte boundary reader remains unchanged. Neither roots, callbacks,
+X nor a green instrumented test establishes cause, delivery, no-error behavior,
+cleanup, a default-launch repair or merge acceptance.
 
 An elapsed-budget failure samples bounded process state immediately before the
 existing owned termination, then attaches one ASCII `process_budget_state=` JSON
