@@ -361,10 +361,13 @@ On Windows, the same elapsed-failure boundary also queries only the already-owne
 Job. It attaches `process_budget_job_state=` immediately before the unchanged
 final v1 note. Version `pennilogic.process-budget-job-state/1` has exactly
 `schema`, `accounting` and `members`, encoded as recursively sorted compact ASCII
-JSON, at most 512 bytes including the prefix. The existing canonical v1 decoder
-ignores this distinct earlier line; transport of the new fields requires a
-separate official Infra decoder adoption. Neither note changes the original
-`BudgetExceeded`, refusal or incomplete-outcome treatment.
+JSON, at most 512 bytes including the prefix. The adopted canonical Infra
+qualifier transports the optional Job fields from the matching unittest `ERROR`
+block, requiring the Job note immediately before the unchanged final v1 note.
+Malformed or misplaced Job notes remain unavailable, not observed zeroes.
+The existing v1 schema and 384-byte bound, original `BudgetExceeded`,
+refusal and incomplete-outcome treatment remain unchanged. This source adoption
+adds no runtime evidence and does not diagnose or repair the original timeout.
 
 Accounting uses one query: an `observed` block contains `status`,
 `total_assigned` (the Job's cumulative process count) and `active`, with unsigned
