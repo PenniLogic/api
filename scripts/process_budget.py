@@ -27,6 +27,12 @@ def launch_command(command):
 
 
 MAX_CAPTURE_BYTES = 4 * 1024 * 1024
+CAPTURE_STATE_PREFIX = "process_budget_capture_state="
+CAPTURE_STATE_SCHEMA = "pennilogic.process-budget-capture-state/1"
+CAPTURE_STATE_UNAVAILABLE = (
+    CAPTURE_STATE_PREFIX + '{"schema":"' + CAPTURE_STATE_SCHEMA + '","status":"unavailable"}'
+)
+EMPTY_CAPTURE_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 JOB_STATE_PREFIX = "process_budget_job_state="
 JOB_STATE_SCHEMA = "pennilogic.process-budget-job-state/1"
 JOB_STATE_UNAVAILABLE = (
@@ -138,6 +144,34 @@ def budget_observation(process, captured, started, waiting):
     except (OSError, RuntimeError, AttributeError, TypeError, ValueError, OverflowError):
         state = {"schema": schema, "status": "unavailable"}
     return "process_budget_state=" + json.dumps(state, sort_keys=True, separators=(",", ":"))
+
+
+def capture_observation(streams, *, separate):
+    try:
+        if type(separate) is not bool or type(streams) is not dict or streams.keys() != {"stdout", "stderr"}:
+            return CAPTURE_STATE_UNAVAILABLE
+        projected = {}
+        for name in ("stdout", "stderr"):
+            stream = streams[name]
+            if type(stream) is not dict or stream.keys() != {"bytes", "sha256"}:
+                return CAPTURE_STATE_UNAVAILABLE
+            count, digest = stream["bytes"], stream["sha256"]
+            if (type(count) is not int or not 0 <= count <= 18446744073709551615
+                    or type(digest) is not str or len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)
+                    or count == 0 and digest != EMPTY_CAPTURE_SHA256):
+                return CAPTURE_STATE_UNAVAILABLE
+            projected[name] = {"bytes": count, "sha256": digest}
+        if not separate and projected["stderr"] != {"bytes": 0, "sha256": EMPTY_CAPTURE_SHA256}:
+            return CAPTURE_STATE_UNAVAILABLE
+        state = {
+            "schema": CAPTURE_STATE_SCHEMA, "status": "observed", "scope": "snapshot", "complete": False,
+            "mode": "separate" if separate else "merged", **projected,
+        }
+        note = CAPTURE_STATE_PREFIX + json.dumps(state, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return note if len(note.encode("ascii")) <= 512 else CAPTURE_STATE_UNAVAILABLE
+    except (OSError, RuntimeError, AttributeError, KeyError, TypeError, ValueError, OverflowError):
+        return CAPTURE_STATE_UNAVAILABLE
 
 
 class Capture:
@@ -489,6 +523,7 @@ def run(command, root, seconds, capture=False, *, env=None, separate=False, inhe
             raise OSError("Owned process output capture failed")
         if failure == "elapsed":
             error = BudgetExceeded(stdout, stderr, streams)
+            error.add_note(capture_observation(error.streams, separate=separate))
             if job_observation is not None:
                 error.add_note(job_observation)
             error.add_note(observation)

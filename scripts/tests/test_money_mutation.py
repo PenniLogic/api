@@ -1295,9 +1295,10 @@ class ProcessBudgetObservationTest(unittest.TestCase):
             if parent_exits:
                 self.assertTrue(marker.is_file())
             notes = getattr(raised.exception, "__notes__", [])
-            self.assertEqual(len(notes), 2 if os.name == "nt" else 1)
+            self.assertEqual(len(notes), 3 if os.name == "nt" else 2)
+            ProcessBudgetCaptureObservationTest().state(notes[0])
             if os.name == "nt":
-                ProcessBudgetJobObservationTest().decode(notes[0])
+                ProcessBudgetJobObservationTest().decode(notes[-2])
             for note in notes:
                 for private in ("synthetic-private", str(root), str(sys.executable), "time.sleep"):
                     self.assertNotIn(private, note)
@@ -1433,6 +1434,145 @@ class ProcessBudgetObservationTest(unittest.TestCase):
                                SCRIPTS, 10, capture=True, separate=True)
         observe.assert_not_called()
         self.assertEqual(getattr(raised.exception, "__notes__", []), [])
+
+
+class ProcessBudgetCaptureObservationTest(unittest.TestCase):
+    PREFIX = "process_budget_capture_state="
+    SCHEMA = "pennilogic.process-budget-capture-state/1"
+    EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+    def metadata(self, stdout=b"", stderr=b""):
+        return {name: {"bytes": len(value), "sha256": hashlib.sha256(value).hexdigest()}
+                for name, value in (("stdout", stdout), ("stderr", stderr))}
+
+    def state(self, note):
+        self.assertIs(type(note), str)
+        self.assertLessEqual(len(note.encode("ascii")), 512)
+        self.assertTrue(note.startswith(self.PREFIX))
+        value = json.loads(note[len(self.PREFIX):])
+        self.assertEqual(note, self.PREFIX + json.dumps(value, sort_keys=True, separators=(",", ":")))
+        self.assertEqual(value["schema"], self.SCHEMA)
+        if value["status"] == "unavailable":
+            self.assertEqual(set(value), {"schema", "status"})
+            return value
+        self.assertEqual(set(value), {"schema", "status", "scope", "complete", "mode", "stdout", "stderr"})
+        self.assertEqual(value["status"], "observed")
+        self.assertEqual(value["scope"], "snapshot")
+        self.assertIs(value["complete"], False)
+        self.assertIn(value["mode"], ("merged", "separate"))
+        for name in ("stdout", "stderr"):
+            stream = value[name]
+            self.assertEqual(set(stream), {"bytes", "sha256"})
+            self.assertIs(type(stream["bytes"]), int)
+            self.assertTrue(0 <= stream["bytes"] <= 18446744073709551615)
+            self.assertIs(type(stream["sha256"]), str)
+            self.assertRegex(stream["sha256"], r"\A[0-9a-f]{64}\Z")
+            if stream["bytes"] == 0:
+                self.assertEqual(stream["sha256"], self.EMPTY_SHA256)
+        if value["mode"] == "merged":
+            self.assertEqual(value["stderr"], {"bytes": 0, "sha256": self.EMPTY_SHA256})
+        return value
+
+    def test_observed_zero_bytes_are_distinct_from_unavailable_capture(self):
+        for separate in (False, True):
+            with self.subTest(separate=separate):
+                state = self.state(process_budget.capture_observation(self.metadata(), separate=separate))
+                self.assertEqual(state["status"], "observed")
+                self.assertEqual(state["mode"], "separate" if separate else "merged")
+                self.assertEqual((state["stdout"]["bytes"], state["stderr"]["bytes"]), (0, 0))
+                self.assertEqual(self.state(process_budget.capture_observation(None, separate=separate)),
+                                 {"schema": self.SCHEMA, "status": "unavailable"})
+
+    def test_merged_stderr_is_an_unused_slot_not_an_independent_stream(self):
+        streams = self.metadata(b"out\nerr\n")
+        state = self.state(process_budget.capture_observation(streams, separate=False))
+        self.assertEqual(state["mode"], "merged")
+        self.assertEqual(state["stdout"], streams["stdout"])
+        self.assertEqual(state["stderr"], {"bytes": 0, "sha256": self.EMPTY_SHA256})
+        note = process_budget.capture_observation(self.metadata(b"out", b"err"), separate=False)
+        self.assertEqual(self.state(note), {"schema": self.SCHEMA, "status": "unavailable"})
+
+    def test_separate_snapshot_projects_existing_hashes_without_rehash_or_queries(self):
+        streams = self.metadata(b"\xffsynthetic-private-output", b"synthetic-private-error")
+        before = json.dumps(streams, sort_keys=True)
+        with (
+            patch.object(process_budget.subprocess, "Popen", side_effect=AssertionError("unexpected launch")),
+            patch.object(process_budget, "WindowsJob", side_effect=AssertionError("unexpected Job")),
+            patch.object(process_budget.time, "monotonic", side_effect=AssertionError("unexpected clock")),
+            patch.object(process_budget.hashlib, "sha256", side_effect=AssertionError("unexpected rehash")),
+        ):
+            note = process_budget.capture_observation(streams, separate=True)
+        state = self.state(note)
+        self.assertEqual((state["stdout"], state["stderr"]), (streams["stdout"], streams["stderr"]))
+        self.assertEqual(json.dumps(streams, sort_keys=True), before)
+        self.assertNotIn("synthetic-private", note)
+
+    def test_uint64_boundaries_fit_the_exact_canonical_envelope(self):
+        for stdout in (0, 1, 18446744073709551615):
+            for stderr in (0, 1, 18446744073709551615):
+                streams = {name: {"bytes": count, "sha256": "f" * 64 if count else self.EMPTY_SHA256}
+                           for name, count in (("stdout", stdout), ("stderr", stderr))}
+                with self.subTest(stdout=stdout, stderr=stderr):
+                    note = process_budget.capture_observation(streams, separate=True)
+                    state = self.state(note)
+                    self.assertEqual((state["stdout"], state["stderr"]), (streams["stdout"], streams["stderr"]))
+                    self.assertLessEqual(len(note), 389)
+        self.assertEqual(len(note), 389)
+        self.assertEqual(len(process_budget.CAPTURE_STATE_UNAVAILABLE.encode("ascii")), 106)
+
+    def test_invalid_modes_counts_and_hashes_never_become_observed(self):
+        for mode in (None, 0, 1, "synthetic-private-mode", [], {}):
+            with self.subTest(mode=mode):
+                self.assertEqual(process_budget.capture_observation(self.metadata(), separate=mode),
+                                 process_budget.CAPTURE_STATE_UNAVAILABLE)
+        counts = (False, True, None, -1, 18446744073709551616, 1.0, float("nan"),
+                  float("inf"), "synthetic-private-count")
+        hashes = (False, True, None, b"a" * 64, "a" * 63, "a" * 65, "A" * 64,
+                  "g" * 64, "\u2603" * 64, "a" * 63 + "\n", "synthetic-private-path")
+        for name in ("stdout", "stderr"):
+            for key, values in (("bytes", counts), ("sha256", hashes)):
+                for value in values:
+                    streams = self.metadata(b"out", b"err")
+                    streams[name][key] = value
+                    with self.subTest(stream=name, field=key, value=value):
+                        self.assertEqual(process_budget.capture_observation(streams, separate=True),
+                                         process_budget.CAPTURE_STATE_UNAVAILABLE)
+            streams = self.metadata()
+            streams[name]["sha256"] = "a" * 64
+            with self.subTest(zero_with_wrong_hash=name):
+                self.assertEqual(process_budget.capture_observation(streams, separate=True),
+                                 process_budget.CAPTURE_STATE_UNAVAILABLE)
+
+    def test_malformed_shapes_and_extra_private_fields_are_unavailable(self):
+        class NonPlainDict(dict):
+            pass
+
+        cases = [None, False, [], "synthetic-private-metadata", {}, {"stdout": self.metadata()["stdout"]},
+                 {**self.metadata(), "command": "synthetic-private-command"}, NonPlainDict(self.metadata())]
+        for name in ("stdout", "stderr"):
+            for value in (None, [], False, "synthetic-private-stream", {},
+                          {"bytes": 0}, {"sha256": self.EMPTY_SHA256},
+                          {"bytes": 0, "sha256": self.EMPTY_SHA256, "path": "synthetic-private-path"},
+                          NonPlainDict(self.metadata()[name])):
+                cases.append({**self.metadata(), name: value})
+        for index, streams in enumerate(cases):
+            with self.subTest(case=index):
+                note = process_budget.capture_observation(streams, separate=True)
+                self.assertEqual(note, process_budget.CAPTURE_STATE_UNAVAILABLE)
+                self.assertEqual(self.state(note), {"schema": self.SCHEMA, "status": "unavailable"})
+                self.assertNotIn("synthetic-private", note)
+
+    def test_encoding_refusals_keep_the_bounded_unavailable_note(self):
+        for effect in (OSError("synthetic-private"), RuntimeError("synthetic-private"),
+                       AttributeError("synthetic-private"), KeyError("synthetic-private"),
+                       TypeError("synthetic-private"), ValueError("synthetic-private"),
+                       OverflowError("synthetic-private"), "x" * 513, "\u2603", None):
+            streams = self.metadata()
+            options = {"side_effect": effect} if isinstance(effect, Exception) else {"return_value": effect}
+            with self.subTest(effect=type(effect).__name__), patch.object(process_budget.json, "dumps", **options):
+                note = process_budget.capture_observation(streams, separate=True)
+            self.assertEqual(note, process_budget.CAPTURE_STATE_UNAVAILABLE)
+            self.assertEqual(self.state(note), {"schema": self.SCHEMA, "status": "unavailable"})
 
 
 class FakeJobObservationApi:
@@ -1920,7 +2060,7 @@ class ProcessBudgetJobObservationTest(unittest.TestCase):
 
 class ProcessBudgetJobRunTest(unittest.TestCase):
     def run_mocked(self, *, platform="nt", failure="elapsed", exit_code=0, inherit_tree=False, query_error=0,
-                   missing_provider=None):
+                   missing_provider=None, capture=True, separate=True):
         events = []
         api = FakeJobObservationApi((11, 22))
         api.query_errors[3] = query_error
@@ -1934,7 +2074,8 @@ class ProcessBudgetJobRunTest(unittest.TestCase):
         process.returncode = exit_code if failure is None else None
         process.poll.side_effect = lambda: process.returncode
         process.stdin = Mock() if platform == "nt" else None
-        process.stdout, process.stderr = Mock(), Mock()
+        process.stdout = Mock() if capture else None
+        process.stderr = Mock() if capture and separate else None
         process.kill.side_effect = lambda: setattr(process, "returncode", -9)
         job.attach = Mock(side_effect=lambda value: events.append(("attach", value)))
 
@@ -1956,9 +2097,15 @@ class ProcessBudgetJobRunTest(unittest.TestCase):
         reader.is_alive.return_value = failure is not None
         reader.join.side_effect = lambda **_options: setattr(reader.is_alive, "return_value", False)
         captured = Mock(threads=[reader], exceeded=failure == "output", failed=failure == "capture")
-        streams = {"stdout": {"bytes": 3, "sha256": hashlib.sha256(b"out").hexdigest()},
-                   "stderr": {"bytes": 3, "sha256": hashlib.sha256(b"err").hexdigest()}}
-        captured.snapshot.return_value = (b"out", b"err", streams)
+        output, errors = (b"out", b"err") if separate else (b"out\nerr", b"")
+        streams = {name: {"bytes": len(value), "sha256": hashlib.sha256(value).hexdigest()}
+                   for name, value in (("stdout", output), ("stderr", errors))}
+
+        def snapshot(mode):
+            events.append(("snapshot", None))
+            return (output if mode else output.decode("utf-8")), errors, streams
+
+        captured.snapshot.side_effect = snapshot
         fake_os = SimpleNamespace(name=platform, pathsep=";" if platform == "nt" else ":",
                                   killpg=Mock(side_effect=lambda *_: terminate()))
         environment = {"COMSPEC": api.COMSPEC, "PATH": "synthetic-private-approved-path"}
@@ -1966,10 +2113,23 @@ class ProcessBudgetJobRunTest(unittest.TestCase):
         times = [0, 0.025, 10.025, 10.025] if failure == "elapsed" else [0, 0.025, 0.5]
         raised, result = None, None
         original_observation = process_budget.budget_observation
+        original_projection = process_budget.capture_observation
+        original_error = process_budget.BudgetExceeded
+        created_errors = []
 
         def v1(*args):
             events.append(("v1_observation", None))
             return original_observation(*args)
+
+        def construct_error(*args):
+            error = original_error(*args)
+            created_errors.append(error)
+            return error
+
+        def project(metadata, **options):
+            events.append(("capture_observation", None))
+            self.assertIs(metadata, created_errors[-1].streams)
+            return original_projection(metadata, **options)
 
         with (
             patch.object(process_budget, "os", fake_os),
@@ -1978,16 +2138,18 @@ class ProcessBudgetJobRunTest(unittest.TestCase):
             patch.object(process_budget, "resolve_command", return_value=resolved) as resolve_call,
             patch.object(process_budget, "WindowsJob", return_value=job) as constructor,
             patch.object(process_budget.subprocess, "Popen", return_value=process) as popen,
-            patch.object(process_budget, "Capture", return_value=captured),
+            patch.object(process_budget, "Capture", return_value=captured) as capture_call,
+            patch.object(process_budget, "BudgetExceeded", side_effect=construct_error) as error_call,
             patch.object(process_budget, "budget_observation", side_effect=v1) as state_call,
+            patch.object(process_budget, "capture_observation", side_effect=project) as capture_state_call,
             patch.object(process_budget.time, "monotonic", side_effect=times) as clock,
             patch.object(process_budget.ctypes, "get_last_error", side_effect=lambda: api.last_error, create=True),
             patch.object(process_budget.ctypes, "WinDLL", side_effect=api.load_library, create=True),
         ):
             try:
-                result = process_budget.run(["powershell.exe"], SCRIPTS, 10, capture=True,
-                                            separate=True, inherit_tree=inherit_tree)
-            except (process_budget.BudgetExceeded, OSError) as error:
+                result = process_budget.run(["powershell.exe"], SCRIPTS, 10, capture=capture,
+                                            separate=separate, inherit_tree=inherit_tree)
+            except (original_error, OSError) as error:
                 raised = error
         environment_call.assert_called_once()
         self.assertEqual(list(environment_call.call_args.kwargs["runtime_dirs"]), [])
@@ -2004,18 +2166,33 @@ class ProcessBudgetJobRunTest(unittest.TestCase):
         self.assertEqual(popen.call_args.kwargs, {
             "cwd": SCRIPTS, "env": environment, "bufsize": 0,
             "stdin": subprocess.PIPE if platform == "nt" else None,
-            "stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
+            "stdout": subprocess.PIPE if capture else None,
+            "stderr": (subprocess.PIPE if separate else subprocess.STDOUT) if capture else None,
             "start_new_session": platform != "nt" and not inherit_tree,
         })
         if platform == "nt":
             job.attach.assert_called_once_with(process)
             process.stdin.write.assert_called_once_with(b"1")
             self.assertEqual(process.stdin.close.call_count, 2)
-        self.assertEqual(process.stdout.close.call_count, 1)
-        self.assertEqual(process.stderr.close.call_count, 1)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close.assert_called_once_with()
         process.wait.assert_called_once_with(timeout=10)
-        captured.stop.set.assert_called()
-        captured.snapshot.assert_called_once_with(True)
+        if capture:
+            capture_call.assert_called_once_with(process)
+            captured.stop.set.assert_called()
+            captured.snapshot.assert_called_once_with(separate)
+        else:
+            capture_call.assert_not_called()
+            captured.stop.set.assert_not_called()
+            captured.snapshot.assert_not_called()
+        if failure == "elapsed":
+            error_call.assert_called_once()
+            self.assertIs(raised, created_errors[0])
+            capture_state_call.assert_called_once_with(raised.streams, separate=separate)
+        else:
+            error_call.assert_not_called()
+            capture_state_call.assert_not_called()
         self.assertFalse(api.opened)
         if platform == "nt" and failure == "elapsed" and not query_error:
             api.load_library.assert_called_once_with("KernelBase.dll", use_last_error=True, winmode=0x800)
@@ -2023,7 +2200,8 @@ class ProcessBudgetJobRunTest(unittest.TestCase):
             api.load_library.assert_not_called()
         return SimpleNamespace(
             exception=raised, result=result, events=events, job=job, api=api,
-            state_call=state_call, reader=reader, fake_os=fake_os, process=process, streams=streams,
+            state_call=state_call, capture_state_call=capture_state_call, reader=reader,
+            fake_os=fake_os, process=process, streams=streams if capture else None,
         )
 
     def test_missing_comparison_provider_preserves_timeout_notes_and_cleanup(self):
@@ -2035,17 +2213,19 @@ class ProcessBudgetJobRunTest(unittest.TestCase):
                 self.assertEqual((observed.exception.output, observed.exception.stderr, observed.exception.streams),
                                  (b"out", b"err", observed.streams))
                 notes = observed.exception.__notes__
-                self.assertEqual(len(notes), 2)
-                self.assertEqual(json.loads(notes[0][len(process_budget.JOB_STATE_PREFIX):])["members"],
+                self.assertEqual(len(notes), 3)
+                ProcessBudgetCaptureObservationTest().state(notes[0])
+                self.assertEqual(json.loads(notes[-2][len(process_budget.JOB_STATE_PREFIX):])["members"],
                                  {"status": expected})
-                self.assertEqual(notes[1], (
+                self.assertEqual(notes[-1], (
                     'process_budget_state={"capture_readers":1,"capture_readers_alive":1,"elapsed_ms":10025,'
                     '"process_running":true,"returncode":null,"schema":"pennilogic.process-budget-state/1",'
                     '"setup_ms":25,"status":"observed","wait_ms":10000}'
                 ))
                 observed.job.observation.assert_called_once()
                 self.assertEqual([name for name, _ in observed.events],
-                                 ["attach", "v1_observation", "job_observation", "terminate", "terminate"])
+                                 ["attach", "v1_observation", "job_observation", "terminate",
+                                  "snapshot", "capture_observation", "terminate"])
                 observed.api.OpenProcess.assert_not_called()
                 observed.api.CloseHandle.assert_not_called()
                 observed.reader.join.assert_called_once_with(timeout=10)
@@ -2058,34 +2238,94 @@ class ProcessBudgetJobRunTest(unittest.TestCase):
         observed.job.observation.assert_called_once()
         observed.state_call.assert_called_once()
         events = [name for name, _ in observed.events]
-        self.assertEqual(events, ["attach", "v1_observation", "job_observation", "terminate", "terminate"])
+        self.assertEqual(events, ["attach", "v1_observation", "job_observation", "terminate",
+                                  "snapshot", "capture_observation", "terminate"])
         notes = observed.exception.__notes__
-        self.assertEqual(len(notes), 2)
-        self.assertTrue(notes[0].startswith("process_budget_job_state="))
-        self.assertEqual(notes[1], (
+        self.assertEqual(len(notes), 3)
+        ProcessBudgetCaptureObservationTest().state(notes[0])
+        self.assertTrue(notes[-2].startswith("process_budget_job_state="))
+        self.assertEqual(notes[-1], (
             'process_budget_state={"capture_readers":1,"capture_readers_alive":1,"elapsed_ms":10025,'
             '"process_running":true,"returncode":null,"schema":"pennilogic.process-budget-state/1",'
             '"setup_ms":25,"status":"observed","wait_ms":10000}'
         ))
         observed.reader.join.assert_called_once_with(timeout=10)
 
+    def test_elapsed_failure_has_retained_capture_metadata_before_job_and_v1(self):
+        observed = self.run_mocked()
+        notes = observed.exception.__notes__
+        self.assertTrue(notes[0].startswith("process_budget_capture_state="))
+        self.assertEqual(json.loads(notes[0].split("=", 1)[1]), {
+            "schema": "pennilogic.process-budget-capture-state/1", "status": "observed",
+            "scope": "snapshot", "complete": False, "mode": "separate", **observed.streams,
+        })
+        self.assertTrue(notes[-2].startswith("process_budget_job_state="))
+        self.assertTrue(notes[-1].startswith("process_budget_state="))
+
+    def test_merged_capture_keeps_original_error_and_unused_stderr_metadata(self):
+        observed = self.run_mocked(separate=False)
+        self.assertIs(type(observed.exception), process_budget.BudgetExceeded)
+        self.assertEqual((observed.exception.output, observed.exception.stderr), ("out\nerr", b""))
+        self.assertIs(observed.exception.streams, observed.streams)
+        state = ProcessBudgetCaptureObservationTest().state(observed.exception.__notes__[0])
+        self.assertEqual(state["mode"], "merged")
+        self.assertEqual(state["stdout"], observed.streams["stdout"])
+        self.assertEqual(state["stderr"], observed.streams["stderr"])
+
+    def test_no_capture_is_unavailable_without_invented_bytes_or_hashes(self):
+        for platform in ("nt", "posix"):
+            for separate in (False, True):
+                with self.subTest(platform=platform, separate=separate):
+                    observed = self.run_mocked(platform=platform, capture=False, separate=separate)
+                    self.assertIs(type(observed.exception), process_budget.BudgetExceeded)
+                    self.assertEqual((observed.exception.output, observed.exception.stderr,
+                                      observed.exception.streams), (None, None, None))
+                    self.assertEqual(observed.exception.__notes__[0], process_budget.CAPTURE_STATE_UNAVAILABLE)
+                    self.assertTrue(observed.exception.__notes__[-1].startswith("process_budget_state="))
+                    observed.reader.join.assert_not_called()
+
+    def test_capture_projection_refusals_preserve_original_error_notes_and_cleanup(self):
+        dumps = json.dumps
+        for effect in (TypeError("synthetic-private-projection"), ValueError("synthetic-private-projection"),
+                       RuntimeError("synthetic-private-projection"), "x" * 513, "\u2603", None):
+            def encode(value, **options):
+                if value.get("schema") == "pennilogic.process-budget-capture-state/1":
+                    if isinstance(effect, Exception):
+                        raise effect
+                    return effect
+                return dumps(value, **options)
+
+            with self.subTest(effect=type(effect).__name__), patch.object(process_budget.json, "dumps", side_effect=encode):
+                observed = self.run_mocked()
+            self.assertIs(type(observed.exception), process_budget.BudgetExceeded)
+            self.assertEqual(observed.exception.args, ("Owned process tree exceeded its enforced elapsed budget",))
+            self.assertEqual((observed.exception.output, observed.exception.stderr), (b"out", b"err"))
+            self.assertIs(observed.exception.streams, observed.streams)
+            self.assertEqual(observed.exception.__notes__[0], process_budget.CAPTURE_STATE_UNAVAILABLE)
+            ProcessBudgetJobObservationTest().decode(observed.exception.__notes__[-2])
+            ProcessBudgetObservationTest().state(observed.exception.__notes__[-1])
+            self.assertEqual(observed.job.close.call_count, 2)
+            self.assertEqual(observed.api.QueryInformationJobObject.call_count, 2)
+            observed.reader.join.assert_called_once_with(timeout=10)
+
     def test_unavailable_job_query_preserves_original_timeout_and_existing_cleanup(self):
         observed = self.run_mocked(query_error=5)
         self.assertIs(type(observed.exception), process_budget.BudgetExceeded)
         self.assertEqual(observed.exception.args, ("Owned process tree exceeded its enforced elapsed budget",))
-        note = observed.exception.__notes__[0]
+        note = observed.exception.__notes__[-2]
         self.assertEqual(json.loads(note[len(process_budget.JOB_STATE_PREFIX):])["members"], {"status": "unavailable"})
         self.assertEqual(observed.job.close.call_count, 2)
         self.assertEqual(observed.api.QueryInformationJobObject.call_count, 2)
         observed.api.OpenProcess.assert_not_called()
 
-    def test_non_windows_elapsed_path_remains_v1_only_for_both_tree_modes(self):
+    def test_non_windows_elapsed_adds_capture_before_v1_for_both_tree_modes(self):
         for inherit in (False, True):
             with self.subTest(inherit_tree=inherit):
                 observed = self.run_mocked(platform="posix", inherit_tree=inherit)
                 self.assertIs(type(observed.exception), process_budget.BudgetExceeded)
-                self.assertEqual(len(observed.exception.__notes__), 1)
-                self.assertTrue(observed.exception.__notes__[0].startswith("process_budget_state="))
+                self.assertEqual(len(observed.exception.__notes__), 2)
+                ProcessBudgetCaptureObservationTest().state(observed.exception.__notes__[0])
+                self.assertTrue(observed.exception.__notes__[-1].startswith("process_budget_state="))
                 observed.job.observation.assert_not_called()
                 observed.api.QueryInformationJobObject.assert_not_called()
                 observed.reader.join.assert_called_once_with(timeout=0.1 if inherit else 10)

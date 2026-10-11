@@ -357,6 +357,38 @@ The canonical Infra qualifier owns transport within the matching unittest
 `ERROR` block; a note is neither an exception-allowlist extension nor evidence
 of a complete inventory or a passing test.
 
+After the existing termination and capture snapshot, the elapsed-failure path
+also projects only the original `BudgetExceeded.streams` metadata into an
+additive `process_budget_capture_state=` note. It precedes the existing optional
+Job note and final v1 note, preserving Job-v1 adjacency. There are no new process,
+member or clock queries, output reads, rehashes, waits or changes to the exception.
+The current generated qualifier does not yet transport this new capture note;
+canonical consumer support and adoption are separate work.
+
+Version `pennilogic.process-budget-capture-state/1` uses recursively sorted compact
+ASCII JSON, at most 512 bytes including the prefix. An observed envelope has
+exactly `schema`, `status: "observed"`, `scope: "snapshot"`, `complete: false`,
+`mode: "merged"` or `"separate"`, and `stdout`/`stderr` objects each containing
+exactly `bytes` and `sha256`. Counts are non-boolean integers from 0 through
+18446744073709551615; hashes are exactly 64 lowercase hexadecimal characters.
+A zero count requires the SHA256 of empty bytes. In merged mode, stdout describes
+the merged raw capture and the retained stderr slot must be zero with that empty
+hash; this unused slot does **not** prove that the shell emitted no stderr.
+Separate mode describes each retained stream independently. These are existing
+raw-byte counts/hashes, not hashes of replacement-decoded text or outer unittest
+captures. No arbitrary output, command, private path, raw note or environment is
+projected.
+
+Missing or malformed metadata, an invalid mode, inconsistent merged stderr,
+or a projection/encoding refusal instead emits only
+`{"schema":"pennilogic.process-budget-capture-state/1","status":"unavailable"}`
+after the same prefix, with no invented counts or hashes. The original failure
+and existing notes remain intact. `complete: false` means completeness is not
+established, not that truncation was positively observed: this is only the
+already-retained snapshot after the existing cleanup attempt. It does not prove
+EOF, all child output, process exit, a wait cause or a timeout repair. The
+original v1 schema/384-byte bound and Job schema/512-byte bound are unchanged.
+
 On Windows, the same elapsed-failure boundary also queries only the already-owned
 Job. It attaches `process_budget_job_state=` immediately before the unchanged
 final v1 note. Version `pennilogic.process-budget-job-state/1` has exactly
