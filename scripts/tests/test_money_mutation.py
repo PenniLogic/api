@@ -1090,8 +1090,9 @@ class ProcessBudgetTest(unittest.TestCase):
                     "$r=if(($i -is [bool])-and($o -is [bool])-and($e -is [bool]))"
                     "{'S{0}{1}{2}' -f [int]$i,[int]$o,[int]$e}else{'U'};"
                     "[IO.File]::AppendAllText($pennilogicBoundary,$r,[Text.Encoding]::ASCII);"
-                    + command[-1] + ";"
-                    "[IO.File]::AppendAllText($pennilogicBoundary,'X',[Text.Encoding]::ASCII)"
+                    + "$pennilogicOutput=@(" + command[-1] + ");"
+                    "[IO.File]::AppendAllText($pennilogicBoundary,'X',[Text.Encoding]::ASCII);"
+                    "$pennilogicOutput"
                 )
             result = process_budget.run(command, SCRIPTS, 10, capture=True)
         self.assertEqual(result.returncode, 0)

@@ -330,6 +330,13 @@ Python/JVM/Node startup options, package-manager configuration and unrelated
 credentials are not forwarded. The Windows process-budget bootstrap itself
 uses `-I -S -B` and cannot spawn its child before its owned Job is attached.
 
+The temporary **DIAGNOSTIC COUNTERFACTUAL** in the approved-shell regression
+collects the original `Write-Output` result before recording `X`, then emits it
+through the default output path. This is not a causal repair or proof that the
+original uncaptured output path works. A green changed-shape run cannot release
+merge or acceptance; restore and satisfy the original uncaptured regression
+before accepting a final causal fix.
+
 An elapsed-budget failure samples bounded process state immediately before the
 existing owned termination, then attaches one ASCII `process_budget_state=` JSON
 note to the original `BudgetExceeded`. Successful commands, nonzero exits and
