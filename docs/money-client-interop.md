@@ -355,6 +355,9 @@ under `EU`, before the redirect flags, or during finalization.
 its existing handled failure path. It does not certify a successful JSON write,
 native delegate return, lookup success, entry into the cmdlet, output or pipeline
 completion, cleanup, or cause. Failure to observe `C` is not proof of non-return.
+The marker is untimestamped and collected after the owning command: it does not
+prove the writer returned before the ten-second deadline. The earlier `pre.ms`
+sample precedes the writer invocation and cannot supply that missing ordering.
 Marker append errors use the existing callback-refusal handling; no raw error or
 path is exported. The V2 JSON records and five-record limit are unchanged.
 The paired canonical boundary reader retains every old valid prefix and adds
@@ -452,6 +455,81 @@ increment retained the 2105-byte boundary reader; this composed adoption uses th
 2254-byte inline reader described above. Neither roots, callbacks, `C`, X nor a
 green instrumented test establishes cause, delivery, no-error behavior,
 cleanup, a default-launch repair or merge acceptance.
+
+### Dormant, one-use observer comparison
+
+The original owning test contains an inactive `APPROVED_SHELL_PAIR_ENCLOSURE`
+seam, initialized to `None`. No environment variable, ordinary command or
+generated workflow activates it. With that value unchanged, the original composed
+PowerShell payload, provider call and return/output assertions are unchanged.
+The pair protocol and its synthetic tests do not authorize a real execution.
+
+A separately reviewed owning-suite supervisor may install the enclosure callable
+in the **same discovery-process module instance**. At the original test position,
+the protocol requests a hard 60-second enclosure including a 12-second cleanup
+reserve. This module does not implement or attest that external supervisor.
+Its additional admission checks reserve a complete ten-second work plus existing
+shared ten-second cleanup allowance before either arm, and refuse completion
+after 48 seconds. Neither inner limit is increased or shortened.
+
+The fixed order is required, then `auxiliary-no-lookup-delegates`, each at most
+once. The required arm receives the original command object and calls the same
+provider with the same cwd, capture and assertions. The auxiliary is a copy:
+only its diagnostic file bindings and lookup-observer registration/reporting
+change. Root sampling and its writer remain; Pre/Post delegate construction
+remains but neither is installed, so `Armed` stays false and the existing
+negative-handler guard prevents its installation. The auxiliary omits the
+corresponding observer/terminal records rather than fabricating `armed`,
+unavailable-reason or callback evidence. Its lookup file is intentionally a
+roots-only V2 prefix, not a completed required capsule. The original bare
+`Write-Output`, shell flags, module environment, stdin/capture contract, E/S/X
+operations and stream/hash disposal are unchanged. No new marker is added.
+
+The pair exclusively creates `api106-approved-shell-observer-pair.jsonl` in the
+existing diagnostic directory. This retained claim prevents another pair at
+that location even after failure or interpreter restart; nothing is deleted or
+retried. The auxiliary uses separate, exclusively created
+`api106-approved-shell-auxiliary-boundary.bin` and
+`api106-approved-shell-auxiliary-module-lookup.jsonl`, never the required files.
+The ASCII report has event `api106_approved_shell_observer_pair`, integer `v=1`,
+`diagnostic_only=true`, at most six records, 1024 bytes per record and 4096 total:
+`begin`, then each admitted arm's `started`/`arm`, then `complete` if both
+outcomes can be recorded. An unexecuted arm has an explicit reason instead of a
+process outcome. Partial reports remain partial; `complete` describes arm
+accounting, **not** the external enclosure's later cleanup receipt.
+
+Arm records contain role, outcome, elapsed milliseconds, nullable return code
+and nullable UTF-8 text byte count/hash of returned stdout, not raw output,
+exception text, paths or credentials. Both arms apply the original assertions.
+A required error/failure is re-raised unchanged after the auxiliary, including
+its traceback; an auxiliary success never replaces it. A required process/setup
+or cleanup error prevents the auxiliary when safe ownership completion is
+unknown. Secondary reporting/enclosure failure is chained without erasing the
+required failure. An auxiliary failure is recorded separately and cannot turn
+the required arm's own pass into a claimed required failure, or into pair
+acceptance. An enclosure cannot suppress an incomplete protocol into success.
+Unexpected interruption leaves an incomplete report and propagates.
+
+Hosted activation is still missing: `quality.py test` starts a new unittest
+process, so setting this Python variable in `qualify_windows.py` would not reach
+the owning test. A separately reviewed discovery-process bootstrap and actual
+hard enclosure must preserve the full preceding owning-suite context. The
+canonical qualifier/workflow must also retain and safely project the separate
+pair report and auxiliary evidence even when the required test fails; today's
+collector only handles the required V2 capsule and its inline boundary reader.
+No generated consumer or process-ownership helper is changed by this preparation.
+The new synthetic protocol controls execute after the original test class in
+ordinary discovery ordering; they never run either real arm.
+
+Required-fail/auxiliary-pass would support observer participation only in that
+paired occurrence, not identify a callback or explain the pre-observer failure.
+Two instances of the same stall would show these diagnostic delegates are not
+necessary for that reproduced failure. Pass/pass, inverse results, different
+failures or unmatched preceding state are inconclusive. Fixed order, filesystem
+and module caches, scheduling and separate shell startups remain confounders;
+there is no retry, prewarm or successful-sidecase acceptance. Current and
+historical native failures, complete Windows inventory, API-suite 300-second
+timing, per-test parity and full cleanup obligations remain open.
 
 An elapsed-budget failure samples bounded process state immediately before the
 existing owned termination, then attaches one ASCII `process_budget_state=` JSON

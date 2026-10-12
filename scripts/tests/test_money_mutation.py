@@ -2,6 +2,7 @@
 
 import ast
 from collections import Counter
+from contextlib import contextmanager
 import ctypes
 import errno
 import hashlib
@@ -1381,6 +1382,143 @@ try {
 """
 
 
+# A separately reviewed owning-suite supervisor must install the hard enclosure.
+APPROVED_SHELL_PAIR_ENCLOSURE = None
+
+
+def approved_shell_auxiliary_command(command, boundary, lookup):
+    registration = """                    $s.PreProperty.SetValue($s.Intrinsics,$s.Pre);
+                    $s.PostProperty.SetValue($s.Intrinsics,$s.Post);
+                    if(-not [Object]::ReferenceEquals($s.PreProperty.GetValue($s.Intrinsics),$s.Pre) -or
+                        -not [Object]::ReferenceEquals($s.PostProperty.GetValue($s.Intrinsics),$s.Post)){
+                        throw 'observer-install'
+                    };
+                    $s.Armed=$true;$observerStatus='armed';
+"""
+    observer_record = """    $fields='"phase":"observer","status":"'+$observerStatus+'"';
+    if($observerStatus -ne 'armed'){$fields+=',"code":"'+$observerCode+'"'};
+    $fields+=',"not_found":{"status":"'+$negativeStatus+'"';
+    if($negativeStatus -ne 'armed'){$fields+=',"code":"'+$negativeCode+'"'};
+    $s.Write.Invoke($fields+'}');
+"""
+    if (command[:4] != ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
+            or len(command) != 5 or command[-1].count(APPROVED_SHELL_LOOKUP_SETUP) != 1):
+        raise ValueError("Observer comparison requires the original composed Windows command")
+    setup = APPROVED_SHELL_LOOKUP_SETUP
+    for old, new in ((registration, ""), (observer_record, "    $s.Done=$true;\n")):
+        if setup.count(old) != 1:
+            raise ValueError("Observer comparison setup no longer matches its reviewed seam")
+        setup = setup.replace(old, new, 1)
+    auxiliary = [*command[:4], command[-1].replace(APPROVED_SHELL_LOOKUP_SETUP, setup, 1)]
+    for variable, path, name in (
+        ("pennilogicBoundary", boundary, "api106-approved-shell-auxiliary-boundary.bin"),
+        ("pennilogicLookupPath", lookup, "api106-approved-shell-auxiliary-module-lookup.jsonl"),
+    ):
+        old = "$" + variable + "='" + str(path).replace("'", "''") + "';"
+        new = "$" + variable + "='" + str(path.with_name(name)).replace("'", "''") + "';"
+        if auxiliary[-1].count(old) != 1:
+            raise ValueError("Observer comparison diagnostic binding is not unique")
+        auxiliary[-1] = auxiliary[-1].replace(old, new, 1)
+    return auxiliary
+
+
+def run_approved_shell_observer_pair(case, command, boundary, lookup, *, enclosure):
+    if (boundary.name != "api106-approved-shell-boundary.bin"
+            or lookup != boundary.with_name("api106-approved-shell-module-lookup.jsonl")):
+        raise ValueError("Observer comparison requires the original diagnostic file bindings")
+    required_error, required_traceback = None, None
+    completed = False
+    try:
+        with enclosure(seconds=60, cleanup_reserve=12):
+            started = time.monotonic()
+            for parent in (boundary.parent.parent, boundary.parent):
+                if parent.is_symlink() or parent.is_junction():
+                    raise ValueError("Observer comparison diagnostic area is a reparse point")
+            report = boundary.with_name("api106-approved-shell-observer-pair.jsonl")
+            with report.open("xb") as stream:
+                def record(fields):
+                    data = (json.dumps({
+                        "event": "api106_approved_shell_observer_pair", "v": 1,
+                        "diagnostic_only": True, **fields,
+                    }, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
+                    if len(data) > 1024 or stream.tell() + len(data) > 4096:
+                        raise ValueError("Observer comparison report exceeded its fixed bound")
+                    stream.write(data)
+                    stream.flush()
+
+                record({"phase": "begin", "order": "required-then-auxiliary",
+                        "enclosing_seconds": 60, "cleanup_reserve_seconds": 12,
+                        "arm_work_seconds": 10, "arm_cleanup_seconds": 10})
+                auxiliary = approved_shell_auxiliary_command(command, boundary, lookup)
+                for path in (boundary.with_name("api106-approved-shell-auxiliary-boundary.bin"),
+                             lookup.with_name("api106-approved-shell-auxiliary-module-lookup.jsonl")):
+                    with path.open("xb"):
+                        pass
+                outcomes = {}
+                for role, argv in (("required", command), ("auxiliary-no-lookup-delegates", auxiliary)):
+                    if role != "required" and outcomes["required"] == "process-or-cleanup-error":
+                        outcomes[role] = "not-executed"
+                        record({"phase": "arm", "role": role, "outcome": "not-executed",
+                                "reason": "required-process-or-cleanup-error"})
+                        break
+                    if time.monotonic() - started > 28:
+                        record({"phase": "arm", "role": role, "outcome": "not-executed",
+                                "reason": "insufficient-complete-arm-budget"})
+                        raise TimeoutError("Observer comparison cannot admit another complete 10+10-second arm")
+                    record({"phase": "started", "role": role})
+                    arm_started = time.monotonic()
+                    if arm_started - started > 28:
+                        record({"phase": "arm", "role": role, "outcome": "not-executed",
+                                "reason": "insufficient-complete-arm-budget"})
+                        raise TimeoutError("Observer comparison cannot admit another complete 10+10-second arm")
+                    outcome, error, traceback = "passed", None, None
+                    returncode, stdout = None, None
+                    try:
+                        result = process_budget.run(argv, SCRIPTS, 10, capture=True)
+                        candidate_returncode = result.returncode
+                        if type(candidate_returncode) is not int or not -2147483648 <= candidate_returncode <= 4294967295:
+                            raise ValueError("Observer comparison received an invalid process result")
+                        returncode = candidate_returncode
+                        if type(result.stdout) is not str:
+                            raise ValueError("Observer comparison received an invalid capture result")
+                        data = result.stdout.encode("utf-8", errors="backslashreplace")
+                        stdout = {"text_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+                        case.assertEqual(result.returncode, 0)
+                        case.assertEqual(result.stdout.strip(), "approved-shell")
+                    except (AssertionError, OSError, ValueError, subprocess.TimeoutExpired) as failure:
+                        error, traceback = failure, failure.__traceback__
+                        if isinstance(failure, process_budget.OutputExceeded):
+                            outcome = "output-budget-exceeded"
+                        elif isinstance(failure, process_budget.BudgetExceeded):
+                            outcome = "work-budget-exceeded"
+                        elif isinstance(failure, AssertionError):
+                            outcome = "assertion-failed"
+                        else:
+                            outcome = "process-or-cleanup-error"
+                    if role == "required":
+                        required_error, required_traceback = error, traceback
+                    outcomes[role] = outcome
+                    record({"phase": "arm", "role": role, "outcome": outcome,
+                            "elapsed_ms": int((time.monotonic() - arm_started) * 1000),
+                            "returncode": returncode, "stdout": stdout})
+                if time.monotonic() - started > 48:
+                    raise TimeoutError("Observer comparison exceeded its 48-second work allowance")
+                record({"phase": "complete", "required": outcomes["required"],
+                        "auxiliary": outcomes["auxiliary-no-lookup-delegates"], "acceptance": False})
+            if time.monotonic() - started > 48:
+                raise TimeoutError("Observer comparison finalization exceeded its 48-second work allowance")
+            completed = True
+        if not completed:
+            raise RuntimeError("Observer comparison enclosure suppressed an incomplete protocol")
+    except (AssertionError, OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as failure:
+        if required_error is not None and failure is not required_error:
+            required_error.add_note("Observer comparison also failed in reporting or enclosure; no complete-pair credit")
+            raise required_error.with_traceback(required_traceback) from failure
+        raise
+    if required_error is not None:
+        raise required_error.with_traceback(required_traceback)
+
+
 class ApprovedShellWriterReturnTest(unittest.TestCase):
     """Source controls only; never execute PowerShell or the protected native fixture."""
 
@@ -1766,6 +1904,10 @@ class ProcessBudgetTest(unittest.TestCase):
                     "[IO.File]::AppendAllText($pennilogicBoundary,'X',[Text.Encoding]::ASCII)"
                     + APPROVED_SHELL_LOOKUP_FINISH
                 )
+                if APPROVED_SHELL_PAIR_ENCLOSURE is not None:
+                    return run_approved_shell_observer_pair(
+                        self, command, boundary, lookup, enclosure=APPROVED_SHELL_PAIR_ENCLOSURE,
+                    )
             result = process_budget.run(command, SCRIPTS, 10, capture=True)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout.strip(), "approved-shell")
@@ -3580,6 +3722,437 @@ class ProcessBudgetJobRunTest(unittest.TestCase):
         observed.reader.join.assert_called_once_with(timeout=0.125)
         observed.process.wait.assert_called_once_with(timeout=0.125)
         self.assertEqual(observed.job.remaining_cleanup.call_count, 2)
+
+
+class WindowsShellObserverPairProtocolTest(unittest.TestCase):
+    """Synthetic protocol controls; no shell, provider or enclosure executes."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root, self.sequence, self.now = Path(temporary.name), 0, 0
+        self.arm_runner = self.enterContext(patch.object(
+            process_budget, "run", side_effect=AssertionError("Synthetic arm outcome not supplied"),
+        ))
+        self.popen = self.enterContext(patch.object(
+            subprocess, "Popen", side_effect=AssertionError("Native execution is forbidden in protocol controls"),
+        ))
+        self.enterContext(patch.object(time, "monotonic", side_effect=lambda: self.now))
+        self.enclosure_calls = []
+
+        @contextmanager
+        def enclosure(**kwargs):
+            self.enclosure_calls.append(kwargs)
+            yield
+
+        self.enclosure = enclosure
+
+    def tearDown(self):
+        self.popen.assert_not_called()
+
+    def inputs(self):
+        self.sequence += 1
+        directory = self.root / str(self.sequence) / "build" / "diagnostics"
+        directory.mkdir(parents=True)
+        boundary = directory / "api106-approved-shell-boundary.bin"
+        lookup = directory / "api106-approved-shell-module-lookup.jsonl"
+        for path in (boundary, lookup):
+            with path.open("xb"):
+                pass
+        command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Write-Output 'approved-shell'"]
+        assignment, = [item for item in ast.walk(ApprovedShellWriterReturnTest().fixture())
+                       if isinstance(item, ast.Assign) and len(item.targets) == 1
+                       and ast.unparse(item.targets[0]) == "command[-1]"]
+        command[-1] = eval(compile(ast.Expression(assignment.value), "<synthetic-command-shape>", "eval"), {
+            "__builtins__": {}, "str": str, "command": command, "boundary": boundary, "lookup": lookup,
+            "APPROVED_SHELL_LOOKUP_SETUP": APPROVED_SHELL_LOOKUP_SETUP,
+            "APPROVED_SHELL_LOOKUP_FINISH": APPROVED_SHELL_LOOKUP_FINISH,
+        })
+        return command, boundary, lookup
+
+    def result(self, code=0, stdout="approved-shell\n"):
+        return subprocess.CompletedProcess(["synthetic-only"], code, stdout)
+
+    def invoke(self, inputs):
+        return run_approved_shell_observer_pair(self, *inputs, enclosure=self.enclosure)
+
+    def records(self, inputs):
+        def reject_constant(_):
+            self.fail("Observer comparison report contains a non-JSON numeric constant")
+
+        path = inputs[1].with_name("api106-approved-shell-observer-pair.jsonl")
+        data = path.read_bytes()
+        self.assertLessEqual(len(data), 4096)
+        data.decode("ascii")
+        records = [json.loads(line, parse_constant=reject_constant) for line in data.splitlines()]
+        self.assertLessEqual(len(records), 6)
+        return records
+
+    def malformed_returncodes(self):
+        return (
+            ("string", "synthetic-rejected-result"),
+            ("true", True), ("false", False),
+            ("nested-mapping", {"synthetic-rejected-result": {"nested": ["private"]}}),
+            ("nested-sequence", ["synthetic-rejected-result", {"nested": "private"}]),
+            ("nonserializable", object()),
+            ("nan", float("nan")), ("positive-infinity", float("inf")),
+            ("negative-infinity", float("-inf")), ("float-zero", 0.0), ("none", None),
+            ("below-range", -2147483649), ("above-range", 4294967296),
+        )
+
+    def malformed_captures(self):
+        return tuple((name, value) for name, value in self.malformed_returncodes() if type(value) is not str) + (
+            ("bytes", b"synthetic-rejected-result"),
+        )
+
+    def assert_invalid_arm(self, inputs, role, returncode):
+        records = self.records(inputs)
+        arm, = [item for item in records if item.get("role") == role and item["phase"] == "arm"]
+        self.assertEqual(arm, {
+            "event": "api106_approved_shell_observer_pair", "v": 1, "diagnostic_only": True,
+            "phase": "arm", "role": role, "outcome": "process-or-cleanup-error", "elapsed_ms": 0,
+            "returncode": returncode, "stdout": None,
+        })
+        raw = inputs[1].with_name("api106-approved-shell-observer-pair.jsonl").read_text(encoding="ascii")
+        self.assertNotIn("synthetic-rejected-result", raw)
+        self.assertFalse(records[-1]["acceptance"])
+        return records
+
+    def test_required_malformed_returncode_is_null_and_prevents_auxiliary(self):
+        for name, value in self.malformed_returncodes():
+            with self.subTest(value=name):
+                inputs = self.inputs()
+                self.arm_runner.reset_mock()
+                self.arm_runner.side_effect = [self.result(value), self.result()]
+                with self.assertRaisesRegex(ValueError, "^Observer comparison received an invalid process result$") as observed:
+                    self.invoke(inputs)
+                self.assertIs(type(observed.exception), ValueError)
+                self.assertIsNone(observed.exception.__cause__)
+                self.arm_runner.assert_called_once()
+                records = self.assert_invalid_arm(inputs, "required", None)
+                self.assertEqual(records[-1]["required"], "process-or-cleanup-error")
+                self.assertEqual(records[-1]["auxiliary"], "not-executed")
+                self.assertEqual(records[-2]["reason"], "required-process-or-cleanup-error")
+
+    def test_required_malformed_capture_is_null_and_prevents_auxiliary(self):
+        for name, value in self.malformed_captures():
+            with self.subTest(value=name):
+                inputs = self.inputs()
+                self.arm_runner.reset_mock()
+                self.arm_runner.side_effect = [self.result(stdout=value), self.result()]
+                with self.assertRaisesRegex(ValueError, "^Observer comparison received an invalid capture result$") as observed:
+                    self.invoke(inputs)
+                self.assertIs(type(observed.exception), ValueError)
+                self.assertIsNone(observed.exception.__cause__)
+                self.arm_runner.assert_called_once()
+                records = self.assert_invalid_arm(inputs, "required", 0)
+                self.assertEqual(records[-1]["required"], "process-or-cleanup-error")
+                self.assertEqual(records[-1]["auxiliary"], "not-executed")
+
+    def test_auxiliary_malformed_result_cannot_change_required_outcome(self):
+        for field, cases in (("code", self.malformed_returncodes()), ("stdout", self.malformed_captures())):
+            for name, value in cases:
+                for required in ("passed", "work-budget-exceeded", "assertion-failed"):
+                    with self.subTest(field=field, value=name, required=required):
+                        inputs = self.inputs()
+                        error = (process_budget.BudgetExceeded("") if required == "work-budget-exceeded"
+                                 else AssertionError("synthetic required failure") if required == "assertion-failed"
+                                 else None)
+                        if error is not None:
+                            error.add_note("synthetic original required note")
+                        self.arm_runner.reset_mock()
+                        self.arm_runner.side_effect = [
+                            self.result() if error is None else error, self.result(**{field: value}),
+                        ]
+                        if error is None:
+                            self.invoke(inputs)
+                        else:
+                            with self.assertRaises(type(error)) as observed:
+                                self.invoke(inputs)
+                            self.assertIs(observed.exception, error)
+                            self.assertIsNone(error.__cause__)
+                            self.assertEqual(error.__notes__, ["synthetic original required note"])
+                        self.assertEqual(self.arm_runner.call_count, 2)
+                        records = self.assert_invalid_arm(
+                            inputs, "auxiliary-no-lookup-delegates", None if field == "code" else 0,
+                        )
+                        self.assertEqual(records[-1]["required"], required)
+                        self.assertEqual(records[-1]["auxiliary"], "process-or-cleanup-error")
+
+    def test_valid_exit_and_signal_codes_keep_existing_assertion_semantics(self):
+        for role in ("required", "auxiliary-no-lookup-delegates"):
+            for code in (-2147483648, -15, -1, 0, 1, 255, 2147483647, 4294967295):
+                with self.subTest(role=role, code=code):
+                    inputs = self.inputs()
+                    self.arm_runner.reset_mock()
+                    self.arm_runner.side_effect = ([self.result(code), self.result()] if role == "required"
+                                                   else [self.result(), self.result(code)])
+                    if role == "required" and code:
+                        with self.assertRaises(AssertionError):
+                            self.invoke(inputs)
+                    else:
+                        self.invoke(inputs)
+                    self.assertEqual(self.arm_runner.call_count, 2)
+                    records = self.records(inputs)
+                    arm, = [item for item in records if item.get("role") == role and item["phase"] == "arm"]
+                    self.assertIs(type(arm["returncode"]), int)
+                    self.assertEqual(arm["returncode"], code)
+                    self.assertEqual(arm["outcome"], "assertion-failed" if code else "passed")
+                    self.assertEqual(records[-1]["required"],
+                                     "assertion-failed" if role == "required" and code else "passed")
+                    self.assertFalse(records[-1]["acceptance"])
+
+    def test_default_seam_is_dormant_and_original_method_keeps_its_position(self):
+        module = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        assignment, = [item for item in module.body if isinstance(item, ast.Assign)
+                       and ast.unparse(item.targets[0]) == "APPROVED_SHELL_PAIR_ENCLOSURE"]
+        self.assertIsNone(ast.literal_eval(assignment.value))
+        method = ApprovedShellWriterReturnTest().fixture()
+        gate, = [item for item in ast.walk(method) if isinstance(item, ast.If)
+                 and ast.unparse(item.test) == "APPROVED_SHELL_PAIR_ENCLOSURE is not None"]
+        self.assertEqual(len(gate.body), 1)
+        self.assertIsInstance(gate.body[0], ast.Return)
+        self.assertEqual(ast.unparse(gate.body[0].value), (
+            "run_approved_shell_observer_pair(self, command, boundary, lookup, "
+            "enclosure=APPROVED_SHELL_PAIR_ENCLOSURE)"
+        ))
+        self.assertNotIn("environ", ast.unparse(gate))
+        self.assertNotIn("load_tests", [item.name for item in module.body if isinstance(item, ast.FunctionDef)])
+
+    def test_auxiliary_only_omits_registration_and_corresponding_observer_records(self):
+        command, boundary, lookup = self.inputs()
+        original = list(command)
+        auxiliary = approved_shell_auxiliary_command(command, boundary, lookup)
+        self.assertEqual(command, original)
+        self.assertEqual(auxiliary[:4], command[:4])
+        setup = auxiliary[-1].split("$i=[Console]::IsInputRedirected;", 1)[0]
+        self.assertNotIn("$s.PreProperty.SetValue($s.Intrinsics,$s.Pre);", setup)
+        self.assertNotIn("$s.PostProperty.SetValue($s.Intrinsics,$s.Post);", setup)
+        self.assertNotIn("$s.Armed=$true", setup)
+        self.assertIn("if($s.Armed){", setup)
+        self.assertIn("$s.NotFoundProperty.SetValue($s.Intrinsics,$s.NotFound);", setup)
+        self.assertIn("$s.Done=$true;\n} catch {", setup)
+        self.assertNotIn("""$fields='"phase":"observer" """.strip(), setup)
+        root_prefix = APPROVED_SHELL_LOOKUP_SETUP.split("$observerStatus='unavailable';", 1)[0]
+        self.assertIn(root_prefix, auxiliary[-1])
+        self.assertTrue(auxiliary[-1].endswith(APPROVED_SHELL_LOOKUP_FINISH))
+        self.assertEqual(auxiliary[-1].count("Write-Output 'approved-shell';"), 1)
+        required_tail = command[-1].split("$i=[Console]::IsInputRedirected;", 1)[1]
+        self.assertEqual(auxiliary[-1].split("$i=[Console]::IsInputRedirected;", 1)[1], required_tail)
+
+    def test_required_command_cwd_caps_environment_and_assertions_are_unchanged(self):
+        inputs = self.inputs()
+        self.arm_runner.side_effect = [self.result(), self.result()]
+        self.invoke(inputs)
+        self.assertEqual(self.enclosure_calls, [{"seconds": 60, "cleanup_reserve": 12}])
+        self.assertEqual(self.arm_runner.call_count, 2)
+        self.assertIs(self.arm_runner.call_args_list[0].args[0], inputs[0])
+        for call in self.arm_runner.call_args_list:
+            self.assertEqual(call.args[1:], (SCRIPTS, 10))
+            self.assertEqual(call.kwargs, {"capture": True})
+        records = self.records(inputs)
+        self.assertEqual([item["role"] for item in records if item["phase"] == "started"],
+                         ["required", "auxiliary-no-lookup-delegates"])
+        self.assertEqual((records[-1]["required"], records[-1]["auxiliary"]), ("passed", "passed"))
+        self.assertFalse(records[-1]["acceptance"])
+        self.assertEqual(inputs[1].read_bytes(), b"")
+        self.assertEqual(inputs[2].read_bytes(), b"")
+
+    def test_required_timeout_is_not_replaced_by_auxiliary_success(self):
+        inputs = self.inputs()
+        error = process_budget.BudgetExceeded("")
+        error.add_note("synthetic original note")
+        self.arm_runner.side_effect = [error, self.result()]
+        with self.assertRaises(process_budget.BudgetExceeded) as observed:
+            self.invoke(inputs)
+        self.assertIs(observed.exception, error)
+        self.assertEqual(error.__notes__, ["synthetic original note"])
+        self.assertEqual(self.records(inputs)[-1]["required"], "work-budget-exceeded")
+        self.assertEqual(self.records(inputs)[-1]["auxiliary"], "passed")
+        self.assertEqual(self.arm_runner.call_count, 2)
+
+    def test_required_exit_and_output_assertions_still_fail_independently(self):
+        for result in (self.result(7), self.result(stdout="not-approved-shell")):
+            with self.subTest(code=result.returncode, stdout=result.stdout):
+                inputs = self.inputs()
+                self.arm_runner.side_effect = [result, self.result()]
+                with self.assertRaises(AssertionError):
+                    self.invoke(inputs)
+                self.assertEqual(self.records(inputs)[-1]["required"], "assertion-failed")
+                self.assertEqual(self.records(inputs)[-1]["auxiliary"], "passed")
+
+    def test_auxiliary_failure_is_explicit_but_not_the_required_arm_result(self):
+        for result in (self.result(9), self.result(stdout="different"), process_budget.BudgetExceeded("")):
+            with self.subTest(result=type(result).__name__):
+                inputs = self.inputs()
+                self.arm_runner.side_effect = [self.result(), result]
+                self.invoke(inputs)
+                records = self.records(inputs)
+                self.assertEqual(records[-1]["required"], "passed")
+                self.assertIn(records[-1]["auxiliary"], ("assertion-failed", "work-budget-exceeded"))
+                self.assertFalse(records[-1]["acceptance"])
+
+    def test_unknown_required_ownership_or_cleanup_error_prevents_auxiliary(self):
+        for error in (OSError("synthetic handle failure"), TimeoutError("synthetic cleanup limit"),
+                      ValueError("synthetic setup refusal"), subprocess.TimeoutExpired("synthetic", 10)):
+            with self.subTest(error=type(error).__name__):
+                inputs = self.inputs()
+                self.arm_runner.reset_mock()
+                self.arm_runner.side_effect = error
+                with self.assertRaises(type(error)) as observed:
+                    self.invoke(inputs)
+                self.assertIs(observed.exception, error)
+                self.arm_runner.assert_called_once()
+                self.assertEqual(self.records(inputs)[-1]["auxiliary"], "not-executed")
+
+    def test_auxiliary_cleanup_failure_cannot_erase_required_timeout(self):
+        inputs = self.inputs()
+        error = process_budget.BudgetExceeded("")
+        self.arm_runner.side_effect = [error, TimeoutError("synthetic auxiliary cleanup limit")]
+        with self.assertRaises(process_budget.BudgetExceeded) as observed:
+            self.invoke(inputs)
+        self.assertIs(observed.exception, error)
+        self.assertEqual(self.records(inputs)[-1]["auxiliary"], "process-or-cleanup-error")
+
+    def test_enclosure_failure_preserves_required_exception_and_secondary_cause(self):
+        @contextmanager
+        def enclosure(**kwargs):
+            yield
+            raise TimeoutError("synthetic enclosing cleanup limit")
+
+        inputs = self.inputs()
+        error = process_budget.BudgetExceeded("")
+        self.arm_runner.side_effect = [error, self.result()]
+        self.enclosure = enclosure
+        with self.assertRaises(process_budget.BudgetExceeded) as observed:
+            self.invoke(inputs)
+        self.assertIs(observed.exception, error)
+        self.assertIsInstance(error.__cause__, TimeoutError)
+        self.assertIn("no complete-pair credit", error.__notes__[-1])
+
+    def test_enclosure_failure_after_required_success_is_not_silenced(self):
+        @contextmanager
+        def enclosure(**kwargs):
+            yield
+            raise TimeoutError("synthetic enclosing cleanup limit")
+
+        self.enclosure = enclosure
+        self.arm_runner.side_effect = [self.result(), self.result()]
+        with self.assertRaisesRegex(TimeoutError, "enclosing cleanup"):
+            self.invoke(self.inputs())
+
+    def test_enclosure_cannot_suppress_prearm_failure_as_success(self):
+        @contextmanager
+        def enclosure(**kwargs):
+            try:
+                yield
+            except ValueError:
+                pass
+
+        self.enclosure = enclosure
+        inputs = self.inputs()
+        inputs[0][1] = "-File"
+        with self.assertRaisesRegex(RuntimeError, "incomplete protocol"):
+            self.invoke(inputs)
+        self.arm_runner.assert_not_called()
+        self.assertNotIn("complete", [record["phase"] for record in self.records(inputs)])
+
+    def test_budget_reserve_refuses_auxiliary_without_changing_its_inner_limit(self):
+        inputs = self.inputs()
+
+        def slow_required(*args, **kwargs):
+            self.now = 29
+            return self.result()
+
+        self.arm_runner.side_effect = slow_required
+        with self.assertRaisesRegex(TimeoutError, "complete 10\\+10-second arm"):
+            self.invoke(inputs)
+        self.arm_runner.assert_called_once()
+        self.assertEqual(self.records(inputs)[-1]["reason"], "insufficient-complete-arm-budget")
+
+    def test_budget_is_checked_again_after_the_start_record(self):
+        inputs = self.inputs()
+        with patch.object(time, "monotonic", side_effect=[0, 0, 29]):
+            with self.assertRaisesRegex(TimeoutError, "complete 10\\+10-second arm"):
+                self.invoke(inputs)
+        self.arm_runner.assert_not_called()
+        self.assertEqual(self.records(inputs)[-1]["outcome"], "not-executed")
+
+    def test_late_pair_cannot_report_completion(self):
+        inputs = self.inputs()
+
+        def late_auxiliary(*args, **kwargs):
+            if self.arm_runner.call_count == 2:
+                self.now = 49
+            return self.result()
+
+        self.arm_runner.side_effect = late_auxiliary
+        with self.assertRaisesRegex(TimeoutError, "48-second work"):
+            self.invoke(inputs)
+        self.assertEqual(self.arm_runner.call_count, 2)
+        self.assertNotIn("complete", [record["phase"] for record in self.records(inputs)])
+
+    def test_late_report_finalization_cannot_become_success(self):
+        inputs = self.inputs()
+        self.arm_runner.side_effect = [self.result(), self.result()]
+        with patch.object(time, "monotonic", side_effect=[0] * 8 + [49]):
+            with self.assertRaisesRegex(TimeoutError, "finalization"):
+                self.invoke(inputs)
+        self.assertEqual(self.arm_runner.call_count, 2)
+        self.assertFalse(self.records(inputs)[-1]["acceptance"])
+
+    def test_claim_and_each_auxiliary_file_are_exclusive_and_never_removed(self):
+        for name in ("api106-approved-shell-observer-pair.jsonl",
+                     "api106-approved-shell-auxiliary-boundary.bin",
+                     "api106-approved-shell-auxiliary-module-lookup.jsonl"):
+            with self.subTest(name=name):
+                inputs = self.inputs()
+                path = inputs[1].with_name(name)
+                path.write_bytes(b"synthetic prior observation")
+                with self.assertRaises(FileExistsError):
+                    self.invoke(inputs)
+                self.assertEqual(path.read_bytes(), b"synthetic prior observation")
+                self.arm_runner.assert_not_called()
+
+    def test_second_invocation_cannot_repeat_either_arm(self):
+        inputs = self.inputs()
+        self.arm_runner.side_effect = [self.result(), self.result()]
+        self.invoke(inputs)
+        before = self.records(inputs)
+        with self.assertRaises(FileExistsError):
+            self.invoke(inputs)
+        self.assertEqual(self.arm_runner.call_count, 2)
+        self.assertEqual(self.records(inputs), before)
+
+    def test_unknown_flags_setup_or_bindings_refuse_before_either_arm(self):
+        for change in ("flags", "setup", "duplicate-binding"):
+            with self.subTest(change=change):
+                command, boundary, lookup = self.inputs()
+                if change == "flags":
+                    command[1] = "-File"
+                elif change == "setup":
+                    command[-1] = command[-1].replace(APPROVED_SHELL_LOOKUP_SETUP, "")
+                else:
+                    command[-1] += "$pennilogicBoundary='" + str(boundary).replace("'", "''") + "';"
+                with self.assertRaises(ValueError):
+                    self.invoke((command, boundary, lookup))
+                self.arm_runner.assert_not_called()
+
+    def test_report_has_no_raw_output_exception_text_or_paths(self):
+        inputs = self.inputs()
+        secret = "synthetic-private-diagnostic-text"
+        self.arm_runner.side_effect = [self.result(stdout=secret), OSError(secret)]
+        with self.assertRaises(AssertionError):
+            self.invoke(inputs)
+        records = self.records(inputs)
+        text = json.dumps(records)
+        self.assertNotIn(secret, text)
+        self.assertNotIn(str(self.root), text)
+        self.assertNotIn("powershell.exe", text)
+        required, = [item for item in records if item.get("role") == "required" and item["phase"] == "arm"]
+        self.assertEqual(required["stdout"], {
+            "text_bytes": len(secret), "sha256": hashlib.sha256(secret.encode()).hexdigest(),
+        })
 
 
 if __name__ == "__main__":
