@@ -210,6 +210,38 @@ class RuntimeFingerprintTest(unittest.TestCase):
                 {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}, snapshot[str(executable)],
             )
 
+    def test_money_report_inventory_follows_the_authoritative_owner(self):
+        directory = self.root / "build/test-results/test"
+        directory.mkdir(parents=True)
+        suite, money = primitive_fixture(directory)
+        general = directory / "TEST-general.xml"
+        general.write_text(
+            '<testsuite name="com.pennilogic.testing.MoneyWirePropertyTest" tests="1" '
+            'skipped="0" failures="0" errors="0"><testcase '
+            'classname="com.pennilogic.testing.MoneyWirePropertyTest" name="property()"/></testsuite>',
+            encoding="utf-8",
+        )
+        legacy = self.root / "build/test-results/moneyTest/TEST-primitive.xml"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes(money.read_bytes())
+        original = mutation.input_snapshot(self.config)
+        self.assertEqual(mutation.file_record(money), original[str(money)])
+        self.assertNotIn(str(general), original)
+        self.assertNotIn(str(legacy), original)
+        self.assertEqual("com.pennilogic.money.", mutation.TEST_PACKAGE)
+        general.write_text(general.read_text(encoding="utf-8").replace("property()", "anotherProperty()"), encoding="utf-8")
+        legacy.write_bytes(b"stale non-owner data must not be read")
+        self.assertEqual(original, mutation.input_snapshot(self.config))
+        suite.set("timestamp", "synthetic-new-execution")
+        ET.ElementTree(suite).write(money)
+        current = mutation.input_snapshot(self.config)
+        self.assertNotEqual(original[str(money)], current[str(money)])
+        self.assertEqual(mutation.file_record(money), current[str(money)])
+        money.unlink()
+        self.assertNotIn(str(money), mutation.input_snapshot(self.config))
+        with self.assertRaisesRegex(ValueError, "executed target tests"):
+            quality.money_test_metrics(self.root)
+
     def test_runtime_link_chain_and_retargeted_endpoint_or_bytes_change_snapshot(self):
         middle, selected = self.root / "middle", self.root / "any-runtime-name"
         self.link(middle, self.executable)
@@ -425,7 +457,7 @@ class MutationReportTest(unittest.TestCase):
 class PrimitiveModelEvidenceTest(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.directory = self.root / "build/test-results/moneyTest"
+        self.directory = self.root / "build/test-results/test"
         self.directory.mkdir(parents=True)
         properties = ET.Element("testsuite", {"tests": "3", "failures": "0", "errors": "0", "skipped": "0"})
         for name in ("round_trip", "associativity", "collision_keys"):
@@ -458,6 +490,61 @@ class PrimitiveModelEvidenceTest(unittest.TestCase):
             "status": "passed", "representation": "jdk_big_integer", "comparisons": 45, "disagreements": 0,
             "categories": dict(zip(PRIMITIVE_METHODS, range(1, 10))),
         }, evidence["primitive_model"])
+
+    def test_ordinary_property_suite_remains_in_total_metrics_but_not_money_evidence(self):
+        path = self.directory / "TEST-wire-property.xml"
+        path.write_text(
+            '<testsuite name="com.pennilogic.testing.MoneyWirePropertyTest" tests="1" '
+            'skipped="0" failures="0" errors="0"><testcase '
+            'classname="com.pennilogic.testing.MoneyWirePropertyTest" name="property()"/></testsuite>',
+            encoding="utf-8",
+        )
+        self.assertEqual({self.path, self.properties}, set(quality.money_test_reports(self.root)))
+        self.assertEqual(12, self.metrics()["target_tests"])
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            quality.test_metrics(self.root)
+        self.assertEqual({"event": "tests", "count": 13, "skipped": 0, "failed": 0}, json.loads(output.getvalue()))
+
+    def test_legacy_money_task_reports_neither_supply_nor_duplicate_current_evidence(self):
+        legacy = self.root / "build/test-results/moneyTest"
+        legacy.mkdir(parents=True)
+        for path in (self.path, self.properties):
+            (legacy / path.name).write_bytes(path.read_bytes())
+        self.assertEqual(12, self.metrics()["target_tests"])
+        self.path.unlink()
+        with self.assertRaisesRegex(ValueError, "primitive"):
+            self.metrics()
+        self.save()
+        self.properties.unlink()
+        with self.assertRaisesRegex(ValueError, "property case evidence is missing"):
+            self.metrics()
+        self.path.unlink()
+        with self.assertRaisesRegex(ValueError, "executed target tests"):
+            self.metrics()
+
+    def test_duplicate_owner_reports_are_refused_not_deduplicated(self):
+        (self.directory / "TEST-duplicate.xml").write_bytes(self.path.read_bytes())
+        with self.assertRaisesRegex(ValueError, "duplicate case"):
+            self.metrics()
+
+    def test_money_named_report_cannot_hide_unrelated_cases(self):
+        for named_by_file in (False, True):
+            name = "com.pennilogic.money.UnrelatedTest" if named_by_file else "unrelated"
+            path = self.directory / f"TEST-{name}.xml"
+            suite_name = "unrelated" if named_by_file else "com.pennilogic.money.UnrelatedTest"
+            path.write_text(
+                f'<testsuite name="{suite_name}" tests="1" skipped="0" failures="0" errors="0">'
+                '<testcase classname="unrelated.Test" name="case()"/></testsuite>',
+                encoding="utf-8",
+            )
+            with self.subTest(named_by_file=named_by_file), self.assertRaisesRegex(ValueError, "unrelated"):
+                self.metrics()
+            path.unlink()
+        mixed = ET.parse(self.properties)
+        mixed.getroot().find("testcase").set("classname", "unrelated.Test")
+        mixed.write(self.properties)
+        with self.assertRaisesRegex(ValueError, "unrelated"):
+            self.metrics()
 
     def test_missing_suite_or_each_category_refuses_and_restores(self):
         self.path.unlink()
@@ -582,7 +669,7 @@ class MutationEvidenceTest(unittest.TestCase):
     def test_provider_properties_without_primitive_model_refuse(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            directory = root / "build/test-results/moneyTest"
+            directory = root / "build/test-results/test"
             directory.mkdir(parents=True)
             suite = ET.Element("testsuite", {"tests": "3", "failures": "0", "errors": "0", "skipped": "0"})
             for name in ("round_trip", "associativity", "collision_keys"):
@@ -804,7 +891,7 @@ class MutationEvidenceTest(unittest.TestCase):
     def test_property_metrics_require_executed_categories_and_do_not_invent_an_oracle(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            directory = root / "build/test-results/moneyTest"
+            directory = root / "build/test-results/test"
             directory.mkdir(parents=True)
             primitive_fixture(directory)
             suite = ET.Element("testsuite", {"tests": "3", "failures": "0", "errors": "0", "skipped": "0"})
@@ -935,7 +1022,8 @@ class MutationNativeConsoleTest(unittest.TestCase):
 
 APPROVED_SHELL_LOOKUP_SETUP = r"""
 $script:pennilogicLookup=@{File=$null;Clock=$null;Hash=$null;Write=$null;Bytes=0;Records=0;
-    Failed=$false;Armed=$false;Seen=$false;Done=$false;Start=$null;Pre=$null;Post=$null};
+    Failed=$false;Armed=$false;Seen=$false;Done=$false;Start=$null;Pre=$null;Post=$null;
+    NegativeArmed=$false;NegativeSeen=$false;NegativeStart=$null;NotFound=$null};
 try {
     $s=$script:pennilogicLookup;
     $attributes=[IO.File]::GetAttributes($pennilogicLookupPath);
@@ -956,8 +1044,8 @@ try {
         if($w.Failed){return};
         try {
             if($fields -match '[^\x20-\x7e]'){throw 'capture-encoding'};
-            $bytes=[Text.Encoding]::ASCII.GetBytes('{"v":1,'+$fields+"}`n");
-            if($bytes.Length -gt 6144 -or $w.Records -ge 4 -or
+            $bytes=[Text.Encoding]::ASCII.GetBytes('{"v":2,'+$fields+"}`n");
+            if($bytes.Length -gt 6144 -or $w.Records -ge 5 -or
                 $w.Bytes+$bytes.Length -gt 8192 -or $w.File.Length -ne $w.Bytes){
                 throw 'capture-limit'
             };
@@ -1065,7 +1153,8 @@ try {
                             };
                             $ms=$p.Clock.ElapsedMilliseconds;$time='null';$elapsed='null';
                             if($ms -ge 0 -and $ms -le 600000 -and
-                                ($null -eq $p.Start -or $ms -ge $p.Start)){
+                                ($null -eq $p.Start -or $ms -ge $p.Start) -and
+                                ($null -eq $p.NegativeStart -or $ms -ge $p.NegativeStart)){
                                 $time=$ms.ToString($p.Invariant);
                                 if($null -ne $p.Start -and $ms -ge $p.Start){
                                     $elapsed=($ms-$p.Start).ToString($p.Invariant)
@@ -1112,9 +1201,60 @@ try {
             }
         }
     };
+    $negativeStatus='unavailable';$negativeCode='observer-unavailable';
+    if($s.Armed){
+        $negativeCode='unsupported-api';
+        try {
+            $s.NotFoundProperty=$intrinsicsType.GetProperty('CommandNotFoundAction');
+            if($null -ne $s.NotFoundProperty -and
+                $null -ne $s.NotFoundProperty.GetGetMethod() -and
+                -not $s.NotFoundProperty.GetGetMethod().IsVirtual -and
+                $null -ne $s.NotFoundProperty.GetSetMethod() -and
+                $s.NotFoundProperty.PropertyType -eq $s.PreProperty.PropertyType){
+                $negativeCode='existing-hook';
+                if($null -eq $s.NotFoundProperty.GetValue($s.Intrinsics)){
+                    $s.NotFound=[EventHandler[System.Management.Automation.CommandLookupEventArgs]]{
+                        param($sender,$lookupEvent)
+                        $p=$script:pennilogicLookup;
+                        if(-not $p.Armed -or -not $p.NegativeArmed -or $p.Done -or $p.Failed){return};
+                        try {
+                            if(-not [StringComparer]::OrdinalIgnoreCase.Equals(
+                                $p.NameProperty.GetValue($lookupEvent),'Write-Output')){return};
+                            if(-not $p.Seen){
+                                $p.Done=$true;
+                                $p.Write.Invoke('"phase":"post","status":"unavailable","code":"post-without-pre"');
+                                return
+                            };
+                            if($p.NegativeSeen){
+                                $p.Done=$true;
+                                $p.Write.Invoke('"phase":"post","status":"unavailable","code":"nested-target"');
+                                return
+                            };
+                            $p.NegativeSeen=$true;$ms=$p.Clock.ElapsedMilliseconds;$time='null';
+                            if($ms -ge 0 -and $ms -le 600000 -and
+                                ($null -eq $p.Start -or $ms -ge $p.Start)){
+                                $p.NegativeStart=$ms;$time=$ms.ToString($p.Invariant)
+                            };
+                            $p.Write.Invoke('"phase":"not-found","status":"observed","ms":'+$time);
+                        } catch {
+                            $p.Done=$true;
+                            $p.Write.Invoke('"phase":"post","status":"refused","code":"callback"');
+                        }
+                    };
+                    $s.NotFoundProperty.SetValue($s.Intrinsics,$s.NotFound);
+                    if(-not [Object]::ReferenceEquals($s.NotFoundProperty.GetValue($s.Intrinsics),$s.NotFound)){
+                        throw 'negative-observer-install'
+                    };
+                    $s.NegativeArmed=$true;$negativeStatus='armed';
+                }
+            }
+        } catch {$negativeStatus='refused';$negativeCode='install'}
+    };
     $fields='"phase":"observer","status":"'+$observerStatus+'"';
     if($observerStatus -ne 'armed'){$fields+=',"code":"'+$observerCode+'"'};
-    $s.Write.Invoke($fields);
+    $fields+=',"not_found":{"status":"'+$negativeStatus+'"';
+    if($negativeStatus -ne 'armed'){$fields+=',"code":"'+$negativeCode+'"'};
+    $s.Write.Invoke($fields+'}');
 } catch {
     if(-not $script:pennilogicLookup.Failed){
         $script:pennilogicLookup.Failed=$true;
@@ -1135,6 +1275,8 @@ try {
         $s.PreProperty.GetValue($s.Intrinsics),$s.Pre)){$s.PreProperty.SetValue($s.Intrinsics,$null)};
     if($null -ne $s.Post -and [Object]::ReferenceEquals(
         $s.PostProperty.GetValue($s.Intrinsics),$s.Post)){$s.PostProperty.SetValue($s.Intrinsics,$null)};
+    if($null -ne $s.NotFound -and [Object]::ReferenceEquals(
+        $s.NotFoundProperty.GetValue($s.Intrinsics),$s.NotFound)){$s.NotFoundProperty.SetValue($s.Intrinsics,$null)};
 } catch {
     if(-not $s.Failed){
         $s.Failed=$true;

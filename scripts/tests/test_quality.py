@@ -875,6 +875,76 @@ class CoverageRefusalDiagnosticsTest(unittest.TestCase):
             self.assertEqual(["coverage"], [json.loads(record)["event"] for record in output.getvalue().splitlines()])
 
 
+class MoneyTaskOwnershipTest(unittest.TestCase):
+    """Source controls; these do not configure or execute Gradle."""
+
+    def setUp(self):
+        self.build = (quality.ROOT / "build.gradle.kts").read_text(encoding="utf-8")
+
+    def section(self, start, end):
+        self.assertEqual(1, self.build.count(start))
+        self.assertEqual(1, self.build.count(end))
+        return self.build.split(start, 1)[1].split(end, 1)[0].strip()
+
+    def test_money_task_is_only_an_alias_for_the_single_ordinary_executor(self):
+        alias = self.section("val targetedMoneyTest =", "\nval acceptedCoverageReport =")
+        self.assertRegex(
+            alias,
+            r'\Atasks\.register\("moneyTest"\) \{\s+description = "[^"\n]+"\s+'
+            r'group = "verification"\s+dependsOn\(tasks\.test\)\s+\}\Z',
+        )
+        ordinary = self.section("tasks.test {", "\nval targetedMoneyTest =")
+        for setting in ('outputs.upToDateWhen { false }', 'outputs.cacheIf { false }', 'excludeTags("postgres")'):
+            self.assertIn(setting, ordinary)
+        for selection in ("include(", "exclude(", "includeTestsMatching(", "excludeTestsMatching(", "includeTags("):
+            self.assertNotIn(selection, ordinary)
+        self.assertNotIn("dependsOn", ordinary)
+        self.assertIn("finalizedBy(tasks.jacocoTestReport)", ordinary)
+
+    def test_coverage_consumers_use_the_authoritative_data_without_the_retired_execution(self):
+        money = self.section("val acceptedCoverageReport =", "\nval acceptedCoverageCheck =")
+        for setting in (
+            "dependsOn(targetedMoneyTest)",
+            'executionData.setFrom(layout.buildDirectory.file("jacoco/test.exec"))',
+            "classDirectories.setFrom(acceptedSourceSet.output.classesDirs)",
+            "sourceDirectories.setFrom(acceptedSourceSet.allSource.sourceDirectories)",
+        ):
+            self.assertIn(setting, money)
+        data = self.section("val aggregateCoverageData =", "\ntasks.jacocoTestReport {")
+        for name in ("test", "integrationTest", "migrationConventionCheck"):
+            self.assertIn(f'layout.buildDirectory.file("jacoco/{name}.exec")', data)
+        report = self.section("tasks.jacocoTestReport {", "\ntasks.jacocoTestCoverageVerification {")
+        verification = self.section("tasks.jacocoTestCoverageVerification {", "\ntasks.check {")
+        self.assertIn("dependsOn(tasks.test)", report)
+        for prerequisite in ("integrationTest", "migrationConventionCheck"):
+            self.assertIn(f"mustRunAfter({prerequisite})", report)
+        self.assertIn("dependsOn(tasks.jacocoTestReport)", verification)
+        for consumer in (report, verification):
+            self.assertIn("executionData.setFrom(aggregateCoverageData)", consumer)
+            self.assertNotIn("targetedMoneyTest", consumer)
+        self.assertNotIn("moneyTest.exec", self.build)
+        self.assertNotIn('include("*.exec")', self.build)
+
+    def test_existing_entrypoints_and_integration_property_criteria_remain_distinct(self):
+        check = self.section("tasks.check {", "\ntasks.withType<AbstractArchiveTask>()")
+        for dependency in (
+            "moneyGuard", "acceptedCoverageCheck", "acceptedMutationCheck", "generatedClientInterop",
+            "tasks.spotlessCheck", "tasks.jacocoTestCoverageVerification", "integrationTest",
+            "migrationConventionCheck",
+        ):
+            self.assertIn(dependency, check)
+        integration = self.section('tasks.register<Test>("integrationTest") {', "\nval migrationsDirectory =")
+        self.assertIn('includeTags("postgres")', integration)
+        self.assertIn("shouldRunAfter(tasks.test)", integration)
+        self.assertIn("check(count > 0 && skipped == 0)", integration)
+        self.assertIn("finalizedBy(stopMigrationTestPostgres)", integration)
+        ordinary = self.section("tasks.test {", "\nval targetedMoneyTest =")
+        self.assertNotIn('excludeTags("property")', ordinary)
+        guide = (quality.ROOT / "docs/money-mutation.md").read_text(encoding="utf-8")
+        self.assertIn('gradlew.bat test --tests "com.pennilogic.money.*"', guide)
+        self.assertIn("full ordinary non-Postgres suite", guide)
+
+
 class MoneyCoverageQualificationTest(unittest.TestCase):
     def report(self, directory, classes=("Money", "CurrencyRegistry"), sources=("Money.kt", "CurrencyRegistry.kt")):
         class_nodes = "".join(f'<class name="{quality.MONEY_PACKAGE}/{name}"/>' for name in classes)
@@ -1265,7 +1335,6 @@ class BuildCoverageConsumerTest(unittest.TestCase):
         events.extend({"event": "money_property_cases", "property": name, "count": 1}
                       for name in ("round_trip", "associativity", "collision_keys"))
         ET.SubElement(suite, "system-out").text = "\n".join(map(json.dumps, events))
-        self.write_xml("build/test-results/moneyTest/TEST-fixture.xml", suite)
         self.write_xml("build/test-results/test/TEST-fixture.xml", suite)
         self.write_reports()
 

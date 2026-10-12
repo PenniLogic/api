@@ -22,6 +22,7 @@ MONEY_REPORT = Path("build/reports/jacoco/moneyCoverageReport/moneyCoverageRepor
 MONEY_CLASSES = Path("build/classes/kotlin/contractsMoney")
 MONEY_PACKAGE = "com/pennilogic/contracts/money"
 MONEY_BASELINE = "quality/money-coverage-baseline.json"
+MONEY_TEST_PACKAGE = "com.pennilogic.money."
 MONEY_PRIMITIVE_TEST_CLASS = "com.pennilogic.money.AcceptedMoneyPrimitiveModelTest"
 MONEY_PRIMITIVE_TESTS = {
     "construction": "constructionMatchesExactModel()",
@@ -293,8 +294,21 @@ def money_class_inventory(provider):
     return classes
 
 
+def money_test_reports(root=ROOT):
+    reports = {}
+    for path in sorted((root / "build/test-results/test").glob("TEST-*.xml")):
+        suite = ET.parse(path).getroot()
+        if (
+            path.name.startswith("TEST-" + MONEY_TEST_PACKAGE)
+            or suite.get("name", "").startswith(MONEY_TEST_PACKAGE)
+            or any(case.get("classname", "").startswith(MONEY_TEST_PACKAGE) for case in suite.findall("testcase"))
+        ):
+            reports[path] = suite
+    return reports
+
+
 def money_test_metrics(root=ROOT):
-    suites = [ET.parse(path).getroot() for path in (root / "build/test-results/moneyTest").glob("TEST-*.xml")]
+    suites = list(money_test_reports(root).values())
     identities = set()
     for suite in suites:
         if any(
@@ -310,7 +324,7 @@ def money_test_metrics(root=ROOT):
             raise ValueError("Money test counters disagree with their executed cases")
         for case in cases:
             identity = (case.get("classname", ""), case.get("name", ""))
-            if not identity[0].startswith("com.pennilogic.money.") or not identity[1] or identity in identities:
+            if not identity[0].startswith(MONEY_TEST_PACKAGE) or not identity[1] or identity in identities:
                 raise ValueError("Money test evidence has an unrelated, unnamed or duplicate case")
             identities.add(identity)
     tests = sum(int(suite.get("tests")) for suite in suites)

@@ -145,7 +145,8 @@ refused command characters. POSIX fixtures remain `0644`; tracked wrapper
 bytes/modes and the parent environment are unchanged.
 
 Existing `test` and `integrationTest` selections execute all the new tests;
-`build` still invokes both. The existing `moneyTest`/PIT qualification inventory
+`build` still invokes both. Money tests are owned once by `test`; `moneyTest` is a
+compatibility lifecycle alias, not another runner. The PIT qualification inventory
 is unchanged: the new non-ledger consumer is in `com.pennilogic.testing`, not a
 replacement for the 39 existing Money tests, 10,030 round trips, 10,000
 associativity cases, 384 keys or 66,851 finite model comparisons.

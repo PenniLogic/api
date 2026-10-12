@@ -194,6 +194,9 @@ tasks.withType<Test>().configureEach {
 }
 
 tasks.test {
+    // Money coverage and mutation evidence must not reuse a cached test execution.
+    outputs.upToDateWhen { false }
+    outputs.cacheIf { false }
     useJUnitPlatform {
         excludeTags("postgres")
     }
@@ -220,29 +223,10 @@ tasks.test {
 }
 
 val targetedMoneyTest =
-    tasks.register<Test>("moneyTest") {
-        description = "Runs the actual immutable Money dependency's source-seam and arithmetic tests."
+    tasks.register("moneyTest") {
+        description = "Runs the authoritative ordinary test suite, including the Money tests."
         group = "verification"
-        testClassesDirs =
-            sourceSets.test
-                .get()
-                .output.classesDirs
-        classpath = sourceSets.test.get().runtimeClasspath
-        outputs.upToDateWhen { false }
-        outputs.cacheIf { false }
-        useJUnitPlatform()
-        include("com/pennilogic/money/**")
-        systemProperty(
-            "pennilogic.money.source",
-            layout.buildDirectory
-                .dir("contracts-money/source")
-                .get()
-                .asFile.path,
-        )
-        inputs.dir(layout.buildDirectory.dir("contracts-money/source/spec"))
-        testLogging {
-            events("failed", "skipped")
-        }
+        dependsOn(tasks.test)
     }
 
 val acceptedCoverageReport =
@@ -250,7 +234,7 @@ val acceptedCoverageReport =
         description = "Measures every compiled class of the immutable Contracts Money source dependency."
         group = "verification"
         dependsOn(targetedMoneyTest)
-        executionData.setFrom(layout.buildDirectory.file("jacoco/moneyTest.exec"))
+        executionData.setFrom(layout.buildDirectory.file("jacoco/test.exec"))
         classDirectories.setFrom(acceptedSourceSet.output.classesDirs)
         sourceDirectories.setFrom(acceptedSourceSet.allSource.sourceDirectories)
         reports {
@@ -602,13 +586,19 @@ registerMigrationTask("migrateDryRun", "Prints the migrate plan and writes nothi
 registerMigrationTask("migrateDownDryRun", "Prints the migrate-down plan and writes nothing.", "migrate-down", "--dry-run")
 registerMigrationTask("migrateStatus", "Prints the registry state: current version, last applied migration and lock holder.", "status")
 
+val aggregateCoverageData =
+    files(
+        layout.buildDirectory.file("jacoco/test.exec"),
+        layout.buildDirectory.file("jacoco/integrationTest.exec"),
+        layout.buildDirectory.file("jacoco/migrationConventionCheck.exec"),
+    )
+
 tasks.jacocoTestReport {
     dependsOn(tasks.test)
     mustRunAfter(integrationTest)
-    mustRunAfter(targetedMoneyTest)
     mustRunAfter(migrationConventionCheck)
     // Include the real convention-check CLI alongside test JVMs; a skipped integrationTest leaves no new data.
-    executionData.setFrom(fileTree(layout.buildDirectory.dir("jacoco")) { include("*.exec") })
+    executionData.setFrom(aggregateCoverageData)
     reports {
         xml.required.set(true)
         html.required.set(true)
@@ -617,8 +607,7 @@ tasks.jacocoTestReport {
 
 tasks.jacocoTestCoverageVerification {
     dependsOn(tasks.jacocoTestReport)
-    mustRunAfter(targetedMoneyTest)
-    executionData.setFrom(fileTree(layout.buildDirectory.dir("jacoco")) { include("*.exec") })
+    executionData.setFrom(aggregateCoverageData)
     val docker = dockerAvailable
     val ci = providers.environmentVariable("CI")
     onlyIf("the coverage gate needs the Postgres tests, which need Docker") { task ->

@@ -335,12 +335,16 @@ leaves the default `PSModulePath` untouched and keeps the original uncaptured
 `Write-Output`, 10-second call, return/output assertions and E/S-or-U/X grammar.
 It exclusively creates `build/diagnostics/api106-approved-shell-module-lookup.jsonl`
 outside JUnit selection. The child appends only bounded, flushed ASCII NDJSON:
-at most 8192 bytes, four records and 6144 bytes per LF-terminated record, with
-integer `v=1`. No raw paths, module names, commands, messages, credentials or ANSI
-are exported.
+at most 8192 bytes, five records and 6144 bytes per LF-terminated record, with
+integer `v=2` throughout. No raw paths, module names, commands, messages,
+credentials or ANSI are exported. Historical V1 capsules retain their exact
+four-record contract and contain no negative-hook availability or observation.
+Versions must not be mixed or reinterpreted. This V2 producer requires the
+corresponding reviewed canonical collector; its generated adoption is separate.
 
-The record order is `roots`, `observer`, optional `pre`, optional `post`, each
-at most once. `roots/observed` has `value` (`present` or `absent`) and `roots`:
+The V2 record order is `roots`, `observer`, optional `pre`, optional `not-found`,
+optional `post`, each at most once. `roots/observed` has `value` (`present` or
+`absent`) and `roots`:
 up to 32 entries with consecutive `i`, `kind` (`pshome`, `unknown`, `empty`),
 `sha256` and nullable `duplicate_of`. Hashes are lowercase SHA256 of each exact
 strict-UTF-8 component, without normalization; duplicates refer to the earliest
@@ -360,8 +364,24 @@ public reflection metadata, not alias resolution or command enumeration.
 Unavailable codes are `roots-refused`, `existing-hooks`, `unsupported-api`;
 installation failure is `observer/refused` with `code=install`.
 
+Every V2 `observer` also has an exact `not_found` object. The optional public
+WinPS5.1 `CommandNotFoundAction` hook is admitted independently: only a supported,
+currently null slot is assigned, and identity readback is required before its
+separate armed flag is set. Its object is `{"status":"armed"}`, or has
+`status=unavailable` with `code=existing-hook|unsupported-api`, or
+`status=refused` with `code=install`. The base Pre/Post observer can remain armed
+in all those cases. If and only if the base observer is not armed, the object is
+`{"status":"unavailable","code":"observer-unavailable"}`. A partially installed
+negative handler remains inert; an existing handler is never overwritten.
+
 Only the first matching actual lookup is sampled. `pre/observed` adds nullable
-`ms`. `post/observed` adds nullable `ms`, `lookup_ms`, actual `command_type`
+`ms`. With both observers armed and an earlier unambiguous `pre`, the first
+matching negative callback adds only `v`, `phase=not-found`, `status=observed`
+and nullable `ms`. This record is nonterminal: it establishes callback entry
+and recording, not callback return, lookup completion, a particular subsequent
+command result, test success or cleanup. An absent negative record remains
+unknown, not evidence of successful resolution or a cache hit.
+`post/observed` adds nullable `ms`, `lookup_ms`, actual `command_type`
 (1,2,4,8,16,32,64,128,256, or null for no returned command), `module_kind` and
 `module_sha256`. Module kinds are `no-command`, `none`, `unknown`, `pshome`,
 `other`; only the latter two have a hash of the observed module path, capped at
@@ -370,28 +390,39 @@ not module-byte or symlink attestation. Alias metadata describes its defining
 module, never its resolved target. Times are monotonic diagnostic-relative
 milliseconds in 0..600000 or null, not a changed deadline or method duration.
 The lookup interval includes callback/recording overhead. Nested target lookup
-invalidates pairing and emits no provenance.
-Both samples use `Stopwatch.ElapsedMilliseconds` without further rounding or
-clamping. An out-of-range sample is null; a post sample below a valid pre sample
-is also null. When both samples are nonnull, `post.ms >= pre.ms` and `lookup_ms`
-is exactly their integer difference. Otherwise `lookup_ms` is null; either or
-both samples may independently be null.
+or a repeated matching negative callback invalidates pairing, emits one
+`post/unavailable` with `code=nested-target`, and emits no inner provenance or
+second negative record. A negative callback without a recorded pre emits only
+the existing `post/unavailable` with `code=post-without-pre`.
+All three boundary samples use the existing `Stopwatch.ElapsedMilliseconds`
+without further rounding or clamping. An out-of-range sample is null; a negative
+sample below a valid pre sample is null, and a post sample below either retained
+valid predecessor is null. All nonnull pre/negative/post samples are therefore
+nondecreasing, even across a null sample. When pre and post are both nonnull,
+`lookup_ms` is exactly `post.ms - pre.ms`; otherwise it is null. A null negative
+sample does not change that rule, and there is no negative elapsed field.
+Throwing property, clock or formatting access uses the existing callback
+refusal, not a fabricated sample or negative edge.
 
 Other `post` records have only `code`: unavailable codes are
 `observer-unavailable`, `no-pre`, `no-post`, `nested-target`, `post-without-pre`;
 refusal codes are `command-type`, `module-path-limit`, `callback`. All records
 also have `v`, `phase`, `status`; unknown fields are invalid. Writer/open failures
 emit only the fixed `api106_module_lookup_capture`/`refused` stderr event, never
-exception text or a success fallback. Successful finalization removes only the
-fixture's own delegates and closes its stream; process termination can leave a
-strict prefix.
+exception text or a success fallback. After a terminal post or capture failure,
+callbacks emit no further records. Normal finalization after pre/negative
+without post emits `post/unavailable` with `code=no-post`. Successful finalization
+removes all three delegates only when each slot still refers to the fixture's
+own delegate; later replacements are never removed. Existing stream/hash cleanup
+is unchanged, and process termination can leave a strict prefix.
 
 The canonical collector must read at most 8193 bytes and validate the entire
 capsule before emitting its safe projection. Reparse/nonregular files, I/O errors,
 oversize, incomplete lines, non-ASCII/BOM/ANSI, duplicate JSON keys, wrong types,
 unknown fields/enums, invalid hashes/duplicate indices and impossible phase
 relationships are explicit refusals, without echoing offending data. A valid
-prefix is partial/unknown: absent callbacks do not prove a cached lookup. The
+prefix is partial/unknown: only a final post completes a capsule, not a negative
+edge alone. Absent callbacks do not prove a cached lookup. The
 existing 2105-byte boundary reader remains unchanged. Neither roots, callbacks,
 X nor a green instrumented test establishes cause, delivery, no-error behavior,
 cleanup, a default-launch repair or merge acceptance.
