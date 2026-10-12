@@ -598,7 +598,16 @@ coverage consumer, only the focused Money gate was rerun; no further ledger exec
 The normal build wiring is unchanged, but a fresh post-correction full normal build is not claimed.
 
 Windows uses a private kill-on-close Job Object. A stdin-gated bootstrap cannot launch the
-real command before attachment, closing the process-start race. POSIX uses an owned process
+real command before its retained process handle is attached, closing the process-start race.
+Cleanup explicitly terminates the owned job and retains it until accounting reports no active
+members, waiting on its private completion port rather than assuming bootstrap exit or
+kill-on-close proves descendant completion. Completion, reader joins, and bootstrap reaping
+share the existing ten-second cleanup allowance; an unavailable completion check or expired
+allowance is a failure, not a cleanup claim. Timeliness is checked after owned-handle release
+and again after reader, bootstrap, and stream finalization. Observed completion exactly at
+the deadline is allowed, but a zero-timeout wait cannot certify completion after it.
+Failed setup/attachment also closes the private
+completion port. No process is reopened by PID for attachment or termination. POSIX uses an owned process
 group. Timeout output is retained, children cannot outlive a successful parent, and no process
 name or shared daemon is killed. Kotlin compilation stays inside the owned Gradle process
 tree rather than creating a shared Kotlin daemon. The Windows startup/timeout/isolation
@@ -607,6 +616,19 @@ Docker is not an OS child process: the existing ID-scoped Gradle finalizer remov
 disposable PostgreSQL container in the recorded build. A forcibly terminated host JVM can
 still leave its recorded container for the existing stale-container cleanup on the next run;
 OS process containment is not a Docker-daemon cleanup guarantee.
+
+The PIT consumer preserves a cleanup timeout as a terminal failed attempt and event with
+its original reason. It writes timeout output only for capture-bearing budget exceptions;
+a cleanup timeout without captured output does not manufacture an empty native log.
+Windows bootstrap-reap expiry uses that same cleanup refusal and retains the underlying
+wait exception as its cause.
+
+The Windows approved-Docker-directory test preserves its original nonzero worker failure and
+adds a bounded note containing only the fixture's allowlisted boolean result plus captured-text
+length/hash. Unexpected text is not printed, including text swallowed by the fixture's redirected
+stdout. This is diagnosability, not an interpretation or repair of a numeric worker exit, and
+does not identify the owner of any previously observed directory lock or fix the separate
+hosted approved-shell stall.
 
 Control diagnostics use synthetic cases and stable operation/category IDs, never production
 records or monetary expected/actual values. The Kotlin value-comparison probe proves a failed

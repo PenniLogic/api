@@ -962,6 +962,84 @@ class MutationEvidenceTest(unittest.TestCase):
             self.assertEqual(original, (previous / "run.json").read_text())
 
 
+class MutationCleanupTimeoutTest(unittest.TestCase):
+    def failed_attempt(self, error, *, cli=False):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        provider = Mock(wraps=SyntheticStrategy())
+        provider.BUNDLE, provider.STRATEGY_FILE = Path("synthetic"), Path("strategy.json")
+        provider.SOURCE_REF, provider.DOCS_REF = "synthetic-contracts", "synthetic-docs"
+        provider.OUTPUT_HASHES = {"Money.kt": "synthetic-source"}
+        provider.verify_outputs = Mock(return_value=[])
+        provider.owned_target = Mock(side_effect=lambda base, relative: base / relative)
+        config = {
+            "java": str(root / "synthetic-java.exe"),
+            "tool_classpath": [str(root / (name + "-1.0.0.jar")) for name in (
+                "pitest", "pitest-entry", "pitest-command-line", "pitest-junit5-plugin", "junit-platform-launcher",
+            )],
+            "test_classpath": [str(root / "synthetic-tests")],
+        }
+        input_file = root / "input.json"
+        input_file.write_text(json.dumps(config), encoding="utf-8")
+        with (
+            patch.object(mutation, "ROOT", root),
+            patch.object(quality, "money_provider_module", return_value=provider),
+            patch.object(quality, "money_class_inventory", return_value={"com/pennilogic/money/Money": "synthetic"}),
+            patch.object(quality, "money_test_metrics", return_value={"synthetic": "consumer-control-only"}),
+            patch.object(mutation, "input_snapshot", return_value={"synthetic": "bound"}),
+            patch.object(quality, "script_module", return_value=process_budget),
+            patch.object(process_budget, "run", side_effect=error) as run,
+            patch.object(process_budget.subprocess, "Popen", side_effect=AssertionError("No native mutation workload")),
+            patch("sys.stdout", new_callable=io.StringIO) as output,
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            if cli:
+                with patch.object(sys, "argv", ["money_mutation.py", "run", "--input-file", str(input_file)]):
+                    self.assertEqual(mutation.main(), 1)
+                self.assertIn("Money mutation gate failed", stderr.getvalue())
+            else:
+                with self.assertRaises(type(error)) as raised:
+                    mutation.execute(input_file)
+                self.assertIs(raised.exception, error)
+            run.assert_called_once()
+            self.assertTrue(run.call_args.kwargs["capture"])
+        run_id = json.loads((root / mutation.REPORTS / "latest.json").read_text(encoding="utf-8"))["run_id"]
+        directory = root / mutation.REPORTS / run_id
+        record = json.loads((directory / "run.json").read_text(encoding="utf-8"))
+        event = json.loads(output.getvalue())
+        for value in (record, event):
+            self.assertEqual(value["status"], "failed")
+            self.assertEqual(value["failure"], str(error))
+        self.assertEqual(event["run_id"], run_id)
+        self.assertIsNone(record["result"])
+        self.assertEqual(len(record["commands"]), 1)
+        self.assertTrue(record["commands"][0]["budget_exceeded"])
+        self.assertIsNone(record["commands"][0]["exit_code"])
+        self.assertGreaterEqual(record["commands"][0]["elapsed_seconds"], 0)
+        return directory, record
+
+    def test_cleanup_timeout_persists_original_failure_without_inventing_output(self):
+        error = TimeoutError("Owned process job cleanup exceeded its existing allowance")
+        self.assertFalse(hasattr(error, "output"))
+        directory, record = self.failed_attempt(error)
+        self.assertFalse((directory / "catalogue.log").exists())
+        self.assertNotIn("catalogue.log", record["outputs"])
+
+    def test_cli_cleanup_timeout_keeps_terminal_failure_and_nonzero_exit(self):
+        directory, record = self.failed_attempt(
+            TimeoutError("Owned process job cleanup exceeded its existing allowance"), cli=True,
+        )
+        self.assertFalse((directory / "catalogue.log").exists())
+        self.assertNotIn("catalogue.log", record["outputs"])
+
+    def test_capture_bearing_budget_timeout_preserves_existing_output_contract(self):
+        for output in (None, "", "synthetic captured output\n"):
+            with self.subTest(output=output):
+                directory, record = self.failed_attempt(process_budget.BudgetExceeded(output))
+                path = directory / "catalogue.log"
+                self.assertEqual(path.read_text(encoding="utf-8"), output or "")
+                self.assertEqual(record["outputs"]["catalogue.log"], mutation.file_record(path))
+
+
 class MutationNativeConsoleTest(unittest.TestCase):
     def test_required_log_binding_and_restoration(self):
         result = MutationPolicyTest().result(90, 100)
@@ -1299,6 +1377,90 @@ try {
 """
 
 
+def run_docker_fixture(command, root):
+    try:
+        return quality.run(command, root=root, capture=True, budget=10)
+    except subprocess.CalledProcessError as error:
+        note = {"schema": "pennilogic.synthetic-docker-fixture/1", "status": "unavailable"}
+        if type(error.output) is str:
+            data = error.output.encode("utf-8", errors="backslashreplace")
+            note.update(capture_text_bytes=len(data), capture_text_sha256=hashlib.sha256(data).hexdigest())
+            if len(data) <= 4096:
+                tail = error.output.splitlines()[-1:]
+                for approved in (False, True):
+                    for isolated in (False, True):
+                        value = {"approved": approved, "isolated": isolated}
+                        if tail == [json.dumps(value)]:
+                            note.update(status="observed", **value)
+        error.add_note("synthetic_docker_fixture=" + json.dumps(note, sort_keys=True, separators=(",", ":")))
+        raise
+
+
+class DockerFixtureDiagnosticTest(unittest.TestCase):
+    def failure(self, output):
+        error = subprocess.CalledProcessError(3758096423, ["synthetic-worker"], output=output)
+        error.add_note("existing-note")
+        with (
+            patch.object(quality, "run", side_effect=error) as run,
+            patch("sys.stdout", new_callable=io.StringIO),
+            self.assertRaises(subprocess.CalledProcessError) as observed,
+        ):
+            run_docker_fixture(["synthetic-worker"], SCRIPTS)
+        self.assertIs(observed.exception, error)
+        self.assertEqual(error.returncode, 3758096423)
+        self.assertEqual(error.__notes__[0], "existing-note")
+        self.assertEqual(len(error.__notes__), 2)
+        run.assert_called_once_with(["synthetic-worker"], root=SCRIPTS, capture=True, budget=10)
+        return json.loads(error.__notes__[-1].split("=", 1)[1]), error.__notes__[-1]
+
+    def test_failure_keeps_exact_error_and_bounded_synthetic_boolean_output(self):
+        for approved in (False, True):
+            for isolated in (False, True):
+                with self.subTest(approved=approved, isolated=isolated):
+                    value = {"approved": approved, "isolated": isolated}
+                    output = json.dumps(value) + "\n"
+                    note, text = self.failure(output)
+                    self.assertEqual(note, {
+                        "schema": "pennilogic.synthetic-docker-fixture/1", "status": "observed", **value,
+                        "capture_text_bytes": len(output),
+                        "capture_text_sha256": hashlib.sha256(output.encode()).hexdigest(),
+                    })
+                    self.assertLess(len(text), 512)
+
+    def test_unrecognized_output_is_hash_only_and_never_prints_ambient_values(self):
+        secret = "synthetic-private-value-not-for-diagnostics"
+        for output in (secret, secret + "\n" + json.dumps({"approved": False, "isolated": True})):
+            with self.subTest(trailing_record="\n" in output):
+                note, text = self.failure(output)
+                self.assertNotIn(secret, text)
+                self.assertEqual(note["capture_text_sha256"], hashlib.sha256(output.encode()).hexdigest())
+                self.assertEqual(note["status"], "observed" if "\n" in output else "unavailable")
+
+    def test_invalid_oversized_or_missing_output_does_not_invent_a_synthetic_record(self):
+        for output in (None, b'{"approved": false, "isolated": true}', "x" * 4097,
+                       '{"approved": 1, "isolated": true}', '{"approved": false, "isolated": true, "extra": 1}',
+                       '{"approved": false, "approved": true, "isolated": true}', "\ud800"):
+            with self.subTest(type=type(output).__name__):
+                note, text = self.failure(output)
+                self.assertEqual(note["status"], "unavailable")
+                self.assertNotIn("approved", note)
+                self.assertNotIn("isolated", note)
+                self.assertLess(len(text), 512)
+
+    def test_success_returns_unchanged_output(self):
+        output = '{"approved": true, "isolated": true}\n'
+        with patch.object(quality, "run", return_value=output) as run:
+            self.assertIs(run_docker_fixture(["synthetic-worker"], SCRIPTS), output)
+        run.assert_called_once_with(["synthetic-worker"], root=SCRIPTS, capture=True, budget=10)
+
+    def test_unrelated_failure_is_not_reclassified_or_hidden(self):
+        error = OSError("synthetic-provider-failure")
+        with patch.object(quality, "run", side_effect=error), self.assertRaises(OSError) as observed:
+            run_docker_fixture(["synthetic-worker"], SCRIPTS)
+        self.assertIs(observed.exception, error)
+        self.assertFalse(hasattr(error, "__notes__"))
+
+
 class ProcessBudgetTest(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "win32", "Windows Docker Desktop executable boundary")
     def test_budgeted_quality_admits_only_the_approved_docker_directory(self):
@@ -1347,9 +1509,7 @@ class ProcessBudgetTest(unittest.TestCase):
                 patch.object(process_budget, "environment", side_effect=controlled_environment),
                 patch("sys.stdout", new_callable=io.StringIO),
             ):
-                result = quality.run(
-                    [sys.executable, "-I", "-S", "-B", "-c", code], root=root, capture=True, budget=10,
-                )
+                result = run_docker_fixture([sys.executable, "-I", "-S", "-B", "-c", code], root)
             self.assertEqual(json.loads(result), {"approved": True, "isolated": True})
             self.assertEqual(admissions, [docker])
             self.assertFalse(marker.exists())
@@ -2184,23 +2344,21 @@ class ProcessBudgetJobObservationTest(unittest.TestCase):
         self.assertIs(api.CompareObjectHandles.restype, ctypes.c_int32)
 
     def test_job_construction_and_attachment_do_not_load_the_comparison_provider(self):
-        api = FakeJobObservationApi()
-        api.kernel32.CreateJobObjectW = Mock(return_value=api.JOB)
-        api.kernel32.SetInformationJobObject = Mock(return_value=1)
-        api.kernel32.AssignProcessToJobObject = Mock(return_value=1)
-        api.kernel32.OpenProcess = Mock(return_value=100011)
-        api.kernel32.CloseHandle = Mock(return_value=1)
-        with patch.object(process_budget.ctypes, "WinDLL", side_effect=api.load_library, create=True):
+        api = FakeJobCleanupApi()
+        with (
+            patch.object(process_budget.ctypes, "WinDLL", return_value=api, create=True) as load,
+            patch.object(process_budget.time, "monotonic", side_effect=lambda: api.clock),
+        ):
             job = process_budget.WindowsJob()
-            job.attach(SimpleNamespace(pid=11))
+            job.attach(SimpleNamespace(pid=11, _handle=api.BOOTSTRAP))
             job.close()
-        api.load_library.assert_called_once_with("kernel32", use_last_error=True)
-        api.kernel32.OpenProcess.assert_called_once_with(0x0101, False, 11)
-        api.kernel32.AssignProcessToJobObject.assert_called_once_with(api.JOB, 100011)
-        self.assertEqual([call.args[0] for call in api.kernel32.CloseHandle.call_args_list], [100011, api.JOB])
+        load.assert_called_once_with("kernel32", use_last_error=True)
+        api.OpenProcess.assert_not_called()
+        api.AssignProcessToJobObject.assert_called_once_with(api.JOB, api.BOOTSTRAP)
+        self.assertEqual([call.args[0] for call in api.CloseHandle.call_args_list], [api.JOB, api.PORT])
         self.assertIsNone(job.handle)
         api.CompareObjectHandles.assert_not_called()
-        api.QueryInformationJobObject.assert_not_called()
+        self.assertTrue(all(call.args[1] == 1 for call in api.QueryInformationJobObject.call_args_list))
 
     def test_comparison_provider_is_not_loaded_without_usable_members(self):
         for case in ("missing-job", "empty", "oversized", "refused"):
@@ -2471,9 +2629,513 @@ class ProcessBudgetJobObservationTest(unittest.TestCase):
             self.assertFalse(api.opened)
 
 
+class FakeJobCleanupApi:
+    JOB, PORT, BOOTSTRAP = 70001, 70002, 70003
+
+    def __init__(self):
+        self.clock, self.active, self.last_error = 100, 0, 0
+        self.transitions, self.events = [1, 0], []
+        self.CreateJobObjectW = Mock(return_value=self.JOB)
+        self.SetInformationJobObject = Mock(return_value=1)
+        self.CreateIoCompletionPort = Mock(return_value=self.PORT)
+        self.AssignProcessToJobObject = Mock(side_effect=self.attach)
+        self.TerminateJobObject = Mock(side_effect=lambda job, code: self.events.append(("terminate", job, code)) or 1)
+        self.QueryInformationJobObject = Mock(side_effect=self.query)
+        self.GetQueuedCompletionStatus = Mock(side_effect=self.wait)
+        self.CloseHandle = Mock(side_effect=lambda handle: self.events.append(("close", handle, self.active)) or 1)
+        self.OpenProcess, self.CompareObjectHandles = Mock(), Mock()
+
+    def attach(self, job, process):
+        self.active = 2
+        self.events.append(("attach", job, process))
+        return 1
+
+    def query(self, job, kind, value, size, returned):
+        if job != self.JOB or kind != 1 or size != 48:
+            raise AssertionError("Unexpected owned-job query")
+        account = ctypes.cast(value, ctypes.POINTER(process_budget.WindowsJob.Accounting)).contents
+        account.total, account.active = 2, self.active
+        returned._obj.value = size
+        self.events.append(("active", self.active))
+        return 1
+
+    def wait(self, port, message, key, overlapped, milliseconds):
+        if port != self.PORT or not 0 < milliseconds <= 10000:
+            raise AssertionError("Unexpected owned completion wait")
+        self.events.append(("wait", milliseconds))
+        self.clock += 0.025
+        self.active = self.transitions.pop(0)
+        message._obj.value, key._obj.value, overlapped._obj.value = 4, self.JOB, None
+        return 1
+
+
+class WindowsJobCleanupTest(unittest.TestCase):
+    def setUp(self):
+        self.api = FakeJobCleanupApi()
+        self.load = self.enterContext(patch.object(process_budget.ctypes, "WinDLL", return_value=self.api, create=True))
+        self.enterContext(patch.object(process_budget.ctypes, "get_last_error",
+                                       side_effect=lambda: self.api.last_error, create=True))
+        self.enterContext(patch.object(process_budget.time, "monotonic", side_effect=lambda: self.api.clock))
+        self.enterContext(patch.object(process_budget.subprocess, "Popen", side_effect=AssertionError("No native control")))
+
+    def attached_job(self):
+        job = process_budget.WindowsJob()
+        job.attach(SimpleNamespace(pid=11, _handle=self.api.BOOTSTRAP))
+        return job
+
+    def assert_released(self, job):
+        self.assertIsNone(job.handle)
+        self.assertIsNone(job.completion_port)
+        self.assertEqual([call.args[0] for call in self.api.CloseHandle.call_args_list],
+                         [self.api.JOB, self.api.PORT])
+        self.api.OpenProcess.assert_not_called()
+
+    def complete_after(self, seconds, *, timeout=False):
+        def wait(port, message, key, overlapped, milliseconds):
+            self.assertEqual(port, self.api.PORT)
+            self.assertGreater(milliseconds, 0)
+            self.assertLessEqual(milliseconds, 10000)
+            self.api.clock += seconds
+            self.api.active = 0
+            if timeout:
+                self.api.last_error = 258
+                return 0
+            message._obj.value, key._obj.value, overlapped._obj.value = 4, self.api.JOB, None
+            return 1
+
+        self.api.GetQueuedCompletionStatus.side_effect = wait
+
+    def run_with_moving_cleanup_clock(self, *, completion_seconds=1, timeout=False, joins=(),
+                                      reap_seconds=0, final_stream_seconds=0, reap_error=None,
+                                      bootstrap_running=False):
+        self.api = FakeJobCleanupApi()
+        self.load.return_value = self.api
+        self.complete_after(completion_seconds, timeout=timeout)
+        jobs, readers = [], []
+        original_init = process_budget.WindowsJob.__init__
+
+        def initialize(job):
+            original_init(job)
+            jobs.append(job)
+
+        process = Mock(pid=11, _handle=self.api.BOOTSTRAP, returncode=None if bootstrap_running else 0, stdin=Mock(),
+                       stdout=Mock() if joins else None, stderr=Mock() if joins else None)
+        process.poll.side_effect = lambda: process.returncode
+
+        def reap(*, timeout):
+            self.assertGreaterEqual(timeout, 0)
+            self.api.clock += reap_seconds
+            if reap_error is not None:
+                raise reap_error
+            return 0
+
+        def close_stdin():
+            if jobs[0].cleanup_deadline is not None:
+                self.api.clock += final_stream_seconds
+
+        process.wait.side_effect = reap
+        process.stdin.close.side_effect = close_stdin
+        for seconds in joins:
+            reader = Mock()
+            reader.is_alive.return_value = True
+
+            def join(*, timeout, duration=seconds, target=reader):
+                self.assertGreaterEqual(timeout, 0)
+                self.api.clock += duration
+                target.is_alive.return_value = False
+
+            reader.join.side_effect = join
+            readers.append(reader)
+        captured = Mock(threads=readers, exceeded=bool(joins), failed=False)
+        captured.snapshot.return_value = (b"", b"", {
+            name: {"bytes": 0, "sha256": hashlib.sha256(b"").hexdigest()} for name in ("stdout", "stderr")
+        })
+        result, error = None, None
+        with (
+            patch.object(process_budget, "os", SimpleNamespace(name="nt", pathsep=";")),
+            patch.object(process_budget, "environment", return_value={}),
+            patch.object(process_budget, "resolve_command", return_value=["synthetic-command"]),
+            patch.object(process_budget.WindowsJob, "__init__", initialize),
+            patch.object(process_budget.subprocess, "Popen", return_value=process),
+            patch.object(process_budget, "Capture", return_value=captured),
+        ):
+            try:
+                result = process_budget.run(["synthetic-command"], SCRIPTS, 1,
+                                            capture=bool(joins), separate=bool(joins))
+            except (TimeoutError, OSError) as observed:
+                error = observed
+        job, = jobs
+        self.assert_released(job)
+        self.assertEqual(job.cleanup_deadline, 110)
+        self.assertEqual(process.stdin.close.call_count, 2)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close.assert_called_once_with()
+        self.assertEqual(process.kill.call_count, 2 if bootstrap_running else 0)
+        return SimpleNamespace(job=job, process=process, readers=readers, result=result, error=error)
+
+    def test_close_waits_for_all_members_before_releasing_owned_handles(self):
+        job = self.attached_job()
+        job.close()
+        self.assertEqual(self.api.events, [
+            ("attach", self.api.JOB, self.api.BOOTSTRAP), ("terminate", self.api.JOB, 1),
+            ("active", 2), ("wait", 10000), ("active", 1), ("wait", int((110 - 100.025) * 1000)),
+            ("active", 0), ("close", self.api.JOB, 0), ("close", self.api.PORT, 0),
+        ])
+        self.assertIsNone(job.handle)
+        self.assertIsNone(job.completion_port)
+        self.api.OpenProcess.assert_not_called()
+        self.assertEqual(self.api.SetInformationJobObject.call_count, 2)
+        associate = self.api.SetInformationJobObject.call_args_list[1]
+        self.assertEqual(associate.args[:2], (self.api.JOB, 7))
+        self.assertEqual((associate.args[2]._obj.key, associate.args[2]._obj.port),
+                         (self.api.JOB, self.api.PORT))
+
+    def test_close_is_idempotent_and_does_not_restart_cleanup_allowance(self):
+        job = self.attached_job()
+        job.close()
+        before = list(self.api.events)
+        self.api.clock += 3
+        job.close()
+        self.assertEqual(self.api.events, before)
+        self.assertEqual(job.cleanup_deadline, 110)
+        self.assertLess(job.remaining_cleanup(), 7)
+
+    def test_already_empty_job_needs_no_completion_wait(self):
+        job = self.attached_job()
+        self.api.active = 0
+        job.close()
+        self.api.GetQueuedCompletionStatus.assert_not_called()
+        self.api.TerminateJobObject.assert_called_once_with(self.api.JOB, 1)
+
+    def test_construction_failures_release_only_created_handles(self):
+        for step, expected, handles in (
+            ("job", "Cannot create the owned process budget job", []),
+            ("limits", "Cannot enforce the owned process budget job", [self.api.JOB]),
+            ("port", "Cannot create the owned process completion port", [self.api.JOB]),
+            ("association", "Cannot associate the owned process completion port", [self.api.JOB, self.api.PORT]),
+        ):
+            with self.subTest(step=step):
+                api = FakeJobCleanupApi()
+                if step == "job":
+                    api.CreateJobObjectW.return_value = 0
+                elif step == "limits":
+                    api.SetInformationJobObject.return_value = 0
+                elif step == "port":
+                    api.CreateIoCompletionPort.return_value = 0
+                else:
+                    api.SetInformationJobObject.side_effect = [1, 0]
+                self.load.return_value = api
+                with self.assertRaisesRegex(OSError, expected):
+                    process_budget.WindowsJob()
+                self.assertEqual([call.args[0] for call in api.CloseHandle.call_args_list], handles)
+                api.TerminateJobObject.assert_not_called()
+                api.GetQueuedCompletionStatus.assert_not_called()
+
+    def test_failed_attachment_closes_job_and_port_without_claiming_worker_ownership(self):
+        self.api.AssignProcessToJobObject.side_effect = None
+        self.api.AssignProcessToJobObject.return_value = 0
+        job = process_budget.WindowsJob()
+        with self.assertRaisesRegex(OSError, "Cannot attach the launched process"):
+            job.attach(SimpleNamespace(pid=11, _handle=self.api.BOOTSTRAP))
+        job.close()
+        self.api.TerminateJobObject.assert_not_called()
+        self.api.QueryInformationJobObject.assert_not_called()
+        self.assertEqual([call.args[0] for call in self.api.CloseHandle.call_args_list],
+                         [self.api.JOB, self.api.PORT])
+
+    def test_unavailable_or_invalid_accounting_is_a_cleanup_failure(self):
+        for case in ("query", "size", "count"):
+            with self.subTest(case=case):
+                self.api = FakeJobCleanupApi()
+                self.load.return_value = self.api
+                job = self.attached_job()
+
+                def query(*args):
+                    self.api.query(*args)
+                    if case == "size":
+                        args[-1]._obj.value = 1
+                    elif case == "count":
+                        args[2]._obj.active = 3
+                    return 0 if case == "query" else 1
+
+                self.api.QueryInformationJobObject.side_effect = query
+                with self.assertRaisesRegex(OSError, "Cannot establish owned process job completion"):
+                    job.close()
+                self.assertIsNone(job.handle)
+                self.assertIsNone(job.completion_port)
+                self.api.GetQueuedCompletionStatus.assert_not_called()
+
+    def test_completion_timeout_and_api_failure_refuse_instead_of_reporting_cleanup(self):
+        for code, expected_type, expected in (
+            (258, TimeoutError, "cleanup exceeded its existing allowance"),
+            (5, OSError, "Cannot wait for owned process job completion"),
+        ):
+            with self.subTest(code=code):
+                self.api = FakeJobCleanupApi()
+                self.load.return_value = self.api
+                job = self.attached_job()
+                self.api.last_error = code
+                self.api.GetQueuedCompletionStatus.side_effect = None
+                self.api.GetQueuedCompletionStatus.return_value = 0
+                with self.assertRaisesRegex(expected_type, expected):
+                    job.close()
+                self.assertEqual(self.api.GetQueuedCompletionStatus.call_count, 1)
+                self.assertIsNone(job.handle)
+                self.assertIsNone(job.completion_port)
+
+    def test_expired_allowance_does_not_start_another_wait(self):
+        job = self.attached_job()
+        job.cleanup_deadline = self.api.clock
+        with self.assertRaisesRegex(TimeoutError, "cleanup exceeded its existing allowance"):
+            job.close()
+        self.api.GetQueuedCompletionStatus.assert_not_called()
+        self.assertIsNone(job.handle)
+        self.assertIsNone(job.completion_port)
+
+    def test_missing_completion_notification_still_requires_observed_empty_accounting(self):
+        job = self.attached_job()
+
+        def wait(*_args):
+            self.api.clock += 10
+            self.api.active, self.api.last_error = 0, 258
+            return 0
+
+        self.api.GetQueuedCompletionStatus.side_effect = wait
+        job.close()
+        self.assertEqual(job.remaining_cleanup(), 0)
+        self.assertEqual([event for event in self.api.events if event[0] == "active"],
+                         [("active", 2), ("active", 0)])
+        self.assertIsNone(job.handle)
+        self.assertIsNone(job.completion_port)
+
+    def test_empty_accounting_after_either_completion_path_respects_deadline(self):
+        for timeout in (False, True):
+            for seconds in (9.999, 10, 10.001):
+                with self.subTest(timeout=timeout, seconds=seconds):
+                    self.api = FakeJobCleanupApi()
+                    self.load.return_value = self.api
+                    job = self.attached_job()
+                    self.complete_after(seconds, timeout=timeout)
+                    if seconds > 10:
+                        with self.assertRaisesRegex(TimeoutError, "cleanup exceeded its existing allowance"):
+                            job.close()
+                    else:
+                        job.close()
+                        self.assertGreaterEqual(job.remaining_cleanup(), 0)
+                    self.assert_released(job)
+                    self.assertEqual(job.cleanup_deadline, 110)
+                    self.assertEqual(self.api.GetQueuedCompletionStatus.call_count, 1)
+                    self.assertEqual([event for event in self.api.events if event[0] == "active"],
+                                     [("active", 2), ("active", 0)])
+
+    def test_initial_empty_accounting_still_requires_timely_observation(self):
+        for seconds in (10, 10.001):
+            with self.subTest(seconds=seconds):
+                self.api = FakeJobCleanupApi()
+                self.load.return_value = self.api
+                job = self.attached_job()
+                self.api.active = 0
+
+                def query(*args):
+                    self.api.clock += seconds
+                    return self.api.query(*args)
+
+                self.api.QueryInformationJobObject.side_effect = query
+                if seconds > 10:
+                    with self.assertRaisesRegex(TimeoutError, "cleanup exceeded its existing allowance"):
+                        job.close()
+                else:
+                    job.close()
+                self.assert_released(job)
+                self.api.GetQueuedCompletionStatus.assert_not_called()
+
+    def test_handle_release_cannot_certify_late_cleanup(self):
+        for delayed in (self.api.JOB, self.api.PORT):
+            for seconds in (10, 10.001):
+                with self.subTest(handle=delayed, seconds=seconds):
+                    self.api = FakeJobCleanupApi()
+                    self.load.return_value = self.api
+                    job = self.attached_job()
+                    self.api.active = 0
+
+                    def close(handle):
+                        if handle == delayed:
+                            self.api.clock += seconds
+                        return 1
+
+                    self.api.CloseHandle.side_effect = close
+                    if seconds > 10:
+                        with self.assertRaisesRegex(TimeoutError, "cleanup exceeded its existing allowance"):
+                            job.close()
+                    else:
+                        job.close()
+                    self.assert_released(job)
+
+    def test_repeated_close_does_not_recertify_an_expired_allowance(self):
+        job = self.attached_job()
+        job.close()
+        self.api.clock = 110.001
+        with self.assertRaisesRegex(TimeoutError, "cleanup exceeded its existing allowance"):
+            job.close()
+        self.assert_released(job)
+        self.assertEqual(job.cleanup_deadline, 110)
+
+    def test_run_rejects_late_empty_completion_despite_successful_bootstrap(self):
+        for timeout in (False, True):
+            with self.subTest(timeout=timeout):
+                observed = self.run_with_moving_cleanup_clock(completion_seconds=10.001, timeout=timeout)
+                self.assertIs(type(observed.error), TimeoutError)
+                self.assertIn("cleanup exceeded its existing allowance", str(observed.error))
+                self.assertIsNone(observed.result)
+                self.assertEqual(observed.process.returncode, 0)
+                observed.process.wait.assert_called_once_with(timeout=0)
+
+    def test_real_close_two_readers_and_reap_share_one_moving_allowance(self):
+        observed = self.run_with_moving_cleanup_clock(joins=(4, 3), reap_seconds=2)
+        self.assertIs(type(observed.error), process_budget.OutputExceeded)
+        self.assertIsNone(observed.result)
+        observed.readers[0].join.assert_called_once_with(timeout=9)
+        observed.readers[1].join.assert_called_once_with(timeout=5)
+        observed.process.wait.assert_called_once_with(timeout=2)
+        self.assertEqual(self.api.clock, observed.job.cleanup_deadline)
+
+    def test_moving_cleanup_clock_refuses_each_late_finalization_stage(self):
+        for stage, joins, reap, stream in (
+            ("first-reader", (9.001, 0), 0, 0),
+            ("second-reader", (4, 5.001), 0, 0),
+            ("reap-after-readers", (4, 3), 2.001, 0),
+            ("stream-after-readers", (4, 3), 0, 2.001),
+            ("successful-bootstrap-reap", (), 9.001, 0),
+            ("successful-bootstrap-stream", (), 0, 9.001),
+        ):
+            with self.subTest(stage=stage):
+                observed = self.run_with_moving_cleanup_clock(
+                    joins=joins, reap_seconds=reap, final_stream_seconds=stream,
+                )
+                self.assertIs(type(observed.error), TimeoutError)
+                self.assertIn("cleanup exceeded its existing allowance", str(observed.error))
+                self.assertIsNone(observed.result)
+                self.assertGreater(self.api.clock, observed.job.cleanup_deadline)
+                observed.process.wait.assert_called_once()
+                for reader in observed.readers:
+                    reader.join.assert_called_once()
+
+    def test_in_budget_and_exact_deadline_completion_remain_valid(self):
+        for reap in (8.999, 9):
+            with self.subTest(reap=reap):
+                observed = self.run_with_moving_cleanup_clock(reap_seconds=reap)
+                self.assertIsNone(observed.error)
+                self.assertEqual(observed.result.returncode, 0)
+                observed.process.wait.assert_called_once_with(timeout=9)
+                self.assertLessEqual(self.api.clock, observed.job.cleanup_deadline)
+
+    def test_bootstrap_reap_timeout_preserves_the_cleanup_timeout_contract(self):
+        expired = subprocess.TimeoutExpired(["synthetic-command"], 9)
+        observed = self.run_with_moving_cleanup_clock(
+            joins=(0, 0), reap_seconds=9, reap_error=expired, bootstrap_running=True,
+        )
+        self.assertIs(type(observed.error), TimeoutError)
+        self.assertIn("cleanup exceeded its existing allowance", str(observed.error))
+        self.assertIs(observed.error.__cause__, expired)
+        self.assertFalse(hasattr(observed.error, "output"))
+        self.assertIsNone(observed.result)
+        observed.process.wait.assert_called_once_with(timeout=9)
+        self.assertEqual(self.api.clock, observed.job.cleanup_deadline)
+
+    def test_foreign_completion_key_cannot_certify_owned_cleanup(self):
+        job = self.attached_job()
+
+        def wait(*args):
+            self.api.wait(*args)
+            args[2]._obj.value = self.api.JOB + 1
+            return 1
+
+        self.api.GetQueuedCompletionStatus.side_effect = wait
+        with self.assertRaisesRegex(OSError, "Unexpected owned process job completion key"):
+            job.close()
+        self.assertIsNone(job.handle)
+        self.assertIsNone(job.completion_port)
+
+    def test_termination_and_handle_release_failures_are_not_silenced(self):
+        for operation, message in (
+            ("terminate", "Cannot terminate the owned process budget job"),
+            ("job", "Cannot close the owned process budget job"),
+            ("port", "Cannot close the owned process completion port"),
+        ):
+            with self.subTest(operation=operation):
+                self.api = FakeJobCleanupApi()
+                self.load.return_value = self.api
+                job = self.attached_job()
+                if operation == "terminate":
+                    self.api.TerminateJobObject.side_effect = None
+                    self.api.TerminateJobObject.return_value = 0
+                else:
+                    failing = self.api.JOB if operation == "job" else self.api.PORT
+                    self.api.CloseHandle.side_effect = lambda handle: int(handle != failing)
+                with self.assertRaisesRegex(OSError, message):
+                    job.close()
+                self.assertEqual([call.args[0] for call in self.api.CloseHandle.call_args_list],
+                                 [self.api.JOB, self.api.PORT])
+
+    def test_parent_exit_does_not_allow_return_with_an_active_descendant(self):
+        process = Mock(pid=11, _handle=self.api.BOOTSTRAP, returncode=0, stdin=Mock(), stdout=None, stderr=None)
+        process.poll.return_value = 0
+        with (
+            patch.object(process_budget, "os", SimpleNamespace(name="nt", pathsep=";")),
+            patch.object(process_budget, "environment", return_value={}),
+            patch.object(process_budget, "resolve_command", return_value=["synthetic-command"]),
+            patch.object(process_budget.subprocess, "Popen", return_value=process),
+        ):
+            completed = process_budget.run(["synthetic-command"], SCRIPTS, 1)
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(self.api.active, 0)
+        self.assertIn(("active", 1), self.api.events)
+        process.kill.assert_not_called()
+        self.assertLess(process.wait.call_args.kwargs["timeout"], 10)
+        self.assertGreater(process.wait.call_args.kwargs["timeout"], 9.9)
+        self.assertEqual(process.stdin.close.call_count, 2)
+
+    def test_failed_assignment_reaps_exact_bootstrap_without_opening_the_stdin_gate(self):
+        self.api.AssignProcessToJobObject.side_effect = None
+        self.api.AssignProcessToJobObject.return_value = 0
+        process = Mock(pid=11, _handle=self.api.BOOTSTRAP, stdin=Mock(), stdout=Mock(), stderr=Mock())
+        process.poll.return_value = None
+        with (
+            patch.object(process_budget, "os", SimpleNamespace(name="nt", pathsep=";")),
+            patch.object(process_budget, "environment", return_value={}),
+            patch.object(process_budget, "resolve_command", return_value=["synthetic-command"]),
+            patch.object(process_budget.subprocess, "Popen", return_value=process),
+            patch.object(process_budget, "Capture", side_effect=AssertionError("Gate must remain closed")),
+            self.assertRaisesRegex(OSError, "Cannot attach the launched process"),
+        ):
+            process_budget.run(["synthetic-command"], SCRIPTS, 1, capture=True, separate=True)
+        process.kill.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=10)
+        process.stdin.write.assert_not_called()
+        for stream in (process.stdin, process.stdout, process.stderr):
+            stream.close.assert_called_once_with()
+
+    def test_failed_process_creation_releases_job_and_completion_port(self):
+        error = OSError("synthetic-process-creation-failure")
+        with (
+            patch.object(process_budget, "os", SimpleNamespace(name="nt", pathsep=";")),
+            patch.object(process_budget, "environment", return_value={}),
+            patch.object(process_budget, "resolve_command", return_value=["synthetic-command"]),
+            patch.object(process_budget.subprocess, "Popen", side_effect=error),
+            self.assertRaises(OSError) as observed,
+        ):
+            process_budget.run(["synthetic-command"], SCRIPTS, 1)
+        self.assertIs(observed.exception, error)
+        self.api.AssignProcessToJobObject.assert_not_called()
+        self.api.TerminateJobObject.assert_not_called()
+        self.assertEqual([call.args[0] for call in self.api.CloseHandle.call_args_list],
+                         [self.api.JOB, self.api.PORT])
+
+
 class ProcessBudgetJobRunTest(unittest.TestCase):
     def run_mocked(self, *, platform="nt", failure="elapsed", exit_code=0, inherit_tree=False, query_error=0,
-                   missing_provider=None, capture=True, separate=True):
+                   missing_provider=None, capture=True, separate=True, cleanup_seconds=10):
         events = []
         api = FakeJobObservationApi((11, 22))
         api.query_errors[3] = query_error
@@ -2498,6 +3160,8 @@ class ProcessBudgetJobRunTest(unittest.TestCase):
             process.returncode = -9 if process.returncode is None else process.returncode
 
         job.close = Mock(side_effect=terminate)
+        job.remaining_cleanup = Mock(return_value=cleanup_seconds)
+        job.check_cleanup_deadline = Mock()
         original = job.observation
 
         def observe(*args):
@@ -2590,7 +3254,11 @@ class ProcessBudgetJobRunTest(unittest.TestCase):
         for stream in (process.stdout, process.stderr):
             if stream is not None:
                 stream.close.assert_called_once_with()
-        process.wait.assert_called_once_with(timeout=10)
+        process.wait.assert_called_once_with(timeout=cleanup_seconds if platform == "nt" else 10)
+        if platform == "nt":
+            job.check_cleanup_deadline.assert_called_once_with()
+        else:
+            job.check_cleanup_deadline.assert_not_called()
         if capture:
             capture_call.assert_called_once_with(process)
             captured.stop.set.assert_called()
@@ -2769,6 +3437,13 @@ class ProcessBudgetJobRunTest(unittest.TestCase):
                 observed.state_call.assert_not_called()
                 observed.job.observation.assert_not_called()
                 observed.api.QueryInformationJobObject.assert_not_called()
+
+    def test_windows_readers_and_bootstrap_share_remaining_cleanup_allowance(self):
+        observed = self.run_mocked(cleanup_seconds=0.125)
+        self.assertIs(type(observed.exception), process_budget.BudgetExceeded)
+        observed.reader.join.assert_called_once_with(timeout=0.125)
+        observed.process.wait.assert_called_once_with(timeout=0.125)
+        self.assertEqual(observed.job.remaining_cleanup.call_count, 2)
 
 
 if __name__ == "__main__":

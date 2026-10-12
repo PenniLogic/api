@@ -221,6 +221,14 @@ class Capture:
 
 
 class WindowsJob:
+    class Accounting(ctypes.Structure):
+        _fields_ = [
+            ("user_time", ctypes.c_int64), ("kernel_time", ctypes.c_int64),
+            ("period_user_time", ctypes.c_int64), ("period_kernel_time", ctypes.c_int64),
+            ("page_faults", ctypes.c_uint32), ("total", ctypes.c_uint32),
+            ("active", ctypes.c_uint32), ("terminated", ctypes.c_uint32),
+        ]
+
     def __init__(self):
         class BasicLimits(ctypes.Structure):
             _fields_ = [
@@ -238,6 +246,9 @@ class WindowsJob:
                 ("peak_process_memory", ctypes.c_size_t), ("peak_job_memory", ctypes.c_size_t),
             ]
 
+        class CompletionPort(ctypes.Structure):
+            _fields_ = [("key", ctypes.c_void_p), ("port", wintypes.HANDLE)]
+
         self.api = ctypes.WinDLL("kernel32", use_last_error=True)
         self.api.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
         self.api.CreateJobObjectW.restype = wintypes.HANDLE
@@ -245,39 +256,51 @@ class WindowsJob:
         self.api.SetInformationJobObject.restype = wintypes.BOOL
         self.api.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
         self.api.AssignProcessToJobObject.restype = wintypes.BOOL
-        self.api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        self.api.OpenProcess.restype = wintypes.HANDLE
+        self.api.CreateIoCompletionPort.argtypes = [
+            wintypes.HANDLE, wintypes.HANDLE, ctypes.c_size_t, wintypes.DWORD,
+        ]
+        self.api.CreateIoCompletionPort.restype = wintypes.HANDLE
+        self.api.GetQueuedCompletionStatus.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(ctypes.c_size_t),
+            ctypes.POINTER(ctypes.c_void_p), wintypes.DWORD,
+        ]
+        self.api.GetQueuedCompletionStatus.restype = wintypes.BOOL
+        self.api.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        self.api.TerminateJobObject.restype = wintypes.BOOL
+        self.api.QueryInformationJobObject.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
+        ]
+        self.api.QueryInformationJobObject.restype = ctypes.c_int32
         self.api.CloseHandle.argtypes = [wintypes.HANDLE]
         self.api.CloseHandle.restype = wintypes.BOOL
+        self.completion_port, self.attached, self.cleanup_deadline = None, False, None
         self.handle = self.api.CreateJobObjectW(None, None)
         if not self.handle:
             raise OSError("Cannot create the owned process budget job")
-        limits = ExtendedLimits()
-        limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        if not self.api.SetInformationJobObject(self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
-            self.close()
-            raise OSError("Cannot enforce the owned process budget job")
+        configured = False
+        try:
+            limits = ExtendedLimits()
+            limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not self.api.SetInformationJobObject(self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+                raise OSError("Cannot enforce the owned process budget job")
+            self.completion_port = self.api.CreateIoCompletionPort(wintypes.HANDLE(-1), None, 0, 1)
+            if not self.completion_port:
+                raise OSError("Cannot create the owned process completion port")
+            completion = CompletionPort(self.handle, self.completion_port)
+            if not self.api.SetInformationJobObject(self.handle, 7, ctypes.byref(completion), ctypes.sizeof(completion)):
+                raise OSError("Cannot associate the owned process completion port")
+            configured = True
+        finally:
+            if not configured:
+                self.close()
 
     def attach(self, process):
-        handle = self.api.OpenProcess(0x0101, False, process.pid)
-        if not handle:
-            raise OSError("Cannot open the launched process for its budget job")
-        try:
-            if not self.api.AssignProcessToJobObject(self.handle, handle):
-                raise OSError("Cannot attach the launched process to its budget job")
-        finally:
-            self.api.CloseHandle(handle)
+        if not self.api.AssignProcessToJobObject(self.handle, process._handle):
+            raise OSError("Cannot attach the launched process to its budget job")
+        self.attached = True
 
     def observation(self, process, command, child_environment):
         errors = (OSError, RuntimeError, AttributeError, TypeError, ValueError, OverflowError, ctypes.ArgumentError)
-
-        class Accounting(ctypes.Structure):
-            _fields_ = [
-                ("user_time", ctypes.c_int64), ("kernel_time", ctypes.c_int64),
-                ("period_user_time", ctypes.c_int64), ("period_kernel_time", ctypes.c_int64),
-                ("page_faults", ctypes.c_uint32), ("total", ctypes.c_uint32),
-                ("active", ctypes.c_uint32), ("terminated", ctypes.c_uint32),
-            ]
 
         class Members(ctypes.Structure):
             _fields_ = [
@@ -301,7 +324,7 @@ class WindowsJob:
 
         def accounting():
             try:
-                value = Accounting()
+                value = self.Accounting()
                 status, length = read(1, value)
                 if status != "observed":
                     return {"status": status}
@@ -433,11 +456,56 @@ class WindowsJob:
         except errors:
             return JOB_STATE_UNAVAILABLE
 
+    def active_processes(self):
+        value, returned = self.Accounting(), ctypes.c_uint32()
+        if (not self.api.QueryInformationJobObject(
+                self.handle, 1, ctypes.byref(value), ctypes.sizeof(value), ctypes.byref(returned))
+                or returned.value != ctypes.sizeof(value) or value.active > value.total):
+            raise OSError("Cannot establish owned process job completion")
+        return value.active
+
+    def remaining_cleanup(self):
+        return max(0, self.cleanup_deadline - time.monotonic())
+
+    def check_cleanup_deadline(self):
+        if time.monotonic() > self.cleanup_deadline:
+            raise TimeoutError("Owned process job cleanup exceeded its existing allowance")
+
     def close(self):
-        if self.handle:
-            if not self.api.CloseHandle(self.handle):
-                raise OSError("Cannot close the owned process budget job")
-            self.handle = None
+        if self.cleanup_deadline is None:
+            self.cleanup_deadline = time.monotonic() + 10
+        try:
+            if self.handle and self.attached:
+                if not self.api.TerminateJobObject(self.handle, 1):
+                    raise OSError("Cannot terminate the owned process budget job")
+                # Kill-on-close initiates termination; retain the job until its tree is empty.
+                while self.active_processes():
+                    milliseconds = int(self.remaining_cleanup() * 1000)
+                    if milliseconds <= 0:
+                        raise TimeoutError("Owned process job cleanup exceeded its existing allowance")
+                    message, key, overlapped = wintypes.DWORD(), ctypes.c_size_t(), ctypes.c_void_p()
+                    if not self.api.GetQueuedCompletionStatus(
+                            self.completion_port, ctypes.byref(message), ctypes.byref(key),
+                            ctypes.byref(overlapped), milliseconds):
+                        if ctypes.get_last_error() == 258:  # WAIT_TIMEOUT
+                            if self.active_processes() == 0:
+                                break
+                            raise TimeoutError("Owned process job cleanup exceeded its existing allowance")
+                        raise OSError("Cannot wait for owned process job completion")
+                    if key.value != self.handle:
+                        raise OSError("Unexpected owned process job completion key")
+        finally:
+            try:
+                if self.handle:
+                    if not self.api.CloseHandle(self.handle):
+                        raise OSError("Cannot close the owned process budget job")
+                    self.handle = None
+            finally:
+                if self.completion_port:
+                    if not self.api.CloseHandle(self.completion_port):
+                        raise OSError("Cannot close the owned process completion port")
+                    self.completion_port = None
+        self.check_cleanup_deadline()
 
 
 def run(command, root, seconds, capture=False, *, env=None, separate=False, inherit_tree=False):
@@ -515,7 +583,8 @@ def run(command, root, seconds, capture=False, *, env=None, separate=False, inhe
                 if failure != "elapsed":
                     captured.stop.set()
                 for thread in captured.threads:
-                    thread.join(timeout=0.1 if inherit_tree and os.name != "nt" else 10)
+                    thread.join(timeout=(job.remaining_cleanup() if job is not None else
+                                         0.1 if inherit_tree else 10))
         stdout, stderr, streams = captured.snapshot(separate) if captured else (None, None, None)
         if failure == "output":
             raise OutputExceeded(stdout, stderr, streams)
@@ -537,7 +606,12 @@ def run(command, root, seconds, capture=False, *, env=None, separate=False, inhe
                 try:
                     terminate()
                 finally:
-                    process.wait(timeout=10)
+                    try:
+                        process.wait(timeout=job.remaining_cleanup() if job is not None else 10)
+                    except subprocess.TimeoutExpired as error:
+                        if job is None:
+                            raise
+                        raise TimeoutError("Owned process job cleanup exceeded its existing allowance") from error
             elif job is not None:
                 job.close()
         finally:
@@ -545,3 +619,5 @@ def run(command, root, seconds, capture=False, *, env=None, separate=False, inhe
                 for stream in (process.stdin, process.stdout, process.stderr):
                     if stream is not None:
                         stream.close()
+            if job is not None:
+                job.check_cleanup_deadline()
