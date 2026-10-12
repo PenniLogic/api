@@ -332,7 +332,7 @@ uses `-I -S -B` and cannot spawn its child before its owned Job is attached.
 
 The temporary **DIAGNOSTIC COUNTERFACTUAL** in the approved-shell regression
 leaves the default `PSModulePath` untouched and keeps the original uncaptured
-`Write-Output`, 10-second call, return/output assertions and E/S-or-U/X grammar.
+`Write-Output`, 10-second call, return/output assertions and legacy E/S-or-U/X prefixes.
 It exclusively creates `build/diagnostics/api106-approved-shell-module-lookup.jsonl`
 outside JUnit selection. The child appends only bounded, flushed ASCII NDJSON:
 at most 8192 bytes, five records and 6144 bytes per LF-terminated record, with
@@ -341,6 +341,31 @@ credentials or ANSI are exported. Historical V1 capsules retain their exact
 four-record contract and contain no negative-hook availability or observation.
 Versions must not be mixed or reinterpreted. This V2 producer requires the
 corresponding reviewed canonical collector; its generated adoption is separate.
+
+The existing boundary file gains one optional literal `C` after `ES[01]{3}` and
+before optional `X`. Only the first matching `Write-Output` pre-lookup callback
+can append it, immediately after its existing pre-record writer invocation
+returns. The callback snapshots an eligible boundary path before that invocation;
+the path is armed only after the redirect flags are appended, around the original
+bare command statement, and disarmed before `X`. The existing first-target latch
+prevents a second or nested lookup from emitting another `C`. No `C` is emitted
+under `EU`, before the redirect flags, or during finalization.
+
+`C` attests only that this writer invocation returned, including a return through
+its existing handled failure path. It does not certify a successful JSON write,
+native delegate return, lookup success, entry into the cmdlet, output or pipeline
+completion, cleanup, or cause. Failure to observe `C` is not proof of non-return.
+Marker append errors use the existing callback-refusal handling; no raw error or
+path is exported. The V2 JSON records and five-record limit are unchanged.
+The paired canonical boundary reader retains every old valid prefix and adds
+only `ES[01]{3}CX?`, with a seven-byte valid maximum and eight-byte overflow probe.
+It reports `pre_record_writer_return` as `observed` for valid `C`, otherwise
+`not-observed`; repeated or out-of-order `C` remains invalid. The earlier
+producer-only increment left the generated reader unchanged. This composed source
+adoption includes the canonical workflow/checker and 2254-byte inline boundary
+reader from protected-merged [PenniLogic/infra#87](https://github.com/PenniLogic/infra/pull/87),
+commit `0f5f7b7ce4baa8206add295ce0adee03292a5b20`. Old records are not
+reinterpreted; native success and acceptance remain unestablished.
 
 The V2 record order is `roots`, `observer`, optional `pre`, optional `not-found`,
 optional `post`, each at most once. `roots/observed` has `value` (`present` or
@@ -422,9 +447,10 @@ oversize, incomplete lines, non-ASCII/BOM/ANSI, duplicate JSON keys, wrong types
 unknown fields/enums, invalid hashes/duplicate indices and impossible phase
 relationships are explicit refusals, without echoing offending data. A valid
 prefix is partial/unknown: only a final post completes a capsule, not a negative
-edge alone. Absent callbacks do not prove a cached lookup. The
-existing 2105-byte boundary reader remains unchanged. Neither roots, callbacks,
-X nor a green instrumented test establishes cause, delivery, no-error behavior,
+edge alone. Absent callbacks do not prove a cached lookup. The earlier producer-only
+increment retained the 2105-byte boundary reader; this composed adoption uses the
+2254-byte inline reader described above. Neither roots, callbacks, `C`, X nor a
+green instrumented test establishes cause, delivery, no-error behavior,
 cleanup, a default-launch repair or merge acceptance.
 
 An elapsed-budget failure samples bounded process state immediately before the

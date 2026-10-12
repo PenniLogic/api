@@ -1,5 +1,6 @@
 """Synthetic report probes test the consumer, never stand in for real PIT results."""
 
+import ast
 from collections import Counter
 import ctypes
 import errno
@@ -1101,7 +1102,7 @@ class MutationNativeConsoleTest(unittest.TestCase):
 APPROVED_SHELL_LOOKUP_SETUP = r"""
 $script:pennilogicLookup=@{File=$null;Clock=$null;Hash=$null;Write=$null;Bytes=0;Records=0;
     Failed=$false;Armed=$false;Seen=$false;Done=$false;Start=$null;Pre=$null;Post=$null;
-    NegativeArmed=$false;NegativeSeen=$false;NegativeStart=$null;NotFound=$null};
+    NegativeArmed=$false;NegativeSeen=$false;NegativeStart=$null;NotFound=$null;Boundary=$null};
 try {
     $s=$script:pennilogicLookup;
     $attributes=[IO.File]::GetAttributes($pennilogicLookupPath);
@@ -1206,11 +1207,14 @@ try {
                                 $p.Write.Invoke('"phase":"post","status":"unavailable","code":"nested-target"');
                                 return
                             };
-                            $p.Seen=$true;$ms=$p.Clock.ElapsedMilliseconds;$time='null';
+                            $p.Seen=$true;$preBoundary=$p.Boundary;$ms=$p.Clock.ElapsedMilliseconds;$time='null';
                             if($ms -ge 0 -and $ms -le 600000){
                                 $p.Start=$ms;$time=$ms.ToString($p.Invariant)
                             };
                             $p.Write.Invoke('"phase":"pre","status":"observed","ms":'+$time);
+                            if($null -ne $preBoundary){
+                                [IO.File]::AppendAllText($preBoundary,'C',[Text.Encoding]::ASCII);
+                            };
                         } catch {
                             $p.Done=$true;
                             $p.Write.Invoke('"phase":"post","status":"refused","code":"callback"');
@@ -1375,6 +1379,136 @@ try {
     }
 };
 """
+
+
+class ApprovedShellWriterReturnTest(unittest.TestCase):
+    """Source controls only; never execute PowerShell or the protected native fixture."""
+
+    def fixture(self):
+        source = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        owner, = [item for item in source.body if isinstance(item, ast.ClassDef) and item.name == "ProcessBudgetTest"]
+        method, = [item for item in owner.body if isinstance(item, ast.FunctionDef)
+                   and item.name == "test_approved_system_shell_survives_without_inheriting_ambient_path"]
+        return method
+
+    def test_first_target_callback_marks_only_after_the_pre_writer_returns(self):
+        callback = APPROVED_SHELL_LOOKUP_SETUP.split(
+            "$s.Pre=[EventHandler[System.Management.Automation.CommandLookupEventArgs]]{", 1,
+        )[1].split("$s.Post=[EventHandler[System.Management.Automation.CommandLookupEventArgs]]{", 1)[0]
+        expected = r"""
+            param($sender,$lookupEvent)
+            $p=$script:pennilogicLookup;
+            if(-not $p.Armed -or $p.Done -or $p.Failed){return};
+            try {
+                if(-not [StringComparer]::OrdinalIgnoreCase.Equals(
+                    $p.NameProperty.GetValue($lookupEvent),'Write-Output')){return};
+                if($p.Seen){
+                    $p.Done=$true;
+                    $p.Write.Invoke('"phase":"post","status":"unavailable","code":"nested-target"');
+                    return
+                };
+                $p.Seen=$true;$preBoundary=$p.Boundary;$ms=$p.Clock.ElapsedMilliseconds;$time='null';
+                if($ms -ge 0 -and $ms -le 600000){
+                    $p.Start=$ms;$time=$ms.ToString($p.Invariant)
+                };
+                $p.Write.Invoke('"phase":"pre","status":"observed","ms":'+$time);
+                if($null -ne $preBoundary){
+                    [IO.File]::AppendAllText($preBoundary,'C',[Text.Encoding]::ASCII);
+                };
+            } catch {
+                $p.Done=$true;
+                $p.Write.Invoke('"phase":"post","status":"refused","code":"callback"');
+            }
+        };
+        """
+        self.assertEqual([line.strip() for line in callback.strip().splitlines()],
+                         [line.strip() for line in expected.strip().splitlines()])
+        marker = "[IO.File]::AppendAllText($preBoundary,'C',[Text.Encoding]::ASCII);"
+        self.assertEqual(APPROVED_SHELL_LOOKUP_SETUP.count(marker), 1)
+        self.assertNotIn(marker, APPROVED_SHELL_LOOKUP_FINISH)
+
+    def test_marker_is_armed_only_between_s_flags_and_the_original_bare_statement(self):
+        assignment, = [item for item in ast.walk(self.fixture()) if isinstance(item, ast.Assign)
+                       and len(item.targets) == 1 and ast.unparse(item.targets[0]) == "command[-1]"]
+        expected = ast.parse(r"""(
+            "$pennilogicBoundary='" + str(boundary).replace("'", "''") + "';"
+            "[IO.File]::AppendAllText($pennilogicBoundary,'E',[Text.Encoding]::ASCII);"
+            "$pennilogicLookupPath='" + str(lookup).replace("'", "''") + "';"
+            + APPROVED_SHELL_LOOKUP_SETUP +
+            "$i=[Console]::IsInputRedirected;$o=[Console]::IsOutputRedirected;"
+            "$e=[Console]::IsErrorRedirected;"
+            "$r=if(($i -is [bool])-and($o -is [bool])-and($e -is [bool]))"
+            "{'S{0}{1}{2}' -f [int]$i,[int]$o,[int]$e}else{'U'};"
+            "[IO.File]::AppendAllText($pennilogicBoundary,$r,[Text.Encoding]::ASCII);"
+            "if($r -cne 'U'){$script:pennilogicLookup.Boundary=$pennilogicBoundary};"
+            + command[-1] + ";"
+            "$script:pennilogicLookup.Boundary=$null;"
+            "[IO.File]::AppendAllText($pennilogicBoundary,'X',[Text.Encoding]::ASCII)"
+            + APPROVED_SHELL_LOOKUP_FINISH
+        )""", mode="eval").body
+        self.assertEqual(ast.dump(assignment.value), ast.dump(expected))
+        self.assertIn("NotFound=$null;Boundary=$null};", APPROVED_SHELL_LOOKUP_SETUP)
+
+    def test_original_fixture_keeps_shell_arguments_limits_and_result_assertions(self):
+        method = self.fixture()
+        expected_command = ast.parse(
+            r"""command = (["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                            "Write-Output 'approved-shell'"] if os.name == "nt"
+                           else ["/bin/sh", "-c", "printf 'approved-shell\\n'"])"""
+        ).body[0]
+        self.assertEqual(ast.dump(method.body[0]), ast.dump(expected_command))
+        calls = [item for item in ast.walk(method) if isinstance(item, ast.Call)]
+        run, = [item for item in calls if ast.unparse(item.func) == "process_budget.run"]
+        self.assertEqual(ast.dump(run), ast.dump(ast.parse(
+            "process_budget.run(command, SCRIPTS, 10, capture=True)", mode="eval",
+        ).body))
+        expected_assertions = ast.parse(
+            'self.assertEqual(result.returncode, 0)\nself.assertEqual(result.stdout.strip(), "approved-shell")'
+        ).body
+        self.assertEqual([ast.dump(item) for item in method.body[-2:]],
+                         [ast.dump(item) for item in expected_assertions])
+        for name in ("boundary", "lookup"):
+            create, = [item for item in calls if ast.unparse(item.func) == name + ".open"]
+            self.assertEqual(ast.dump(create), ast.dump(ast.parse(name + '.open("xb")', mode="eval").body))
+
+    def test_observer_installation_and_cleanup_keep_null_and_identity_guards(self):
+        setup = "".join(APPROVED_SHELL_LOOKUP_SETUP.split())
+        finish = "".join(APPROVED_SHELL_LOOKUP_FINISH.split())
+        self.assertIn(
+            "if($null-eq$s.PreProperty.GetValue($s.Intrinsics)-and"
+            "$null-eq$s.PostProperty.GetValue($s.Intrinsics)){try{", setup,
+        )
+        self.assertIn("if($null-eq$s.NotFoundProperty.GetValue($s.Intrinsics)){", setup)
+        for name in ("Pre", "Post", "NotFound"):
+            install = f"$s.{name}Property.SetValue($s.Intrinsics,$s.{name})"
+            identity = f"[Object]::ReferenceEquals($s.{name}Property.GetValue($s.Intrinsics),$s.{name})"
+            self.assertEqual(setup.count(install), 1)
+            self.assertIn(identity, setup)
+            self.assertIn(
+                f"if($null-ne$s.{name}-and{identity})"
+                f"{{$s.{name}Property.SetValue($s.Intrinsics,$null)}}", finish,
+            )
+
+    def test_v2_writer_limits_flush_and_fixed_failure_channel_are_unchanged(self):
+        writer = APPROVED_SHELL_LOOKUP_SETUP.split("$s.Write=[Action[string]]{", 1)[1].split(
+            "$rootsReady=$false;", 1,
+        )[0]
+        self.assertIn('''$bytes=[Text.Encoding]::ASCII.GetBytes('{"v":2,'+$fields+"}`n");''', writer)
+        compact = "".join(writer.split())
+        self.assertIn(
+            "if($bytes.Length-gt6144-or$w.Records-ge5-or"
+            "$w.Bytes+$bytes.Length-gt8192-or$w.File.Length-ne$w.Bytes){throw'capture-limit'};", compact,
+        )
+        self.assertIn(
+            "$w.File.Write($bytes,0,$bytes.Length);$w.File.Flush();"
+            "$w.Bytes+=$bytes.Length;$w.Records++;", compact,
+        )
+        self.assertIn(
+            '''catch{$w.Failed=$true;[Console]::Error.WriteLine('{"event":"api106_module_lookup_capture",'''
+            '''"status":"refused"}');}''', compact,
+        )
+        self.assertNotIn("Boundary", writer)
+        self.assertNotIn("pre_record_writer_return", APPROVED_SHELL_LOOKUP_SETUP)
 
 
 def run_docker_fixture(command, root):
@@ -1626,7 +1760,9 @@ class ProcessBudgetTest(unittest.TestCase):
                     "$r=if(($i -is [bool])-and($o -is [bool])-and($e -is [bool]))"
                     "{'S{0}{1}{2}' -f [int]$i,[int]$o,[int]$e}else{'U'};"
                     "[IO.File]::AppendAllText($pennilogicBoundary,$r,[Text.Encoding]::ASCII);"
+                    "if($r -cne 'U'){$script:pennilogicLookup.Boundary=$pennilogicBoundary};"
                     + command[-1] + ";"
+                    "$script:pennilogicLookup.Boundary=$null;"
                     "[IO.File]::AppendAllText($pennilogicBoundary,'X',[Text.Encoding]::ASCII)"
                     + APPROVED_SHELL_LOOKUP_FINISH
                 )

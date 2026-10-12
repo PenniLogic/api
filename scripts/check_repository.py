@@ -313,7 +313,7 @@ def validate_non_api_ci_workflow(name, data):
 import hashlib
 
 
-API_CI_SHA256 = "b2f7a523d5799c918287a7fe71533766c1111f7556074f2f72ad4c1126fb504c"
+API_CI_SHA256 = "51bf74f97dbb427e68c4db320ebd69bf9daadcc116c9ca628fcbd33f2349fceb"
 REQUIRED += ("scripts/qualify_windows.py",)
 
 
