@@ -19,6 +19,66 @@ quality = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(quality)
 
 
+class QualityObserverPairSelectionTest(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch("sys.stdout", new_callable=io.StringIO))
+        self.errors = self.enterContext(patch("sys.stderr", new_callable=io.StringIO))
+        self.run = self.enterContext(patch.object(quality, "run"))
+        self.gradle = self.enterContext(patch.object(quality, "gradle"))
+        self.metrics = self.enterContext(patch.object(quality, "test_metrics"))
+        self.load = self.enterContext(patch.object(quality, "script_module"))
+
+    def invoke(self, command, *args):
+        with patch.object(sys, "argv", ["quality.py", command, *args]):
+            return quality.main()
+
+    def test_default_test_command_does_not_load_or_install_the_supervisor(self):
+        self.assertEqual(self.invoke("test", "--require-prepared"), 0)
+        self.run.assert_called_once_with([
+            sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests", "-v",
+        ])
+        self.gradle.assert_called_once_with("test", require_prepared=True)
+        self.metrics.assert_called_once_with()
+        self.load.assert_not_called()
+
+    def test_explicit_windows_test_flag_selects_only_the_fixed_full_discovery_owner(self):
+        with patch.object(quality, "os", SimpleNamespace(name="nt")):
+            self.assertEqual(self.invoke("test", "--api106-observer-pair", "--require-prepared"), 0)
+        self.load.assert_called_once_with("api106_observer_pair")
+        self.load.return_value.run_owning_suite.assert_called_once_with()
+        self.run.assert_not_called()
+        self.gradle.assert_called_once_with("test", require_prepared=True)
+        self.metrics.assert_called_once_with()
+
+    def test_non_windows_and_non_test_flags_refuse_before_any_helper_or_runtime(self):
+        for platform, commands in (
+            ("posix", ("test",)),
+            ("nt", ("version", "install", "build", "lint", "format", "coverage", "gate-self-test",
+                    "money-guard", "money-coverage", "money-coverage-report",
+                    "money-mutation", "money-mutation-report")),
+        ):
+            for command in commands:
+                with self.subTest(platform=platform, command=command), patch.object(
+                    quality, "os", SimpleNamespace(name=platform),
+                ), self.assertRaises(SystemExit) as error:
+                    self.invoke(command, "--api106-observer-pair")
+                self.assertEqual(error.exception.code, 2)
+        for operation in (self.run, self.gradle, self.metrics, self.load):
+            operation.assert_not_called()
+        self.assertIn("requires Windows and test", self.errors.getvalue())
+
+    def test_supervisor_and_required_suite_failures_do_not_reach_gradle_or_metrics(self):
+        for error in (ValueError("synthetic-enclosure-refused"),
+                      subprocess.CalledProcessError(1, ["synthetic-full-discovery"])):
+            with self.subTest(error=type(error).__name__), patch.object(quality, "os", SimpleNamespace(name="nt")):
+                self.load.return_value.run_owning_suite.side_effect = error
+                self.assertEqual(self.invoke("test", "--api106-observer-pair"), 1)
+        self.run.assert_not_called()
+        self.gradle.assert_not_called()
+        self.metrics.assert_not_called()
+        self.assertIn("Quality command failed", self.errors.getvalue())
+
+
 class QualityNodeBridgeTest(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="api-node-bridge-test-"))).resolve()

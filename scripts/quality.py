@@ -591,10 +591,14 @@ def main():
     parser.add_argument("--artifact-dir", type=Path, help="Parent directory for isolated gate self-test copies")
     parser.add_argument("--money-client-interop-node", type=Path, help="Approved absolute Node executable for Gradle commands")
     parser.add_argument("--require-prepared", action="store_true", help="Require prepared source inputs for build/test")
+    parser.add_argument("--api106-observer-pair", action="store_true",
+                        help="Explicit Windows test-only API106 diagnostic; canonical activation is not wired")
     args = parser.parse_args()
     started = time.monotonic()
     budget = None
     try:
+        if args.api106_observer_pair and (args.command != "test" or os.name != "nt"):
+            parser.error("--api106-observer-pair requires Windows and test")
         gradle_options = {}
         if args.require_prepared:
             if args.command not in ("build", "test"):
@@ -620,7 +624,10 @@ def main():
                 check_coverage(args.base, args.write_baseline)
                 check_money_coverage(args.base, args.write_baseline)
         elif args.command == "test":
-            run([sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests", "-v"])
+            if args.api106_observer_pair:
+                script_module("api106_observer_pair").run_owning_suite()
+            else:
+                run([sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests", "-v"])
             gradle("test", **gradle_options)
             test_metrics()
         elif args.command == "lint":

@@ -464,13 +464,99 @@ generated workflow activates it. With that value unchanged, the original compose
 PowerShell payload, provider call and return/output assertions are unchanged.
 The pair protocol and its synthetic tests do not authorize a real execution.
 
-A separately reviewed owning-suite supervisor may install the enclosure callable
-in the **same discovery-process module instance**. At the original test position,
-the protocol requests a hard 60-second enclosure including a 12-second cleanup
-reserve. This module does not implement or attest that external supervisor.
-Its additional admission checks reserve a complete ten-second work plus existing
-shared ten-second cleanup allowance before either arm, and refuse completion
-after 48 seconds. Neither inner limit is increased or shortened.
+The API-owned `scripts/api106_observer_pair.py` source prepares an explicit
+Windows/test-only `python scripts/quality.py test --api106-observer-pair` route.
+This is default-off diagnostic source, not execution authorization or an accepted
+native enclosure. Ordinary `quality.py test` still runs its original unittest
+command. The generated qualifier does not forward the option.
+
+The prepared supervisor creates the actual discovery interpreter suspended,
+retains its creation process/thread handles, attaches the existing Windows Job,
+rechecks the API source/interpreter bindings and only then resumes its thread.
+There is no extra live bootstrap interpreter, breakaway or attachment fallback.
+The child keeps the ordinary interpreter startup flags, cwd, environment and
+standard streams. A fixed byte-bound `-c` bootstrap replaces only the `-m` entry
+and restores its absolute cwd import entry. It discovers the full ordinary
+suite, locates exactly one original test object and its existing module, requires
+the `None` seam, and installs there without reloading, filtering or reordering
+the suite. The private fixed-size control pipe, unnamed eight-byte deadline
+mapping and its unnamed mutex are separate from test logs and stdin. Only those three private handles
+and duplicates of the original three standard handles enter the suspended
+child's explicit handle whitelist. Source/tool bindings are API-specific per-use continuity checks of the
+selected CPython 3.14 executable and fixed API sources, not Infra Git/Gitleaks
+admission, a signed runtime attestation or native qualification.
+
+At that test's `startTest`, the child samples one monotonic epoch and atomically
+publishes its exact bits into the initially zero shared word, before target
+admission or its first control wait. The successful zero-to-epoch exchange is
+the publication point; a delayed exchange retains the earlier sampled time,
+never fresh credit. The parent already owns and monitors the mapping. It does
+not need the `ARM` pipe frame to discover or enforce that epoch; any later `ARM`
+must match it exactly. Scheduling before publication is not a demonstrated
+native bound, and no target admission/control wait precedes publication.
+The same epoch is yielded by the enclosure and used for all 28/48-second protocol
+checks; acknowledgment latency never restarts it. Normal `stopTest` accounting
+follows the original per-test fixture cleanup and result callbacks. Initial
+discovery and class/module fixtures can precede this per-test window; they are not prewarmed,
+reordered or claimed inside it. Each arm still reserves a complete ten-second
+work plus existing shared ten-second cleanup allowance. Neither inner limit is
+increased or shortened.
+
+All shared-word reads and conditional writes hold the same inherited mutex.
+`CreateMutexW`, zero-time `WaitForSingleObject` and `ReleaseMutex` replace the
+unavailable current-host `InterlockedCompareExchange64` export; no intrinsic,
+undocumented entrypoint or raw unsynchronized access is substituted. The
+documented interlocked API-set contract also resolves to KernelBase on that
+observed host, whose export table lacks the symbol; it is not a usable alias.
+The [documented wait/release barriers](https://learn.microsoft.com/en-us/windows/win32/sync/synchronization-and-multiprocessor-issues)
+protect the complete word operation. The
+[zero-time acquisition](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject)
+never enters a blocking wait: contention, abandonment
+or another acquisition failure refuses the control path rather than hiding
+the epoch behind a lock wait, retrying or granting another allowance. Thus even
+brief benign contention can abort this diagnostic; it is not evidence about
+the required shell or the original stall. A granted abandoned mutex is released
+once without consuming its word. A failed or interrupted release remains
+uncertain, with no further word access or release retry. The sampled epoch is
+retained locally even when publication or release fails, so cleanup cannot
+resample it. Successful publication is visible after the protected write and
+release, still before admission or any blocking control wait.
+
+The independent parent observes the protected atomic word before, during and after
+overlapped control/report I/O, with pending waits sliced at at most 25 milliseconds.
+That observation interval is not another allowance or a native timing guarantee.
+A live child publishing an epoch but never delivering `ARM` still has the same
+independent parent deadline owner. While the word is zero, preceding suite work
+does not acquire a global 60-second limit. The case must finalize by 48 seconds; otherwise its
+outer Job is terminated and termination, member drain, reaping, control/report
+I/O cancellation and release use the remainder of the same 60-second deadline,
+including the 12-second reserve. Unconfirmed cleanup remains a failure, never
+success-shaped evidence; unconfirmed overlapped I/O does not attest its later
+interpreter-finalization time or a bounded parent exit. API-owned mock controls
+cover this state machine but do not prove real Windows timing, cancellation,
+nested-Job or filesystem behavior.
+
+The child publishes a permanent closed word only after receiving the final
+`DONE` acknowledgment within the original work deadline. The parent independently
+observes that closure before disarming case enforcement; waiting for closure
+also uses that deadline. The word is never reset: premature close, epoch change,
+erasure or rearm is refused. Subsequent ordinary suite work keeps its existing
+accounting without an expired case deadline. This mapping, mutex, atomic
+publication and polling are additional observer perturbations, not an established causal fix.
+
+One parent ownership guard spans acquisition, attachment, protocol construction,
+supervision and finalization; there is no pre-entry cleanup handoff. Every
+acquired temporary inheritable handle receives one release attempt even when an
+earlier release raises a declared cleanup error, `KeyboardInterrupt` or
+`SystemExit`. Ambiguous closes are not retried. The original acquisition/creation
+failure stays primary, secondary release failures remain explicit, and release
+uncertainty prevents a true cleanup claim. The shared Windows ownership helper
+is unchanged. The mapping view and both mapping/mutex handles are independently
+released, even after a declared cleanup failure or cancellation; partial
+acquisition remains owned. These source corrections do not supersede the frozen
+v1/v2 reviews or constitute independent acceptance of v3. A resource-free DLL
+binding check verifies export resolution only, not mutex behavior, physical
+deadline enforcement or any hosted activation.
 
 The fixed order is required, then `auxiliary-no-lookup-delegates`, each at most
 once. The required arm receives the original command object and calls the same
@@ -510,16 +596,33 @@ the required arm's own pass into a claimed required failure, or into pair
 acceptance. An enclosure cannot suppress an incomplete protocol into success.
 Unexpected interruption leaves an incomplete report and propagates.
 
-Hosted activation is still missing: `quality.py test` starts a new unittest
-process, so setting this Python variable in `qualify_windows.py` would not reach
-the owning test. A separately reviewed discovery-process bootstrap and actual
-hard enclosure must preserve the full preceding owning-suite context. The
-canonical qualifier/workflow must also retain and safely project the separate
-pair report and auxiliary evidence even when the required test fails; today's
-collector only handles the required V2 capsule and its inline boundary reader.
-No generated consumer or process-ownership helper is changed by this preparation.
-The new synthetic protocol controls execute after the original test class in
-ordinary discovery ordering; they never run either real arm.
+The discovery process and its descendants acquire an additional outer Job;
+the unchanged per-arm Jobs are nested. That is an additional observer confounder.
+Normal case completion requires the known live discovery process, identified
+by its creation handle, to be the sole outer member: it is not active-zero.
+The outer Job remains owned until suite exit without an expired case cleanup
+deadline. If the parent must terminate discovery, the rest of the inventory is
+incomplete; it cannot preserve a killed interpreter's live exception or fabricate
+replacement test results. On the normal path, the original required exception
+and unittest objects/order/result accounting are preserved.
+
+The parent exclusively creates the private
+`api106-approved-shell-enclosure.jsonl` receipt, bounded to eight ASCII records,
+1024 bytes each and 8192 total, using deadline-bound overlapped writes.
+Its case-closed record is a pre-acknowledgment phase observation that one known
+discovery member remains, not proof of the later shared-word closure; its
+cleanup record cannot attest its own subsequent file-handle close. A partial
+receipt is partial, not proof of cleanup or full inventory.
+
+Hosted activation is still unwired. After separate canonical source review, the
+qualifier/workflow must explicitly forward the option and an independent
+`always()` collector must retain and safely project the pair report, auxiliary
+boundary/roots-only capsule and enclosure receipt even when discovery fails or
+is terminated. Today's collector only handles the required V2 capsule and its
+inline boundary reader. No generated consumer or shared process-ownership helper
+is changed by this preparation. The ordinary source/protocol controls, including
+the new supervisor mocks, never run either real arm. Independent review and a
+separate one-use execution decision remain required.
 
 Required-fail/auxiliary-pass would support observer participation only in that
 paired occurrence, not identify a callback or explain the pre-observer failure.

@@ -9,6 +9,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -1429,8 +1430,11 @@ def run_approved_shell_observer_pair(case, command, boundary, lookup, *, enclosu
     required_error, required_traceback = None, None
     completed = False
     try:
-        with enclosure(seconds=60, cleanup_reserve=12):
-            started = time.monotonic()
+        with enclosure(seconds=60, cleanup_reserve=12) as window:
+            started = getattr(window, "started", None)
+            if (type(started) not in (int, float) or not math.isfinite(started)
+                    or not 0 <= started <= time.monotonic()):
+                raise ValueError("Observer comparison requires the admitted absolute epoch")
             for parent in (boundary.parent.parent, boundary.parent):
                 if parent.is_symlink() or parent.is_junction():
                     raise ValueError("Observer comparison diagnostic area is a reparse point")
@@ -3743,7 +3747,7 @@ class WindowsShellObserverPairProtocolTest(unittest.TestCase):
         @contextmanager
         def enclosure(**kwargs):
             self.enclosure_calls.append(kwargs)
-            yield
+            yield SimpleNamespace(started=self.now)
 
         self.enclosure = enclosure
 
@@ -3958,6 +3962,33 @@ class WindowsShellObserverPairProtocolTest(unittest.TestCase):
         self.assertEqual(inputs[1].read_bytes(), b"")
         self.assertEqual(inputs[2].read_bytes(), b"")
 
+    def test_absolute_window_includes_prior_admission_instead_of_restarting_after_enter(self):
+        @contextmanager
+        def enclosure(**kwargs):
+            self.now = 29
+            yield SimpleNamespace(started=0)
+
+        self.enclosure = enclosure
+        inputs = self.inputs()
+        with self.assertRaisesRegex(TimeoutError, "complete 10\\+10-second arm"):
+            self.invoke(inputs)
+        self.arm_runner.assert_not_called()
+        self.assertEqual(self.records(inputs)[-1]["reason"], "insufficient-complete-arm-budget")
+
+    def test_invalid_or_missing_absolute_window_refuses_before_report_or_provider(self):
+        for started in (None, True, "synthetic", float("nan"), float("inf"), -1, 1):
+            @contextmanager
+            def enclosure(**kwargs):
+                yield SimpleNamespace(started=started)
+
+            with self.subTest(started=repr(started)):
+                self.enclosure = enclosure
+                inputs = self.inputs()
+                with self.assertRaisesRegex(ValueError, "admitted absolute epoch"):
+                    self.invoke(inputs)
+                self.arm_runner.assert_not_called()
+                self.assertFalse(inputs[1].with_name("api106-approved-shell-observer-pair.jsonl").exists())
+
     def test_required_timeout_is_not_replaced_by_auxiliary_success(self):
         inputs = self.inputs()
         error = process_budget.BudgetExceeded("")
@@ -4017,7 +4048,7 @@ class WindowsShellObserverPairProtocolTest(unittest.TestCase):
     def test_enclosure_failure_preserves_required_exception_and_secondary_cause(self):
         @contextmanager
         def enclosure(**kwargs):
-            yield
+            yield SimpleNamespace(started=self.now)
             raise TimeoutError("synthetic enclosing cleanup limit")
 
         inputs = self.inputs()
@@ -4033,7 +4064,7 @@ class WindowsShellObserverPairProtocolTest(unittest.TestCase):
     def test_enclosure_failure_after_required_success_is_not_silenced(self):
         @contextmanager
         def enclosure(**kwargs):
-            yield
+            yield SimpleNamespace(started=self.now)
             raise TimeoutError("synthetic enclosing cleanup limit")
 
         self.enclosure = enclosure
@@ -4045,7 +4076,7 @@ class WindowsShellObserverPairProtocolTest(unittest.TestCase):
         @contextmanager
         def enclosure(**kwargs):
             try:
-                yield
+                yield SimpleNamespace(started=self.now)
             except ValueError:
                 pass
 
