@@ -614,15 +614,47 @@ discovery member remains, not proof of the later shared-word closure; its
 cleanup record cannot attest its own subsequent file-handle close. A partial
 receipt is partial, not proof of cleanup or full inventory.
 
-Hosted activation is still unwired. After separate canonical source review, the
-qualifier/workflow must explicitly forward the option and an independent
-`always()` collector must retain and safely project the pair report, auxiliary
-boundary/roots-only capsule and enclosure receipt even when discovery fails or
-is terminated. Today's collector only handles the required V2 capsule and its
-inline boundary reader. No generated consumer or shared process-ownership helper
-is changed by this preparation. The ordinary source/protocol controls, including
-the new supervisor mocks, never run either real arm. Independent review and a
-separate one-use execution decision remain required.
+The generated workflow and qualifier now contain the canonical default-off
+route. This local candidate uses corrected canonical source
+`e94792d8605c42c8b9d8dd5ee398b757b27486eb` through its immutable actual-history
+binding `f719c9d0242a0c80ea401cc18cc2e96da61cabce`. Both are published on the
+producer topic, not accepted on protected main. The adoption changes only the
+generated CI workflow, repository checker and Windows qualifier from the
+original API source; the other 22 generated outputs remain unchanged. This
+correction from the prior local candidate changes only the qualifier, preserving
+all 24 other generated outputs, the legacy inline reader and API
+owner/controller/observer/provider/preparation source.
+
+The typed `workflow_dispatch` input `api106_observer_pair` defaults to `false`.
+Only an explicitly selected manual run uses the full owning command
+`quality.py test --require-prepared --api106-observer-pair`: complete supervised
+Python discovery, then Gradle test and JUnit metrics only if discovery succeeds.
+Same-job checkout, Python, Git, JDK and preparation bindings admit finite runtime
+inputs before owner creation; ambient PATH and environment are not admitted as
+a substitute. The fresh Gradle cache does not imply offline or prewarmed
+dependencies. The command has 270 seconds of work and the existing single
+10-second cleanup allowance, with a strict diagnostic closed interval below
+300 seconds. The nested case remains 48 work / 60 total / 12 reserve, and
+neither original 10+10 arm is extended.
+
+An independently scheduled conditional `always()` collector can safely project
+the pair report, auxiliary boundary/roots-only capsule and enclosure receipt,
+including incomplete evidence after discovery failure or termination. The
+complementary default path retains the legacy reader. Primary ownership errors
+and returned nonzero results stay failures even when reporting or finalization
+also fails. The explicit route consumes the retained owner captures directly,
+removing the redundant outer temporary-file staging identified in
+`CORE-72A-001`. Active owning failures retain their identity and cause; ordinary
+returned nonzero results project safe Python evidence before any eligible fresh
+Gradle/JUnit evidence. The prior negative consumer opinion remains on its exact
+source subject; neither producer opinions nor the older scoped QA pass clear
+this corrected consumer.
+
+Source/synthetic controls never run either real arm or prove native ownership,
+inventory, cleanup, parity or timing. Fresh independent consumer review,
+publication and a separate one-use execution decision remain required; no hosted
+diagnostic is activated by this local source adoption, and the original
+10,001-ms timeout cause is not established.
 
 Required-fail/auxiliary-pass would support observer participation only in that
 paired occurrence, not identify a callback or explain the pre-observer failure.
