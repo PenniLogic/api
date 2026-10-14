@@ -1,12 +1,23 @@
 import org.gradle.api.artifacts.dsl.LockMode
+import org.gradle.api.logging.Logging
+import org.gradle.api.services.BuildService
+import org.gradle.api.services.BuildServiceParameters
 import org.gradle.api.tasks.testing.TestDescriptor
 import org.gradle.api.tasks.testing.TestListener
 import org.gradle.api.tasks.testing.TestResult
+import org.gradle.build.event.BuildEventsListenerRegistry
+import org.gradle.tooling.events.FinishEvent
+import org.gradle.tooling.events.OperationCompletionListener
+import org.gradle.tooling.events.task.TaskFailureResult
+import org.gradle.tooling.events.task.TaskFinishEvent
+import org.gradle.tooling.events.task.TaskSkippedResult
+import org.gradle.tooling.events.task.TaskSuccessResult
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+import javax.inject.Inject
 
 plugins {
     kotlin("jvm") version "2.4.10"
@@ -14,6 +25,79 @@ plugins {
     jacoco
     id("com.diffplug.spotless") version "8.10.2"
 }
+
+object GradleTaskTiming {
+    fun record(event: TaskFinishEvent): String {
+        val task = event.descriptor.taskPath
+        require(task.length <= 256 && Regex(":[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*").matches(task)) {
+            "Unsupported public task identifier"
+        }
+        val result = event.result
+        val status =
+            when (result) {
+                is TaskFailureResult -> {
+                    "failed"
+                }
+
+                is TaskSkippedResult -> {
+                    "skipped"
+                }
+
+                is TaskSuccessResult -> {
+                    when {
+                        result.isFromCache -> "from_cache"
+                        result.isUpToDate -> "up_to_date"
+                        else -> "executed_success"
+                    }
+                }
+
+                else -> {
+                    "unknown"
+                }
+            }
+        val start = result.startTime
+        val end = result.endTime
+        val measured = start >= 0 && end >= start
+        return groovy.json.JsonOutput.toJson(
+            mapOf(
+                "event" to "gradle_task_completed",
+                "task" to task,
+                "status" to status,
+                "timing" to if (measured) "measured" else "unavailable",
+                "start_ms" to start.takeIf { measured },
+                "end_ms" to end.takeIf { measured },
+                "wall_ms" to if (measured) end - start else null,
+            ),
+        )
+    }
+}
+
+abstract class GradleTaskTimingService :
+    BuildService<BuildServiceParameters.None>,
+    OperationCompletionListener {
+    override fun onFinish(event: FinishEvent) {
+        if (event !is TaskFinishEvent) return
+        try {
+            Logging.getLogger(GradleTaskTimingService::class.java).lifecycle(GradleTaskTiming.record(event))
+        } catch (_: Exception) {
+            // Telemetry must not replace an owning task failure or print its private exception.
+            System.err.println("""{"event":"gradle_task_timing_unavailable","reason":"observation-failed"}""")
+        }
+    }
+}
+
+abstract class GradleTaskTimingPlugin
+    @Inject
+    constructor(
+        private val events: BuildEventsListenerRegistry,
+    ) : Plugin<Project> {
+        override fun apply(project: Project) {
+            val timings = project.gradle.sharedServices.registerIfAbsent("gradleTaskTimings", GradleTaskTimingService::class.java) {}
+            events.onTaskCompletion(timings)
+        }
+    }
+
+apply<GradleTaskTimingPlugin>()
 
 group = "com.pennilogic"
 version = "0.1.0"

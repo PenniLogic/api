@@ -78,6 +78,94 @@ class SyntheticStrategy:
         return json.dumps(self.strategy).encode()
 
 
+class GradleTaskTimingTest(unittest.TestCase):
+    """Source regressions; real Gradle event validation uses the extracted observer unchanged."""
+
+    @staticmethod
+    def observer_source():
+        build = (SCRIPTS.parent / "build.gradle.kts").read_text(encoding="utf-8")
+        start = build.index("object GradleTaskTiming {")
+        end = build.index("\ngroup = ", start)
+        imports = "\n".join(line for line in build.splitlines() if line.startswith("import "))
+        return imports + "\n\n" + build[start:end]
+
+    def test_supported_completion_service_is_registered_once_without_task_actions(self):
+        observer = self.observer_source()
+        for required in ("BuildService<BuildServiceParameters.None>", "\n    OperationCompletionListener {",
+                         "override fun onFinish(event: FinishEvent)", "if (event !is TaskFinishEvent) return",
+                         'registerIfAbsent("gradleTaskTimings", GradleTaskTimingService::class.java)',
+                         "events.onTaskCompletion(timings)", "apply<GradleTaskTimingPlugin>()"):
+            with self.subTest(required=required):
+                self.assertEqual(1, observer.count(required))
+        for forbidden in ("doFirst", "doLast", "dependsOn", "finalizedBy", "mustRunAfter", "onlyIf",
+                          "outputs.", "TaskExecutionListener", "afterTask", "buildFinished"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, observer)
+
+    def test_success_does_not_include_cache_up_to_date_skip_failure_or_unknown_results(self):
+        observer = self.observer_source()
+        status = observer.split("        val status =\n", 1)[1].split("        val start = ", 1)[0]
+        self.assertEqual([
+            "            when (result) {",
+            "                is TaskFailureResult -> {",
+            '                    "failed"',
+            "                }",
+            "",
+            "                is TaskSkippedResult -> {",
+            '                    "skipped"',
+            "                }",
+            "",
+            "                is TaskSuccessResult -> {",
+            "                    when {",
+            '                        result.isFromCache -> "from_cache"',
+            '                        result.isUpToDate -> "up_to_date"',
+            '                        else -> "executed_success"',
+            "                    }",
+            "                }",
+            "",
+            "                else -> {",
+            '                    "unknown"',
+            "                }",
+            "            }",
+        ], status.splitlines())
+
+    def test_time_is_the_result_interval_not_output_arrival_or_a_zero_fallback(self):
+        observer = self.observer_source()
+        for required in ("val start = result.startTime", "val end = result.endTime",
+                         "val measured = start >= 0 && end >= start",
+                         '"timing" to if (measured) "measured" else "unavailable"',
+                         '"start_ms" to start.takeIf { measured }', '"end_ms" to end.takeIf { measured }',
+                         '"wall_ms" to if (measured) end - start else null'):
+            with self.subTest(required=required):
+                self.assertIn(required, observer)
+        for forbidden in ("currentTimeMillis", "nanoTime", "event.eventTime", "coerceAtLeast", "sumOf"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, observer)
+
+    def test_payload_is_bounded_public_task_data_not_result_or_exception_serialization(self):
+        observer = self.observer_source()
+        self.assertIn('task.length <= 256 && Regex(":[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*").matches(task)', observer)
+        payload = observer.split("return groovy.json.JsonOutput.toJson(", 1)[1].split("\n        )", 1)[0]
+        keys = [line.split('"')[1] for line in payload.splitlines() if '"' in line]
+        self.assertEqual(["event", "task", "status", "timing", "start_ms", "end_ms", "wall_ms"], keys)
+        for forbidden in (".failures", ".skipMessage", ".displayName", ".executionReasons", ".toString()",
+                          ".absolutePath", "System.getenv", "System.getProperty"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, observer)
+
+    def test_telemetry_failure_reports_a_closed_reason_without_rethrowing(self):
+        observer = self.observer_source()
+        handler = observer.split("} catch (_: Exception) {", 1)[1].split("\n        }", 1)[0]
+        self.assertEqual(
+            {"event": "gradle_task_timing_unavailable", "reason": "observation-failed"},
+            json.loads(handler.split('"""', 2)[1]),
+        )
+        self.assertIn("System.err.println(", handler)
+        self.assertNotIn("throw", handler)
+        self.assertNotIn("stackTrace", handler)
+        self.assertIn("Logging.getLogger(GradleTaskTimingService::class.java).lifecycle(GradleTaskTiming.record(event))", observer)
+
+
 class MutationPolicyTest(unittest.TestCase):
     def result(self, killed, total, **outcomes):
         counts = Counter({name: 0 for name in mutation.STATUSES})
