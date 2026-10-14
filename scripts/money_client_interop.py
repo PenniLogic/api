@@ -858,7 +858,7 @@ def validate_commands(records):
         require(type(record["cwd"]) is str and Path(record["cwd"]).is_absolute(), "commands-cwd")
         require(type(record.get("executed")) is bool and type(record.get("readiness_probe")) is bool, "commands-shape")
         duration = record.get("elapsed_seconds")
-        require(type(duration) in (int, float) and math.isfinite(duration) and 0 <= duration < SECONDS, "commands-duration")
+        require(type(duration) in (int, float) and 0 <= duration < SECONDS and math.isfinite(duration), "commands-duration")
         require(type(record["expected_exit"]) is int
                 and (type(record["exit_code"]) is int if record["executed"]
                      else record["readiness_probe"] and record["exit_code"] is None), "commands-failed")
@@ -875,6 +875,26 @@ def validate_commands(records):
             require(type(stream["path"]) is str and type(stream["bytes"]) is int and 0 <= stream["bytes"] <= MAX_DOCUMENT
                     and type(stream["sha256"]) is str and sources.DIGEST.fullmatch(stream["sha256"]), "commands-stream")
         require(record["stdout"]["bytes"] + record["stderr"]["bytes"] <= MAX_DOCUMENT, "commands-stream")
+
+
+def timing_event(run_id, records, report_elapsed_seconds, full_elapsed_seconds):
+    require(type(run_id) is str and re.fullmatch(r"[0-9a-f]{32}", run_id) is not None, "timings-identity")
+    require(type(records) is list and len(records) <= len(required_commands()) + 3, "timings-command-count")
+    validate_commands(records)
+    require(all(record["exit_code"] is None or -(2 ** 31) <= record["exit_code"] < 2 ** 32
+                for record in records), "timings-exit")
+    require(type(report_elapsed_seconds) in (int, float) and 0 < report_elapsed_seconds < SECONDS
+            and type(full_elapsed_seconds) in (int, float)
+            and report_elapsed_seconds <= full_elapsed_seconds <= sys.float_info.max
+            and math.isfinite(full_elapsed_seconds), "timings-duration")
+    return {
+        "event": "money_client_interop_timings", "run_id": run_id,
+        "commands": [
+            {key: record[key] for key in ("label", "elapsed_seconds", "executed", "exit_code", "readiness_probe")}
+            for record in records
+        ],
+        "report_elapsed_seconds": report_elapsed_seconds, "full_elapsed_seconds": full_elapsed_seconds,
+    }
 
 
 def verify_commands(root, directory, records, run_id, *, reader=None):
@@ -1027,10 +1047,13 @@ def run_gate(root, run_id, *, require_prepared=False):
         "schema": REPORT_SCHEMA, "status": "passed", "run_id": run_id, "report_sha256": binding(report_file)["sha256"],
     }, replace=True)
     verify(root)
-    return {"event": "money_client_interop", "status": "passed", "run_id": run_id,
-            "case_count": COUNT, "languages": list(LANGUAGES), "invalid_cases_per_language": INVALID_COUNT,
-            "disagreement_refusals": 3, "recoveries": 3, "elapsed_seconds": round(time.monotonic() - runner.started, 6),
-            "report": (directory / "report.json").as_posix()}
+    result = {"event": "money_client_interop", "status": "passed", "run_id": run_id,
+              "case_count": COUNT, "languages": list(LANGUAGES), "invalid_cases_per_language": INVALID_COUNT,
+              "disagreement_refusals": 3, "recoveries": 3, "elapsed_seconds": round(time.monotonic() - runner.started, 6),
+              "report": (directory / "report.json").as_posix()}
+    print(json.dumps(timing_event(run_id, report["commands"], report["elapsed_seconds"], result["elapsed_seconds"]),
+                     sort_keys=True, allow_nan=False))
+    return result
 
 
 def completion(root, run_id=None):
@@ -1125,8 +1148,8 @@ def verify(root=ROOT):
         require(client == expected and client["disagreement_refused"] is True
                 and all(type(client[key]) is int for key in ("round_trip", "invalid_rejected", "recovery", "skipped")),
                 "evidence-client-count")
-    require(type(report["elapsed_seconds"]) in (int, float) and math.isfinite(report["elapsed_seconds"])
-            and 0 < report["elapsed_seconds"] < SECONDS, "evidence-budget")
+    require(type(report["elapsed_seconds"]) in (int, float) and 0 < report["elapsed_seconds"] < SECONDS
+            and math.isfinite(report["elapsed_seconds"]), "evidence-budget")
     return {"event": "money_client_interop", "status": "verified", "run_id": report["run_id"], "case_count": COUNT}
 
 

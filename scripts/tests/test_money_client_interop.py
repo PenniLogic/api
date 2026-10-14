@@ -1368,6 +1368,32 @@ class RunnerBoundaryTest(InteropTest):
         self.assertEqual(interpreter.read_bytes(), b"untrusted-cache-control")
         self.assertEqual(compiler.read_bytes(), b"untrusted-cache-control")
 
+    def test_timing_projection_reuses_the_recorded_runner_clock_and_exit(self):
+        gradle_home = interop.owned(self.root, Path("gradle-support"))
+        gradle_home.mkdir()
+        result = subprocess.CompletedProcess(["synthetic-command"], 0, b"", b"")
+        with mock.patch.dict(os.environ, {"GRADLE_USER_HOME": str(gradle_home)}), \
+                mock.patch.object(interop.Path, "home", side_effect=AssertionError("unexpected ambient home")) as home, \
+                mock.patch.object(interop.time, "monotonic", side_effect=(10.0, 10.125, 12.875)), \
+                mock.patch.object(interop.process_budget, "run", return_value=result) as command:
+            runner = interop.Runner(self.root, Path("recorded-timing"))
+            runner.call("generator-golden", ["synthetic-command"])
+        command.assert_called_once()
+        home.assert_not_called()
+        self.assertEqual(command.call_args.kwargs["env"]["GRADLE_USER_HOME"], str(gradle_home))
+        recorded = interop.read_json(self.root / "recorded-timing/commands/00-generator-golden.json")
+        self.assertEqual(recorded, runner.records[0])
+        self.assertEqual(recorded["elapsed_seconds"], 2.75)
+        records = ExecutionEvidenceTest.records(self)
+        records[0] = recorded
+        with mock.patch.object(interop.time, "monotonic", side_effect=AssertionError("unexpected clock")), \
+                mock.patch.object(interop.process_budget, "run", side_effect=AssertionError("repeated command")):
+            event = interop.timing_event(self.run_id, records, 3.25, 4.875)
+        self.assertEqual(event["commands"][0], {
+            "label": "generator-golden", "elapsed_seconds": 2.75,
+            "executed": True, "exit_code": 0, "readiness_probe": False,
+        })
+
 
 class ExecutionEvidenceTest(InteropTest):
     def test_readiness_records_require_exact_exit_integer_types(self):
@@ -1478,6 +1504,225 @@ class ExecutionEvidenceTest(InteropTest):
             }
             for label in interop.required_commands()
         ]
+
+    def test_timing_event_has_exact_fields_order_and_unmodified_recorded_values(self):
+        records = self.records()
+        for index, record in enumerate(records):
+            record["elapsed_seconds"] = index / 100 + 0.000000123
+        original = copy.deepcopy(records)
+        event = interop.timing_event(self.run_id, records, 3.250001, 4.875002)
+        self.assertEqual(event, {
+            "event": "money_client_interop_timings", "run_id": self.run_id,
+            "commands": [
+                {"label": record["label"], "elapsed_seconds": record["elapsed_seconds"],
+                 "executed": True, "exit_code": record["exit_code"], "readiness_probe": False}
+                for record in records
+            ],
+            "report_elapsed_seconds": 3.250001, "full_elapsed_seconds": 4.875002,
+        })
+        self.assertEqual(len(event["commands"]), 32)
+        self.assertEqual([record["label"] for record in event["commands"]], interop.required_commands())
+        self.assertEqual(records, original)
+
+    def test_timing_event_preserves_zero_through_three_optional_probe_outcomes(self):
+        probes = (
+            ("toolchain-probe", True, 0),
+            ("python-probe", True, 3),
+            ("typescript-probe", False, None),
+        )
+        for count in range(4):
+            records = self.records()
+            for index, (label, executed, exit_code) in enumerate(probes[:count]):
+                records.insert(index, {
+                    **records[-1], "label": label, "readiness_probe": True,
+                    "executed": executed, "exit_code": exit_code, "expected_exit": 0,
+                    "elapsed_seconds": 0.012345 + index,
+                })
+            with self.subTest(probes=count):
+                event = interop.timing_event(self.run_id, records, 8.5, 9.75)
+                self.assertEqual(len(event["commands"]), 32 + count)
+                self.assertEqual(
+                    [(record["label"], record["executed"], record["exit_code"], record["readiness_probe"])
+                     for record in event["commands"][:count]],
+                    [(label, executed, code, True) for label, executed, code in probes[:count]],
+                )
+                self.assertEqual([record["label"] for record in event["commands"][count:]], interop.required_commands())
+
+    def test_timing_event_refuses_missing_duplicate_foreign_reordered_or_excess_records(self):
+        records = self.records()
+        foreign = {**records[0], "label": "synthetic-private-foreign-command"}
+        controls = (
+            ("not-list", tuple(records), "timings-command-count"),
+            ("missing-list", None, "timings-command-count"),
+            ("empty", [], "commands-missing"),
+            ("missing-command", records[:-1], "commands-unexecuted"),
+            ("duplicate", [*records, records[0]], "commands-duplicate"),
+            ("foreign", [*records, foreign], "commands-unknown"),
+            ("reordered", [records[1], records[0], *records[2:]], "commands-unexecuted"),
+            ("too-many", [*records, *records[:4]], "timings-command-count"),
+        )
+        for label, value, cause in controls:
+            output = io.StringIO()
+            with self.subTest(control=label), contextlib.redirect_stdout(output), \
+                    self.assertRaisesRegex(interop.InteropError, "^" + cause + "$") as error:
+                interop.timing_event(self.run_id, value, 3.25, 4.875)
+            self.assertEqual(output.getvalue(), "")
+            self.assertNotIn("synthetic-private", str(error.exception))
+        for name in records[0]:
+            value = self.records()
+            del value[0][name]
+            with self.subTest(missing_field=name), self.assertRaises(interop.InteropError):
+                interop.timing_event(self.run_id, value, 3.25, 4.875)
+
+    def test_timing_event_refuses_malformed_execution_timing_and_private_extra_fields(self):
+        for field, value in (
+            ("executed", 1), ("executed", False), ("readiness_probe", 0), ("readiness_probe", True),
+            ("exit_code", False), ("exit_code", 0.0), ("exit_code", None),
+            ("elapsed_seconds", -0.1), ("elapsed_seconds", 600), ("elapsed_seconds", True),
+            ("elapsed_seconds", "0.1"), ("elapsed_seconds", None),
+            ("elapsed_seconds", float("nan")), ("elapsed_seconds", float("inf")),
+            ("elapsed_seconds", 10 ** 10000), ("private_extra", "synthetic-private"),
+        ):
+            records = self.records()
+            records[0][field] = value
+            with self.subTest(field=field, value_type=type(value).__name__), \
+                    self.assertRaises(interop.InteropError):
+                interop.timing_event(self.run_id, records, 3.25, 4.875)
+        for code in (-(2 ** 31) - 1, 2 ** 32, 10 ** 10000):
+            records = self.records()
+            records.append({**records[0], "label": "toolchain-probe", "readiness_probe": True, "exit_code": code})
+            with self.assertRaisesRegex(interop.InteropError, "^timings-exit$"):
+                interop.timing_event(self.run_id, records, 3.25, 4.875)
+
+    def test_timing_event_requires_actual_bounded_identity_and_coherent_enclosing_durations(self):
+        for identity in (None, True, "a" * 31, "A" * 32, "synthetic-private-path"):
+            with self.subTest(identity_type=type(identity).__name__), \
+                    self.assertRaisesRegex(interop.InteropError, "^timings-identity$"):
+                interop.timing_event(identity, self.records(), 3.25, 4.875)
+        for report, full in (
+            (0, 1), (-1, 1), (600, 601), (True, 1), ("1", 2), (None, 2),
+            (float("nan"), 2), (float("inf"), 2), (10 ** 10000, 2),
+            (2, 1), (1, True), (1, None), (1, "2"), (1, float("nan")),
+            (1, float("inf")), (1, 10 ** 10000),
+        ):
+            with self.subTest(report_type=type(report).__name__, full_type=type(full).__name__), \
+                    self.assertRaisesRegex(interop.InteropError, "^timings-duration$"):
+                interop.timing_event(self.run_id, self.records(), report, full)
+
+    def test_timing_event_is_bounded_and_never_projects_private_command_data(self):
+        records = self.records()
+        private = "synthetic-private-protocol-financial-environment-path"
+        for record in records:
+            record["argv"].append(private)
+            record["cwd"] = str(self.root / private)
+            record["environment"] = {"HOME": str(self.root / private)}
+            for name in ("stdout", "stderr"):
+                record[name]["path"] = private + name
+            record["elapsed_seconds"] = 599.9999999999999
+        for label, code in (("toolchain-probe", -(2 ** 31)), ("python-probe", 2 ** 32 - 1),
+                            ("typescript-probe", 3)):
+            records.append({**records[0], "label": label, "readiness_probe": True, "exit_code": code})
+        event = interop.timing_event(self.run_id, records, 599.999999, sys.float_info.max)
+        emitted = json.dumps(event, sort_keys=True, allow_nan=False)
+        self.assertEqual(len(event["commands"]), 35)
+        self.assertLess(len(emitted.encode("utf-8")), 16384)
+        self.assertNotIn(private, emitted)
+        self.assertNotIn(str(self.root), emitted)
+        for field in ("argv", "cwd", "environment", "stdout", "stderr", "expected_exit", "sha256", "path"):
+            self.assertNotIn('"' + field + '"', emitted)
+        self.assertTrue(all(set(record) == {
+            "label", "elapsed_seconds", "executed", "exit_code", "readiness_probe",
+        } for record in event["commands"]))
+
+    def invoke_timing_gate(self, verification_error=None, command_error=None):
+        specification = self.root / "synthetic-spec.yaml"
+        specification.write_bytes(b"synthetic specification, never generated\n")
+        classpath_file = self.root / "synthetic.jar"
+        classpath_file.write_bytes(b"synthetic classpath data, never executed\n")
+        runner = mock.Mock(started=10.0, records=self.records())
+        runner.call.side_effect = command_error
+        stdout, stderr = io.StringIO(), io.StringIO()
+
+        def document(path):
+            if path.name == "current.json":
+                return {"schema": interop.REPORT_SCHEMA, "status": "running", "run_id": self.run_id}
+            if path.name == "run.lock":
+                return {"run_id": self.run_id}
+            if path.name == "money-wire-fixtures.v1.json":
+                return {"invalid": [{"wire": {}} for _ in range(interop.INVALID_COUNT)]}
+            if path.name == "kotlin-launch.json":
+                return {"classpath": [str(classpath_file)]}
+            return {}
+
+        def verified(root):
+            self.assertEqual(root, self.root)
+            self.assertEqual(stdout.getvalue(), "", "timing output preceded full verification")
+            if verification_error is not None:
+                raise verification_error
+
+        with contextlib.ExitStack() as stack:
+            replacements = {
+                "ROOT": self.root, "Runner": mock.Mock(return_value=runner),
+                "read_json": mock.Mock(side_effect=document),
+                "producer": mock.Mock(return_value=self.root), "module_at": mock.Mock(),
+                "backend_launch": mock.Mock(return_value={"java": "synthetic-java", "classpath": [str(classpath_file)]}),
+                "api_inputs": mock.Mock(return_value={}), "classpath_bindings": mock.Mock(return_value={}),
+                "runtime_inputs": mock.Mock(return_value={}), "inventory": mock.Mock(return_value={}),
+                "runtime_dependencies": mock.Mock(return_value=("synthetic-python", "synthetic-node")),
+                "compile_kotlin": mock.Mock(return_value=["synthetic-kotlin"]),
+                "scratch_spec": mock.Mock(return_value=specification),
+                "generated": mock.Mock(side_effect=lambda _root, _dir, _spec, language, _pl: {"target": language}),
+                "corpus": mock.Mock(return_value={"values": [{"wire": {}}, {"wire": {}}]}),
+                "verify": mock.Mock(side_effect=verified),
+            }
+            for name in ("prepare", "prepare_tools", "verify_default_outputs", "validate_transport", "validate_disagreement"):
+                replacements[name] = mock.Mock()
+            for name, value in replacements.items():
+                stack.enter_context(mock.patch.object(interop, name, value))
+            stack.enter_context(mock.patch.object(interop.sources, "verify_provider"))
+            stack.enter_context(mock.patch.object(interop.time, "monotonic", side_effect=(13.25, 14.875)))
+            native = stack.enter_context(mock.patch.object(
+                interop.process_budget, "run", side_effect=AssertionError("native runtime is outside this control"),
+            ))
+            stack.enter_context(mock.patch.object(
+                sys, "argv", ["money_client_interop.py", "_run", "--run-id", self.run_id],
+            ))
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            stack.enter_context(contextlib.redirect_stderr(stderr))
+            code = interop.main()
+        native.assert_not_called()
+        return code, stdout.getvalue(), stderr.getvalue(), replacements["verify"]
+
+    def test_native_gate_adds_one_timing_event_after_verification_without_changing_success(self):
+        code, stdout, stderr, verify = self.invoke_timing_gate()
+        self.assertEqual((code, stderr), (0, ""))
+        verify.assert_called_once_with(self.root)
+        events = [json.loads(line) for line in stdout.splitlines()]
+        self.assertEqual(events, [
+            interop.timing_event(self.run_id, self.records(), 3.25, 4.875),
+            {"event": "money_client_interop", "status": "passed", "run_id": self.run_id,
+             "case_count": interop.COUNT, "languages": list(interop.LANGUAGES),
+             "invalid_cases_per_language": interop.INVALID_COUNT, "disagreement_refusals": 3, "recoveries": 3,
+             "elapsed_seconds": 4.875, "report": (interop.AREA / "runs" / self.run_id / "report.json").as_posix()},
+        ])
+
+    def test_native_gate_verification_failure_keeps_the_existing_refusal_without_timings(self):
+        code, stdout, stderr, verify = self.invoke_timing_gate(interop.InteropError("evidence-outputs"))
+        self.assertEqual((code, stdout), (1, ""))
+        verify.assert_called_once_with(self.root)
+        self.assertEqual(json.loads(stderr), {
+            "event": "money_client_interop", "status": "refused", "code": "evidence-outputs",
+        })
+
+    def test_native_gate_command_failure_is_not_replaced_by_timing_output(self):
+        code, stdout, stderr, verify = self.invoke_timing_gate(
+            command_error=interop.InteropError("command-failed-generator-golden"),
+        )
+        self.assertEqual((code, stdout), (1, ""))
+        verify.assert_not_called()
+        self.assertEqual(json.loads(stderr), {
+            "event": "money_client_interop", "status": "refused", "code": "command-failed-generator-golden",
+        })
 
     def test_bounded_reads_allocate_for_the_file_not_the_maximum_jar_allowance(self):
         path = self.root / "fixture.txt"
@@ -2084,6 +2329,18 @@ class OutputVerificationTest(PreparedInputsTest):
                 self.assertRaisesRegex(interop.InteropError, "^evidence-stale$"):
             self.verify_report()
         snapshot.assert_not_called()
+
+    def test_invalid_recorded_report_durations_remain_static_verification_refusals(self):
+        original = self.report["elapsed_seconds"]
+        for duration in (0, -1, True, 600, 10 ** 400):
+            self.report["elapsed_seconds"] = duration
+            self.refresh_report()
+            with self.subTest(duration_type=type(duration).__name__), \
+                    self.assertRaisesRegex(interop.InteropError, "^evidence-budget$"):
+                self.verify_report()
+        self.report["elapsed_seconds"] = original
+        self.refresh_report()
+        self.verify_report()
 
 
 if __name__ == "__main__":

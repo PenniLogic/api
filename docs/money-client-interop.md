@@ -162,6 +162,26 @@ Only a genuinely unexecuted optional probe may have a null actual exit; its
 expected exit must still be an integer. A fresh missing-path probe's actual
 exit 3 with expected exit 0 remains valid and triggers preparation, not success.
 
+After full evidence verification, the native worker also emits one
+`money_client_interop_timings` JSON event. It preserves the recorded order of all
+32 required commands and zero to three optional readiness probes. Each command
+contains only `label`, `elapsed_seconds`, `executed`, `exit_code` and
+`readiness_probe`; an unexecuted probe retains its null exit rather than an
+invented zero. The event includes the run ID, the private report's recorded
+`report_elapsed_seconds`, and `full_elapsed_seconds`, copied from the existing
+success event's terminal duration sample after verification. These enclosing
+durations include the command work; they are not additional task durations or
+evidence of non-overlap. Buffered Gradle log timestamps are not command starts.
+
+The timing projection contains no argv, environment, filesystem paths, stream
+bodies, protocol data or financial values. Unknown, duplicate, missing,
+malformed or excessive records refuse the gate through its existing static
+error handling; nothing is silently omitted or reported as a partial success.
+The existing success/refusal events and private report schema remain unchanged.
+This is measurement visibility only: no commands, cases, preparation, caches,
+scheduling, process boundaries or deadlines change, and it does not establish
+native timing, cleanup or product acceptance.
+
 The accepted package requires Node `>=24.14.0 <25` and npm `>=11`.
 Configuring only Python/JDK, or prepending an arbitrary Node executable to PATH,
 does not satisfy the explicit runtime boundary above. The published
