@@ -8,11 +8,13 @@ import ntpath
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
 import threading
 import time
 from ctypes import wintypes
+from uuid import UUID
 
 
 # The bootstrap cannot spawn the real command until its Job Object is attached.
@@ -44,8 +46,20 @@ MAX_JOB_IMAGE_CHARS = 32768
 ENVIRONMENT_KEYS = {
     "HOME", "USERPROFILE", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL",
     "JAVA_HOME", "GRADLE_USER_HOME", "CI", "GITHUB_ACTIONS",
-    "SYSTEMROOT", "WINDIR", "COMSPEC", "PATH", "PENNILOGIC_PYTHON",
+    "SYSTEMROOT", "WINDIR", "COMSPEC", "PATH", "PENNILOGIC_PYTHON", "PSModulePath",
 }
+
+
+def windows_os_path(value):
+    drive, tail = ntpath.splitdrive(value)
+    if (len(drive) != 2 or not drive[0].isascii() or not drive[0].isalpha() or drive[1] != ":"
+            or not tail.startswith("\\") or ntpath.normpath(value) != value
+            or any(character in value for character in '/;~*?"<>|')
+            or any(ord(character) < 32 for character in value) or ":" in tail
+            or any(part.endswith((" ", ".")) for part in tail.split("\\") if part)
+            or len(value.encode("utf-16-le")) // 2 > 32767):
+        raise ValueError("OS-derived Windows paths must be ordinary absolute paths")
+    return Path(value)
 
 
 def system_paths():
@@ -58,14 +72,55 @@ def system_paths():
     length = api.GetSystemDirectoryW(buffer, len(buffer))
     if not 0 < length < len(buffer):
         raise OSError("Cannot resolve the approved Windows system directory")
-    system = Path(buffer.value)
+    system = windows_os_path(buffer.value)
     return [system, system / "WindowsPowerShell" / "v1.0", system / "Wbem"]
+
+
+def windows_module_paths(system):
+    """Keep inbox first by explicitly including the OS-shared root after it.
+
+    Observed WinPS 5.1 prepends a missing shared root. This is ordering policy,
+    not universal module/configuration isolation.
+    """
+    shell = ctypes.WinDLL("shell32.dll", use_last_error=True, winmode=0x800)
+    shell.SHGetKnownFolderPath.argtypes = [
+        ctypes.c_void_p, wintypes.DWORD, wintypes.HANDLE, ctypes.POINTER(ctypes.c_void_p),
+    ]
+    shell.SHGetKnownFolderPath.restype = ctypes.c_long
+    ole = ctypes.WinDLL("ole32.dll", use_last_error=True, winmode=0x800)
+    ole.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    ole.CoTaskMemFree.restype = None
+    identifier = (ctypes.c_ubyte * 16).from_buffer_copy(
+        UUID("905e63b6-c1bf-494e-b29c-65b732d3d21a").bytes_le)
+    result = ctypes.c_void_p()
+    try:
+        status = shell.SHGetKnownFolderPath(ctypes.byref(identifier), 0, None, ctypes.byref(result))
+        if status != 0 or result.value is None:
+            raise OSError("Cannot resolve the OS Program Files directory")
+        program_files = windows_os_path(ctypes.wstring_at(result))
+    finally:
+        if result.value:
+            ole.CoTaskMemFree(result)
+    paths = [system[1] / "Modules", program_files / "WindowsPowerShell" / "Modules"]
+    for path in paths:
+        for index, ancestor in enumerate((*reversed(path.parents), path)):
+            try:
+                metadata = os.lstat(ancestor)
+            except FileNotFoundError:
+                if index == 0:
+                    raise
+                break
+            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_file_attributes & 1024:
+                raise ValueError("OS module path ancestors must be an ordinary directory")
+    return paths
 
 
 def environment(supplied=None, *, runtime_dirs=()):
     supplied = os.environ if supplied is None else supplied
     result = {key: value for key, value in supplied.items()
-              if key in ENVIRONMENT_KEYS - {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PENNILOGIC_PYTHON"}}
+              if key in ENVIRONMENT_KEYS - {
+                  "PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PENNILOGIC_PYTHON", "PSModulePath",
+              }}
     paths = [Path(sys.executable).absolute().parent, Path(sys.base_prefix) / "Scripts", *runtime_dirs]
     if result.get("JAVA_HOME"):
         home = Path(result["JAVA_HOME"])
@@ -81,6 +136,7 @@ def environment(supplied=None, *, runtime_dirs=()):
     if os.name == "nt":
         result.update(SYSTEMROOT=str(system[0].parent), WINDIR=str(system[0].parent),
                       COMSPEC=str(system[0] / "cmd.exe"))
+        result["PSModulePath"] = ";".join(str(path) for path in windows_module_paths(system))
     return result
 
 

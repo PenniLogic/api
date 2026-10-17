@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 import urllib.error
@@ -1396,6 +1397,78 @@ class RunnerBoundaryTest(InteropTest):
 
 
 class ExecutionEvidenceTest(InteropTest):
+    def test_generated_windows_environment_matches_command_record_schema(self):
+        from test_money_mutation import ProcessBudgetEnvironmentTest
+
+        supplied = {
+            "PATH": "ambient-path", "PSModulePath": "ambient-canonical",
+            "PSMODULEPATH": "ambient-upper", "pSmOdUlEpAtH": "ambient-mixed",
+            "ProgramFiles": "ambient-program-files", "PROGRAMFILES": "ambient-upper",
+            "pRoGrAmFiLeS": "ambient-mixed", "GRADLE_USER_HOME": str(self.root / "gradle-support"),
+        }
+        original = dict(supplied)
+        runner = interop.Runner(self.root, Path("windows-environment"))
+        records = self.records()
+        with (
+            ProcessBudgetEnvironmentTest.windows(self, budget=interop.process_budget),
+            mock.patch.object(interop, "os", SimpleNamespace(environ=supplied)),
+        ):
+            for record in records:
+                record["environment"] = runner.child_environment(record["label"])
+        expected = r"C:\OS\System32\WindowsPowerShell\v1.0\Modules;D:\Apps\WindowsPowerShell\Modules"
+        for record in records:
+            environment = record["environment"]
+            self.assertEqual(environment["PSModulePath"], expected)
+            self.assertEqual([key for key in environment if key.casefold() == "psmodulepath"], ["PSModulePath"])
+            self.assertFalse(any(key.casefold() == "programfiles" for key in environment))
+            self.assertFalse(any(value.startswith("ambient-") for value in environment.values()))
+        unchanged = copy.deepcopy(records)
+        interop.validate_commands(records)
+        self.assertEqual(records, unchanged)
+        self.assertEqual(supplied, original)
+
+    def test_non_windows_command_environments_do_not_inherit_module_path_variants(self):
+        from test_money_mutation import ProcessBudgetEnvironmentTest
+
+        supplied = {
+            "PSModulePath": "ambient-canonical", "PSMODULEPATH": "ambient-upper", "pSmOdUlEpAtH": "ambient-mixed",
+            "ProgramFiles": "ambient-program-files", "PROGRAMFILES": "ambient-upper", "pRoGrAmFiLeS": "ambient-mixed",
+            "GRADLE_USER_HOME": str(self.root / "gradle-support"),
+        }
+        original = dict(supplied)
+        runner = interop.Runner(self.root, Path("posix-environment"))
+        records = self.records()
+        with (
+            ProcessBudgetEnvironmentTest.posix(self, budget=interop.process_budget) as api,
+            mock.patch.object(interop, "os", SimpleNamespace(environ=supplied)),
+        ):
+            for record in records:
+                record["environment"] = runner.child_environment(record["label"])
+            api.loader.assert_not_called()
+        for record in records:
+            self.assertFalse(any(key.casefold() in {"psmodulepath", "programfiles"}
+                                 for key in record["environment"]))
+        interop.validate_commands(records)
+        self.assertEqual(supplied, original)
+
+    def test_command_environment_schema_still_rejects_unknown_keys_and_non_string_values(self):
+        from test_money_mutation import ProcessBudgetEnvironmentTest
+
+        runner = interop.Runner(self.root, Path("environment-schema"))
+        with ProcessBudgetEnvironmentTest.windows(self, budget=interop.process_budget):
+            environment = runner.child_environment("python-ready")
+        for key, value in (
+            ("UNKNOWN_SETTING", "unapproved"), ("ProgramFiles", "unapproved"),
+            ("PROGRAMFILES", "unapproved"), ("pRoGrAmFiLeS", "unapproved"),
+            ("PSMODULEPATH", "unapproved"), ("pSmOdUlEpAtH", "unapproved"),
+            ("PSModulePath", None),
+        ):
+            records = self.records()
+            records[0]["environment"] = {**environment, key: value}
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(interop.InteropError, "^commands-environment$"):
+                    interop.validate_commands(records)
+
     def test_readiness_records_require_exact_exit_integer_types(self):
         for label, field, value in (
             ("toolchain-probe", "exit_code", False),

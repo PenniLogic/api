@@ -11,7 +11,8 @@ import io
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1823,6 +1824,236 @@ class DockerFixtureDiagnosticTest(unittest.TestCase):
             run_docker_fixture(["synthetic-worker"], SCRIPTS)
         self.assertIs(observed.exception, error)
         self.assertFalse(hasattr(error, "__notes__"))
+
+
+class ProcessBudgetEnvironmentTest(unittest.TestCase):
+    @contextmanager
+    def windows(self, *, system=r"C:\OS\System32", program_files=r"D:\Apps",
+                system_length=None, folder_status=0, null_folder=False, lstat=None, budget=process_budget):
+        class AbsoluteWindowsPath(PureWindowsPath):
+            def absolute(path):
+                self.assertTrue(path.is_absolute())
+                return path
+
+        kernel, shell, ole = Mock(), Mock(), Mock()
+        folder_buffer = ctypes.create_unicode_buffer(program_files)
+        folder_requests = []
+
+        def system_directory(buffer, size):
+            buffer.value = system
+            return len(system) if system_length is None else system_length
+
+        def known_folder(identifier, flags, token, output):
+            folder_requests.append((ctypes.string_at(identifier, 16), flags, token))
+            if not null_folder:
+                ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.addressof(folder_buffer)
+            return folder_status
+
+        kernel.GetSystemDirectoryW.side_effect = system_directory
+        shell.SHGetKnownFolderPath.side_effect = known_folder
+        libraries = {"kernel32": kernel, "shell32.dll": shell, "ole32.dll": ole}
+        directory = SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=0)
+        operating_system = SimpleNamespace(
+            name="nt", pathsep=";", environ={"JAVA_HOME": "ambient-relative"},
+            lstat=Mock(side_effect=lstat) if lstat else Mock(return_value=directory),
+        )
+        with (
+            patch.object(budget, "os", operating_system),
+            patch.object(budget, "Path", AbsoluteWindowsPath),
+            patch.object(budget, "sys",
+                         SimpleNamespace(executable=r"C:\Python\python.exe", base_prefix=r"C:\Python")),
+            patch.object(budget.ctypes, "WinDLL",
+                         side_effect=lambda name, **kwargs: libraries[name], create=True) as loader,
+        ):
+            yield SimpleNamespace(os=operating_system, kernel=kernel, shell=shell, ole=ole,
+                                  loader=loader, folder_requests=folder_requests)
+
+    @contextmanager
+    def posix(self, *, budget=process_budget):
+        class AbsolutePosixPath(PurePosixPath):
+            def absolute(path):
+                self.assertTrue(path.is_absolute())
+                return path
+
+        operating_system = SimpleNamespace(name="posix", pathsep=":", environ={"CI": "ambient"})
+        with (
+            patch.object(budget, "os", operating_system),
+            patch.object(budget, "Path", AbsolutePosixPath),
+            patch.object(budget, "sys", SimpleNamespace(executable="/python/bin/python", base_prefix="/python")),
+            patch.object(budget.ctypes, "WinDLL", create=True) as loader,
+        ):
+            yield SimpleNamespace(os=operating_system, loader=loader)
+
+    def test_windows_module_order_is_os_derived_despite_poisoned_environment(self):
+        supplied = {
+            "PATH": "ambient-path", "Path": "other-ambient-path",
+            "PSModulePath": "poison-one", "PSMODULEPATH": "poison-two", "pSmOdUlEpAtH": "poison-three",
+            "ProgramFiles": "poison-four", "PROGRAMFILES": "poison-five", "pRoGrAmFiLeS": "poison-six",
+            "SYSTEMROOT": "poison-seven", "WINDIR": "poison-eight", "COMSPEC": "poison-nine",
+            "PENNILOGIC_PYTHON": "poison-ten", "JAVA_HOME": r"E:\Java", "CI": "1",
+        }
+        original = dict(supplied)
+        with self.windows() as api:
+            api.os.environ.update(supplied)
+            result = process_budget.environment(supplied, runtime_dirs=[PureWindowsPath(r"E:\runtime\bin")])
+        self.assertEqual(result.get("PSModulePath"),
+                         r"C:\OS\System32\WindowsPowerShell\v1.0\Modules;D:\Apps\WindowsPowerShell\Modules")
+        self.assertEqual([name for name in result if name.casefold() == "psmodulepath"], ["PSModulePath"])
+        self.assertFalse(any(name.casefold() == "programfiles" for name in result))
+        self.assertEqual(result["SYSTEMROOT"], r"C:\OS")
+        self.assertEqual(result["WINDIR"], r"C:\OS")
+        self.assertEqual(result["COMSPEC"], r"C:\OS\System32\cmd.exe")
+        self.assertEqual(result["PENNILOGIC_PYTHON"], r"C:\Python\python.exe")
+        self.assertEqual(result["PATH"].split(";"), [
+            r"C:\Python", r"C:\Python\Scripts", r"E:\runtime\bin", r"E:\Java\bin",
+            r"C:\OS\System32", r"C:\OS\System32\WindowsPowerShell\v1.0", r"C:\OS\System32\Wbem",
+        ])
+        self.assertEqual(result["CI"], "1")
+        self.assertEqual(supplied, original)
+
+    def test_repeated_sanitization_is_idempotent(self):
+        with self.windows():
+            directories = [PureWindowsPath(r"E:\runtime\bin")]
+            first = process_budget.environment({"JAVA_HOME": r"E:\Java"}, runtime_dirs=directories)
+            original = dict(first)
+            second = process_budget.environment(first, runtime_dirs=directories)
+        self.assertEqual(first, original)
+        self.assertEqual(second, first)
+
+    def test_known_folder_contract_frees_the_os_result(self):
+        with self.windows() as api:
+            process_budget.environment({})
+            self.assertEqual(api.folder_requests, [
+                (bytes.fromhex("b6635e90bfc14e49b29c65b732d3d21a"), 0, None),
+            ])
+            api.ole.CoTaskMemFree.assert_called_once()
+            api.loader.assert_any_call("shell32.dll", use_last_error=True, winmode=0x800)
+            api.loader.assert_any_call("ole32.dll", use_last_error=True, winmode=0x800)
+
+    def test_optional_shared_directory_can_be_missing_without_creating_it(self):
+        seen = []
+
+        def available_ancestor(path):
+            seen.append(str(path))
+            if str(path) == r"D:\Apps\WindowsPowerShell":
+                raise FileNotFoundError("optional shared directory absent")
+            return SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=0)
+
+        with self.windows(lstat=available_ancestor):
+            result = process_budget.environment({})
+        self.assertEqual(result["PSModulePath"].split(";"), [
+            r"C:\OS\System32\WindowsPowerShell\v1.0\Modules", r"D:\Apps\WindowsPowerShell\Modules",
+        ])
+        self.assertIn(r"D:\Apps", seen)
+        self.assertNotIn(r"D:\Apps\WindowsPowerShell\Modules", seen)
+
+    def test_nonordinary_available_ancestors_are_refused(self):
+        for mode, attributes in ((stat.S_IFREG | 0o644, 0), (stat.S_IFDIR | 0o755, 1024)):
+            def metadata(path):
+                return SimpleNamespace(
+                    st_mode=mode if str(path) == r"D:\Apps" else stat.S_IFDIR | 0o755,
+                    st_file_attributes=attributes if str(path) == r"D:\Apps" else 0,
+                )
+
+            with self.subTest(mode=mode, attributes=attributes), self.windows(lstat=metadata):
+                with self.assertRaisesRegex(ValueError, "ordinary directory"):
+                    process_budget.environment({})
+
+    def test_missing_drive_or_unreadable_ancestor_never_reaches_native_start(self):
+        for error in (FileNotFoundError("missing drive"), PermissionError("unreadable ancestor")):
+            with (
+                self.subTest(error=type(error).__name__),
+                self.windows(lstat=Mock(side_effect=error)),
+                patch.object(process_budget.subprocess, "Popen") as popen,
+                patch.object(process_budget, "WindowsJob") as job,
+            ):
+                with self.assertRaises(type(error)):
+                    process_budget.run([r"C:\Python\python.exe"], PureWindowsPath(r"C:\fixture"), 10, env={})
+                popen.assert_not_called()
+                job.assert_not_called()
+
+    def test_unicode_os_roots_keep_their_spelling_and_order(self):
+        program_files = "D:\\Apps\\\U0001f680"
+        with self.windows(program_files=program_files):
+            result = process_budget.environment({})
+        self.assertEqual(result["PSModulePath"].split(";"), [
+            r"C:\OS\System32\WindowsPowerShell\v1.0\Modules",
+            program_files + r"\WindowsPowerShell\Modules",
+        ])
+
+    def test_os_failures_and_invalid_root_shapes_refuse_before_native_start(self):
+        cases = [
+            {"system_length": 0}, {"system_length": 32768},
+            {"folder_status": -2147467259}, {"null_folder": True},
+        ]
+        invalid = ("relative", r"C:relative", r"\rooted", r"\\host\share", r"\\?\C:\OS",
+                   "C:/OS", r"C:\OS;injected", r"C:\OS\..\redirect", r"C:\OS\trailing.",
+                   r"C:\OS\space ", r"C:\PROGRA~1", r"C:\OS:stream", "C:\\OS\ninjected")
+        cases.extend({key: value} for key in ("system", "program_files") for value in invalid)
+        for options in cases:
+            with (
+                self.subTest(options=options), self.windows(**options) as api,
+                patch.object(process_budget.subprocess, "Popen") as popen,
+                patch.object(process_budget, "WindowsJob") as job,
+            ):
+                with self.assertRaises((OSError, ValueError)):
+                    process_budget.run([r"C:\Python\python.exe"], PureWindowsPath(r"C:\fixture"),
+                                       10, env={"ProgramFiles": r"D:\ambient-fallback"})
+                popen.assert_not_called()
+                job.assert_not_called()
+                if options.get("folder_status") or "program_files" in options:
+                    api.ole.CoTaskMemFree.assert_called_once()
+                if options.get("null_folder"):
+                    api.ole.CoTaskMemFree.assert_not_called()
+
+    def test_explicit_empty_mapping_never_inherits_ambient_java_or_flags(self):
+        with self.windows() as api:
+            api.os.environ.update(CI="ambient", PSModulePath="ambient", ProgramFiles="ambient")
+            result = process_budget.environment({})
+        self.assertNotIn("JAVA_HOME", result)
+        self.assertNotIn("CI", result)
+        self.assertEqual(result["PSModulePath"].split(";")[1], r"D:\Apps\WindowsPowerShell\Modules")
+
+    def test_run_preserves_explicit_runtime_path_without_launching_a_fixture(self):
+        supplied = {"PATH": r"E:\runtime\bin", "PSModulePath": "ambient"}
+        with (
+            self.windows(),
+            patch.object(process_budget, "resolve_command", side_effect=RuntimeError("source-only boundary")) as resolve,
+            patch.object(process_budget.subprocess, "Popen") as popen,
+            patch.object(process_budget, "WindowsJob") as job,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "source-only boundary"):
+                process_budget.run([r"C:\Python\python.exe"], PureWindowsPath(r"C:\fixture"), 10, env=supplied)
+            child = resolve.call_args.args[1]
+            self.assertIn(r"E:\runtime\bin", child["PATH"].split(";"))
+            self.assertNotIn("ambient", child["PSModulePath"])
+            popen.assert_not_called()
+            job.assert_not_called()
+        self.assertEqual(supplied, {"PATH": r"E:\runtime\bin", "PSModulePath": "ambient"})
+
+    def test_existing_relative_java_and_runtime_refusals_are_preserved(self):
+        for supplied, directories in (({"JAVA_HOME": "relative"}, ()), ({}, ("relative",))):
+            with self.subTest(supplied=supplied), self.windows():
+                with self.assertRaisesRegex(ValueError, "absolute"):
+                    process_budget.environment(supplied, runtime_dirs=directories)
+
+    def test_non_windows_environment_keeps_its_existing_explicit_mapping_policy(self):
+        with self.posix() as api:
+            result = process_budget.environment(
+                {"HOME": "/home/fixture", "JAVA_HOME": "/jdk", "PATH": "/ambient", "PSModulePath": "ambient",
+                 "PSMODULEPATH": "ambient-upper", "pSmOdUlEpAtH": "ambient-mixed",
+                 "ProgramFiles": "ambient", "PROGRAMFILES": "ambient-upper", "pRoGrAmFiLeS": "ambient-mixed",
+                 "PYTHONPATH": "/ambient"},
+                runtime_dirs=[PurePosixPath("/runtime/bin")],
+            )
+            empty = process_budget.environment({})
+            api.loader.assert_not_called()
+        self.assertEqual(result, {
+            "HOME": "/home/fixture", "JAVA_HOME": "/jdk", "PENNILOGIC_PYTHON": "/python/bin/python",
+            "PATH": "/python/bin:/python/Scripts:/runtime/bin:/jdk/bin:/usr/local/bin:/usr/bin:/bin",
+        })
+        self.assertNotIn("CI", empty)
+        self.assertNotIn("PSModulePath", empty)
 
 
 class ProcessBudgetTest(unittest.TestCase):

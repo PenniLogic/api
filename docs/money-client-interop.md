@@ -349,10 +349,19 @@ only for Java commands, and owned HOME/temp directories. Ambient PATH,
 Python/JVM/Node startup options, package-manager configuration and unrelated
 credentials are not forwarded. The Windows process-budget bootstrap itself
 uses `-I -S -B` and cannot spawn its child before its owned Job is attached.
+On Windows the helper constructs `PSModulePath` from the OS-derived Windows
+PowerShell inbox Modules directory first and the OS Known Folder Program Files
+shared Modules directory second. This key is allowed in recorded child
+environments but is never copied from ambient input on any OS. Ambient
+`PSModulePath`/`ProgramFiles` values and their case variants are not inherited;
+non-Windows child environments still omit `PSModulePath`.
 
 The temporary **DIAGNOSTIC COUNTERFACTUAL** in the approved-shell regression
-leaves the default `PSModulePath` untouched and keeps the original uncaptured
+leaves the helper-provided `PSModulePath` unchanged and keeps the original uncaptured
 `Write-Output`, 10-second call, return/output assertions and legacy E/S-or-U/X prefixes.
+The helper's requested inbox-first/shared-second order is an input policy, not
+universal engine/registry/configuration isolation, a hosted-timeout repair or
+proof of loaded-module trust.
 It exclusively creates `build/diagnostics/api106-approved-shell-module-lookup.jsonl`
 outside JUnit selection. The child appends only bounded, flushed ASCII NDJSON:
 at most 8192 bytes, five records and 6144 bytes per LF-terminated record, with
