@@ -44,8 +44,8 @@ the observed counters; the broader `independent_oracle` remains **`not_implement
 `disagreements: null`**. The original round-trip, associativity and collision categories remain
 required and unchanged. Synthetic Python refusal probes do not provide primitive execution credit.
 
-No Gradle discovery or selection change is needed: the existing `moneyTest` package selection
-already discovers the new test. Coverage and the unconditional `check -> moneyMutation` path
+The ordinary `test` task discovers the model alongside the existing Money tests. The
+`moneyTest` lifecycle alias reaches that same execution. Coverage and the unconditional `check -> moneyMutation` path
 consume the same required evidence. Mutation readback re-parses current JUnit evidence and
 requires a type-exact match to the recorded summary, rejecting duplicate JSON fields too.
 Both provider files, all eight classes, ALL/125 factories, 27 features, `-flogcall,+fkotlin`,
@@ -127,9 +127,11 @@ python scripts\quality.py money-mutation-report
 python -m unittest discover -s scripts\tests
 ```
 
-The normal build reaches `check -> moneyMutation -> moneyCoverageCheck -> moneyTest`.
-`moneyTest` is deliberately re-executed rather than restored from the build cache. The focused
-mutation command has the same dependencies and selection. The report command verifies the
+The normal build reaches
+`check -> moneyMutation -> moneyCoverageCheck -> moneyCoverageReport -> moneyTest -> test`.
+The ordinary `test` task is deliberately re-executed rather than restored from the build cache.
+The Money mutation command has the same prerequisites; PIT still selects only
+`com.pennilogic.money.*`. The report command verifies the
 latest attempt; it neither launches PIT nor falls back to an older passing attempt.
 Full `coverage` also runs `moneyMutation` after its newly forced Money tests and coverage,
 in the same Gradle invocation. Build, full coverage and focused mutation all perform strict
@@ -145,6 +147,52 @@ materialization and eventual native integration are still coordinator/Infra resp
 Unchanged command/profile shapes do not make a stale canonical materialization catalogue ready:
 its Contracts commit and the Money.kt/golden entries must adopt the exact AA8 pins documented
 in the [provider guide](money-guard.md#commands-and-ownership).
+
+### Single test/report owner
+
+The ordinary `test` task is the sole execution/XML owner for `AcceptedMoneySourceTest`,
+`AcceptedMoneyPrimitiveModelTest`, `MoneyDiagnosticTest` and `AcceptedMoneyJvmTest`.
+Their 45 existing declared methods remain selected, without changing any assertion,
+property corpus, provider or test identity. `moneyTest` is only a lifecycle alias depending
+on `test`: it has no test action, copied reports or nested Gradle invocation. A combined
+build/coverage graph reaches the same `test` task once, even through multiple dependencies.
+There is no reverse `test -> moneyTest` dependency. The existing report finalizer depends
+on `test`, not on its alias.
+
+Standalone `test` still runs all its original tests. `moneyTest`, `money-coverage` and
+`money-mutation` now require the full ordinary non-Postgres suite, not a Money-only execution.
+Both up-to-date reuse and build-cache reuse are disabled on its authoritative `test` task.
+The existing Gradle selector remains available for deliberately focused development:
+
+```text
+gradlew.bat test --tests "com.pennilogic.money.*"
+```
+
+On POSIX, use `sh gradlew` with the same arguments. This selector is not the ordinary build
+or Windows qualification and cannot claim their complete inventory. It replaces ordinary
+test XML/execution data and can stale a prior mutation result; the normal commands must
+execute their unfiltered prerequisites again.
+
+Money coverage reads `jacoco/test.exec` but still measures only every compiled class and
+source of the authoritative Contracts Money source set. Aggregate JaCoCo reporting and
+verification read the explicit `test`, `integrationTest` and `migrationConventionCheck`
+execution files; obsolete `moneyTest.exec` cannot contribute coverage. Existing integration
+ordering, Docker/CI requirements, coverage floors and reviewed-base ratchets are unchanged.
+`MoneyWirePropertyTest` stays in the ordinary suite, and Postgres/property integration tests
+stay in `integrationTest`; neither becomes part of PIT's Money test selection.
+
+Money evidence and PIT fingerprints share the Money report inventory under
+`build/test-results/test`. A Money suite name, case class or conventional report filename
+selects the whole report for the existing strict Money checks. Mixed/unrelated cases,
+duplicate identities, malformed counters and missing model/property evidence still refuse;
+no IDs are deduplicated and no old `moneyTest` directory supplies missing evidence.
+Non-Money ordinary reports remain part of the aggregate test and Windows inventories.
+
+The unchanged Windows qualifier reads only the flat ordinary `test` XML directory.
+Consequently, the previously observed Linux `test`/`moneyTest` selection overlap is not proof
+of, or an explanation for, the historical Windows duplicate-JUnit pair. This source correction
+does not repair that unresolved failure or the separate approved-shell timeout. Source/pure
+controls do not establish native scheduling, coverage results, runtime budgets or acceptance.
 
 ## Engine and complete selection
 
@@ -430,7 +478,7 @@ all older packets remain unchanged. The earlier seven-command-only result is not
 workflow evidence.
 
 Full `coverage` now requests the existing `moneyMutation` target with its coverage tasks.
-The target's dependency on `moneyCoverageCheck -> moneyCoverageReport -> moneyTest` ensures
+The target's dependency on `moneyCoverageCheck -> moneyCoverageReport -> moneyTest -> test` ensures
 the newly executed Money tests and coverage precede mutation. Gradle executes that shared
 test dependency once per invocation, not once for each requested task. The existing strict
 `check_latest()` consumer then runs after the aggregate and Money coverage/base checks,
@@ -439,15 +487,28 @@ final consumer. Missing/stale evidence or refresh failure stays blocking; there 
 fallback to a prior passing attempt or repair command after a failed readback.
 
 A normal build followed by full coverage therefore costs **two real PIT runs**: one in
-each command, plus the second execution of the 29 dedicated Money controls. Full coverage
+each command, plus a fresh ordinary suite including all Money controls. The historical
+29-control measurements above retain their original execution attribution. Full coverage
 is not a harmless report read. Each full command gives Gradle only its remaining
 strategy-derived, at-most-600-second budget and includes final verification in its elapsed
 deadline. Native timings and duplicated executions must be reported separately, not added
 as unique tests or hidden by reusing an old mutation record.
 
-No XML binding, timestamp, cache/up-to-date rule, provider, native selection, threshold,
-baseline or generated workflow/profile is changed. The correction needs fresh separate
+The terminal-freshness correction did not change XML binding, timestamps, provider, native
+selection, thresholds, baselines or generated workflow/profile. The later single-owner
+correction above moves fresh execution from the separate Money runner to the ordinary suite.
+The correction needs fresh separate
 Core/QA admission; frozen 6e's finite source reviews do not approve it.
+
+The combined CI command, `python scripts\quality.py build --base <full-trusted-base-commit-SHA>`,
+avoids that second graph: it retains `build installDist`, then checks test metrics, both
+general and Money baselines against the explicit commit, and terminal mutation freshness.
+Commit-usability preflight and all comparisons stay inside the same elapsed budget.
+After the normal CLI and optional Node guards, an explicitly supplied unusable base fails
+before provider/budget reads, Gradle or test metrics; it is never replaced by an environment
+value or treated as omitted. The report consumer retains its own commit validation.
+Manual build without a base and standalone `coverage --base` keep their existing behavior,
+including explicit `--write-baseline` on the commands that compare coverage.
 
 ### Q1 native-summary consistency correction
 
@@ -537,7 +598,16 @@ coverage consumer, only the focused Money gate was rerun; no further ledger exec
 The normal build wiring is unchanged, but a fresh post-correction full normal build is not claimed.
 
 Windows uses a private kill-on-close Job Object. A stdin-gated bootstrap cannot launch the
-real command before attachment, closing the process-start race. POSIX uses an owned process
+real command before its retained process handle is attached, closing the process-start race.
+Cleanup explicitly terminates the owned job and retains it until accounting reports no active
+members, waiting on its private completion port rather than assuming bootstrap exit or
+kill-on-close proves descendant completion. Completion, reader joins, and bootstrap reaping
+share the existing ten-second cleanup allowance; an unavailable completion check or expired
+allowance is a failure, not a cleanup claim. Timeliness is checked after owned-handle release
+and again after reader, bootstrap, and stream finalization. Observed completion exactly at
+the deadline is allowed, but a zero-timeout wait cannot certify completion after it.
+Failed setup/attachment also closes the private
+completion port. No process is reopened by PID for attachment or termination. POSIX uses an owned process
 group. Timeout output is retained, children cannot outlive a successful parent, and no process
 name or shared daemon is killed. Kotlin compilation stays inside the owned Gradle process
 tree rather than creating a shared Kotlin daemon. The Windows startup/timeout/isolation
@@ -546,6 +616,19 @@ Docker is not an OS child process: the existing ID-scoped Gradle finalizer remov
 disposable PostgreSQL container in the recorded build. A forcibly terminated host JVM can
 still leave its recorded container for the existing stale-container cleanup on the next run;
 OS process containment is not a Docker-daemon cleanup guarantee.
+
+The PIT consumer preserves a cleanup timeout as a terminal failed attempt and event with
+its original reason. It writes timeout output only for capture-bearing budget exceptions;
+a cleanup timeout without captured output does not manufacture an empty native log.
+Windows bootstrap-reap expiry uses that same cleanup refusal and retains the underlying
+wait exception as its cause.
+
+The Windows approved-Docker-directory test preserves its original nonzero worker failure and
+adds a bounded note containing only the fixture's allowlisted boolean result plus captured-text
+length/hash. Unexpected text is not printed, including text swallowed by the fixture's redirected
+stdout. This is diagnosability, not an interpretation or repair of a numeric worker exit, and
+does not identify the owner of any previously observed directory lock or fix the separate
+hosted approved-shell stall.
 
 Control diagnostics use synthetic cases and stable operation/category IDs, never production
 records or monetary expected/actual values. The Kotlin value-comparison probe proves a failed

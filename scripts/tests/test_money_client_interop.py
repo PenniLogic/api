@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import py_compile
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -356,6 +357,343 @@ class ColdAcquisitionTest(InteropTest):
         before = len(responses.calls)
         self.assertEqual(interop.prepare(self.root)["requests"], 0)
         self.assertEqual(len(responses.calls), before)
+
+
+class NativePreparationTest(InteropTest):
+    TOKEN = "synthetic-native-source-token-not-a-credential"
+    NATIVE_CONTEXT = {
+        "GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": "PenniLogic/api",
+        "GITHUB_REPOSITORY_ID": "1394134582", "GITHUB_REPOSITORY_OWNER_ID": "335295566",
+        "GITHUB_EVENT_NAME": "pull_request",
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mock.patch.dict(os.environ, self.NATIVE_CONTEXT))
+        self.responses = PublicInputResponses()
+        self.client_type = interop.sources.ReadOnlyClient
+        self.clients = []
+        interop.write_file(self.root, interop.FIXTURES / "source-inputs.json",
+                           interop.read_file(ROOT / interop.FIXTURES / "source-inputs.json"))
+        catalog = interop.sources.validate_catalog(interop.sources.CATALOG)
+        for directory, bindings in (
+            (interop.sources.INPUTS, interop.sources.input_bindings(catalog)),
+            (interop.sources.PROVIDER, interop.sources.provider_bindings(catalog)),
+        ):
+            for name in bindings:
+                interop.write_file(self.root, directory / name, interop.read_file(ROOT / directory / name))
+        interop.write_file(self.root, interop.sources.INPUTS / "materialization.json",
+                           interop.sources.catalog_bytes(catalog))
+        interop.sources.verify_inputs(self.root)
+        interop.sources.verify_provider(self.root)
+
+    def client(self, data, *, native_fetch=False):
+        value = self.client_type(data, opener=self.responses, native_fetch=native_fetch)
+        self.assertIs(value.native_fetch, native_fetch)
+        self.assertFalse(value.authenticated_local)
+        self.clients.append(value)
+        return value
+
+    def prepared_inputs(self, root):
+        for name in interop.source_bindings(interop.catalog(root)):
+            interop.write_file(root, interop.AREA / "inputs" / name, self.responses.contracts[name])
+        interop.write_file(root, interop.AREA / "acquisition.json",
+                           interop.read_file(ROOT / interop.AREA / "acquisition.json"))
+        interop.verify_sources(root)
+        interop.verify_acquisition(root)
+
+    def invoke(self, *arguments, root=None):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(interop, "ROOT", self.root if root is None else root),
+            mock.patch.object(sys, "argv", ["money_client_interop.py", *arguments]),
+            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr),
+        ):
+            code = interop.main()
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_native_cli_forwards_once_and_completed_inputs_are_reused_without_credentials(self):
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "PENNILOGIC_NATIVE_SOURCE_TOKEN": self.TOKEN}),
+            mock.patch.object(interop.sources, "ReadOnlyClient", side_effect=self.client) as constructor,
+            mock.patch.object(interop, "prepare_tools", side_effect=AssertionError("unexpected tools")),
+            mock.patch.object(interop.process_budget, "run", side_effect=AssertionError("unexpected child")),
+        ):
+            code, stdout, stderr = self.invoke("prepare", "--native-fetch")
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(json.loads(stdout)["requests"], 4)
+            self.assertNotIn("PENNILOGIC_NATIVE_SOURCE_TOKEN", os.environ)
+            constructor.assert_called_once_with(interop.catalog(self.root), native_fetch=True)
+        self.assertEqual((self.responses.api_requests, self.responses.archive_requests), (3, 1))
+        for call in self.responses.calls:
+            headers = {name.lower(): value for name, value in call["headers"].items()}
+            self.assertEqual(headers.get("authorization"),
+                             None if call["url"] == interop.ARCHIVE_URL else "Bearer " + self.TOKEN)
+            self.assertEqual(call["method"], "GET")
+            self.assertLessEqual(call["timeout"], interop.sources.REQUEST_SECONDS)
+        interop.verify_sources(self.root)
+        interop.verify_acquisition(self.root)
+        for path in (self.root / interop.AREA).rglob("*"):
+            if path.is_file():
+                self.assertNotIn(self.TOKEN.encode(), path.read_bytes())
+        before = len(self.responses.calls)
+        with mock.patch.object(interop.sources, "ReadOnlyClient", side_effect=AssertionError("unexpected acquisition")):
+            code, stdout, stderr = self.invoke("prepare")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout), {
+            "event": "money_client_inputs", "status": "verified_existing", "inputs": 39, "requests": 0,
+        })
+        self.assertEqual(len(self.responses.calls), before)
+
+    def test_default_preparation_does_not_enable_native_mode_from_the_environment(self):
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "PENNILOGIC_NATIVE_SOURCE_TOKEN": self.TOKEN}),
+            mock.patch.object(interop.sources, "ReadOnlyClient", side_effect=self.client) as constructor,
+        ):
+            code, stdout, stderr = self.invoke("prepare")
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(json.loads(stdout)["requests"], 4)
+            constructor.assert_called_once_with(interop.catalog(self.root))
+            self.assertEqual(os.environ["PENNILOGIC_NATIVE_SOURCE_TOKEN"], self.TOKEN)
+        self.assertTrue(all("authorization" not in {name.lower() for name in call["headers"]}
+                            for call in self.responses.calls))
+
+    def test_existing_inputs_do_not_bypass_the_explicit_native_constructor(self):
+        self.prepared_inputs(self.root)
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "PENNILOGIC_NATIVE_SOURCE_TOKEN": self.TOKEN}),
+            mock.patch.object(interop.sources, "ReadOnlyClient", side_effect=self.client) as constructor,
+        ):
+            code, stdout, stderr = self.invoke("prepare", "--native-fetch")
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(json.loads(stdout)["requests"], 0)
+            self.assertNotIn("PENNILOGIC_NATIVE_SOURCE_TOKEN", os.environ)
+            constructor.assert_called_once_with(interop.catalog(self.root), native_fetch=True)
+            constructor.reset_mock()
+            code, stdout, stderr = self.invoke("prepare", "--native-fetch")
+            self.assertEqual((code, stdout), (1, ""))
+            self.assertEqual(json.loads(stderr)["code"], "native-source-authentication")
+            constructor.assert_called_once_with(interop.catalog(self.root), native_fetch=True)
+        before = interop.inventory(self.root / interop.AREA)
+        for changes, refusal in (
+            ({"GITHUB_REPOSITORY": "PenniLogic/contracts"}, "native-source-context"),
+            ({"GITHUB_REPOSITORY_ID": "1"}, "native-source-context"),
+            ({"GITHUB_EVENT_NAME": "pull_request_target"}, "native-source-context"),
+            ({"PENNILOGIC_NATIVE_SOURCE_TOKEN": "short"}, "native-source-authentication"),
+            ({"PENNILOGIC_NATIVE_SOURCE_TOKEN": self.TOKEN + "\n"}, "native-source-authentication"),
+        ):
+            with (
+                self.subTest(changes=tuple(changes)),
+                mock.patch.dict(os.environ, {"PENNILOGIC_NATIVE_SOURCE_TOKEN": self.TOKEN, **changes}),
+                mock.patch.object(interop.sources, "ReadOnlyClient", side_effect=self.client) as constructor,
+            ):
+                code, stdout, stderr = self.invoke("prepare", "--native-fetch")
+                self.assertEqual((code, stdout), (1, ""))
+                self.assertEqual(json.loads(stderr)["code"], refusal)
+                self.assertNotIn("PENNILOGIC_NATIVE_SOURCE_TOKEN", os.environ)
+                self.assertNotIn(self.TOKEN, stderr)
+                constructor.assert_called_once_with(interop.catalog(self.root), native_fetch=True)
+        self.assertEqual(self.responses.calls, [])
+        self.assertEqual(before, interop.inventory(self.root / interop.AREA))
+        interop.verify_sources(self.root)
+        interop.verify_acquisition(self.root)
+
+    def test_native_selection_rejects_other_commands_and_offline_source_before_dispatch(self):
+        for arguments in (
+            ("run", "--native-fetch"), ("verify", "--native-fetch"),
+            ("_run", "--run-id", self.run_id, "--native-fetch"),
+            ("prepare", "--offline-source", str(self.root), "--native-fetch"),
+            ("prepare", "--native-fetch", "--require-prepared"),
+            ("prepare", "--require-prepared", "--offline-source", str(self.root)),
+            ("verify", "--require-prepared"),
+        ):
+            with self.subTest(arguments=arguments), contextlib.ExitStack() as stack:
+                handlers = [stack.enter_context(mock.patch.object(interop, name))
+                            for name in ("prepare", "verify", "run_gate", "launch_run")]
+                constructor = stack.enter_context(mock.patch.object(interop.sources, "ReadOnlyClient"))
+                code, stdout, stderr = self.invoke(*arguments)
+                self.assertEqual((code, stdout), (1, ""))
+                self.assertEqual(json.loads(stderr)["code"], "argument-mode")
+                for handler in (*handlers, constructor):
+                    handler.assert_not_called()
+        for options in (
+            {"offline_source": self.root, "native_fetch": True},
+            {"offline_source": self.root, "require_prepared": True},
+            {"native_fetch": True, "require_prepared": True},
+            {"native_fetch": 1}, {"require_prepared": 1}, {"require_prepared": "false"},
+        ):
+            with self.subTest(options=options), mock.patch.object(interop.sources, "ReadOnlyClient") as constructor:
+                with self.assertRaisesRegex(interop.InteropError, "^argument-mode$"):
+                    interop.prepare(self.root, **options)
+                constructor.assert_not_called()
+
+    def test_native_refusal_has_no_anonymous_fallback_or_partial_publication(self):
+        headers = Message()
+        headers["X-RateLimit-Remaining"] = "0"
+        failure = urllib.error.HTTPError("https://api.github.com", 403, "synthetic", headers, io.BytesIO())
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "PENNILOGIC_NATIVE_SOURCE_TOKEN": self.TOKEN}),
+            mock.patch.object(interop.sources, "ReadOnlyClient", side_effect=self.client) as constructor,
+            mock.patch.object(self.responses, "open", side_effect=failure) as opener,
+        ):
+            code, stdout, stderr = self.invoke("prepare", "--native-fetch")
+        self.assertEqual((code, stdout), (1, ""))
+        self.assertEqual(json.loads(stderr)["code"], "source-rate-exhausted")
+        constructor.assert_called_once_with(interop.catalog(self.root), native_fetch=True)
+        self.assertEqual(opener.call_count, 1)
+        self.assertFalse((self.root / interop.AREA / "inputs").exists())
+        self.assertFalse((self.root / interop.AREA / "acquisition.json").exists())
+        self.assertNotIn(self.TOKEN, stderr)
+
+    def test_native_archive_redirect_refuses_without_forwarding_authorization(self):
+        opened = self.responses.open
+        archive_requests = []
+        body = io.BytesIO(b"synthetic-private-redirect")
+
+        def redirect(request, timeout):
+            if request.full_url != interop.ARCHIVE_URL:
+                return opened(request, timeout)
+            archive_requests.append(request)
+            return interop.sources.NoRedirect().redirect_request(
+                request, body, 302, "synthetic", Message(), "https://example.invalid/redirect",
+            )
+
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "PENNILOGIC_NATIVE_SOURCE_TOKEN": self.TOKEN}),
+            mock.patch.object(interop.sources, "ReadOnlyClient", side_effect=self.client),
+            mock.patch.object(self.responses, "open", side_effect=redirect),
+        ):
+            code, stdout, stderr = self.invoke("prepare", "--native-fetch")
+        self.assertEqual((code, stdout), (1, ""))
+        self.assertEqual(json.loads(stderr)["code"], "source-redirect")
+        self.assertEqual(self.responses.api_requests, 3)
+        self.assertEqual(len(archive_requests), 1)
+        self.assertFalse(archive_requests[0].has_header("Authorization"))
+        self.assertTrue(body.closed)
+        self.assertFalse((self.root / interop.AREA / "inputs").exists())
+        self.assertNotIn(self.TOKEN, stderr)
+
+    def test_required_preparation_verifies_only_inputs_without_tools_or_source_writes(self):
+        self.prepared_inputs(self.root)
+        before = interop.inventory(self.root / interop.AREA)
+        with (
+            mock.patch.object(interop.sources, "ReadOnlyClient", side_effect=AssertionError("unexpected acquisition")),
+            mock.patch.object(interop, "prepare_tools", side_effect=AssertionError("unexpected tools")),
+            mock.patch.object(interop, "verify", side_effect=AssertionError("unexpected execution verification")),
+            mock.patch.object(interop.process_budget, "run", side_effect=AssertionError("unexpected child")),
+        ):
+            code, stdout, stderr = self.invoke("prepare", "--require-prepared")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout), {
+            "event": "money_client_inputs", "status": "verified_existing", "inputs": 39, "requests": 0,
+        })
+        self.assertEqual(before, interop.inventory(self.root / interop.AREA))
+        self.assertEqual(self.responses.calls, [])
+
+    def test_required_preparation_refuses_absent_or_partial_inputs_without_acquisition(self):
+        for state in ("absent", "inputs-missing", "receipt-missing", "file-missing", "tampered", "extra", "receipt-tampered"):
+            with self.subTest(state=state):
+                root = self.root / state
+                interop.write_file(root, interop.FIXTURES / "source-inputs.json",
+                                   interop.read_file(ROOT / interop.FIXTURES / "source-inputs.json"))
+                if state != "absent":
+                    self.prepared_inputs(root)
+                    inputs = root / interop.AREA / "inputs"
+                    receipt = root / interop.AREA / "acquisition.json"
+                    first = inputs / next(iter(interop.source_bindings(interop.catalog(root))))
+                    if state == "inputs-missing":
+                        shutil.rmtree(inputs)
+                    elif state == "receipt-missing":
+                        receipt.unlink()
+                    elif state == "file-missing":
+                        first.unlink()
+                    elif state == "tampered":
+                        first.write_bytes(b"tampered")
+                    elif state == "extra":
+                        (inputs / "unexpected").write_bytes(b"unexpected")
+                    else:
+                        receipt.write_bytes(b"{}")
+                before = interop.inventory(root)
+                with (
+                    mock.patch.object(interop, "acquire", side_effect=AssertionError("unexpected acquisition")) as acquire,
+                    mock.patch.object(interop.sources, "ReadOnlyClient") as constructor,
+                ):
+                    code, stdout, stderr = self.invoke("prepare", "--require-prepared", root=root)
+                self.assertEqual((code, stdout), (1, ""))
+                self.assertEqual(json.loads(stderr)["status"], "refused")
+                self.assertNotEqual(json.loads(stderr)["code"], "argument-mode")
+                acquire.assert_not_called()
+                constructor.assert_not_called()
+                self.assertEqual(before, interop.inventory(root))
+
+    def test_run_propagates_only_the_requested_non_secret_flag_with_unchanged_budget_and_environment(self):
+        for selected in (False, True):
+            with (
+                self.subTest(selected=selected),
+                mock.patch.dict(os.environ, {"PENNILOGIC_NATIVE_SOURCE_TOKEN": self.TOKEN}),
+                mock.patch.object(interop.process_budget, "run", return_value=subprocess.CompletedProcess([], 1)) as run,
+            ):
+                arguments = ("--require-prepared",) if selected else ()
+                code, stdout, stderr = self.invoke("run", *arguments)
+                self.assertEqual((code, stdout), (1, ""))
+                self.assertEqual(json.loads(stderr)["code"], "gate-refused")
+                current = interop.read_json(self.root / interop.AREA / "current.json")
+                expected = [sys.executable, "-I", "-S", "-B", str(Path(interop.__file__).absolute()),
+                            "_run", "--run-id", current["run_id"], *arguments]
+                run.assert_called_once_with(expected, self.root, interop.SECONDS, env=interop.process_budget.environment())
+                self.assertNotIn("PENNILOGIC_NATIVE_SOURCE_TOKEN", run.call_args.kwargs["env"])
+                self.assertNotIn("--native-fetch", expected)
+                self.assertEqual(current["status"], "refused")
+                self.assertFalse((self.root / interop.AREA / "run.lock").exists())
+
+    def test_worker_refuses_disappearance_after_initial_verification_without_reacquiring(self):
+        for state in ("both-missing", "receipt-missing", "file-missing"):
+            with self.subTest(state=state):
+                root = self.root / state
+                interop.write_file(root, interop.FIXTURES / "source-inputs.json",
+                                   interop.read_file(ROOT / interop.FIXTURES / "source-inputs.json"))
+                self.prepared_inputs(root)
+                code, stdout, stderr = self.invoke("prepare", "--require-prepared", root=root)
+                self.assertEqual((code, stderr), (0, ""))
+                self.assertEqual(json.loads(stdout)["requests"], 0)
+                inputs = root / interop.AREA / "inputs"
+                receipt = root / interop.AREA / "acquisition.json"
+                if state == "both-missing":
+                    shutil.rmtree(inputs)
+                    receipt.unlink()
+                elif state == "receipt-missing":
+                    receipt.unlink()
+                else:
+                    (inputs / next(iter(interop.source_bindings(interop.catalog(root))))).unlink()
+                workers = []
+
+                def worker(command, cwd, seconds, *, env):
+                    self.assertEqual((cwd, seconds), (root, interop.SECONDS))
+                    self.assertEqual(command[5], "_run")
+                    self.assertEqual(command.count("--require-prepared"), 1)
+                    self.assertNotIn("PENNILOGIC_NATIVE_SOURCE_TOKEN", env)
+                    result = self.invoke(*command[5:], root=root)
+                    workers.append(result)
+                    return subprocess.CompletedProcess(command, result[0])
+
+                with (
+                    mock.patch.object(interop.process_budget, "run", side_effect=worker),
+                    mock.patch.object(interop, "acquire", side_effect=AssertionError("unexpected acquisition")) as acquire,
+                    mock.patch.object(interop.sources, "ReadOnlyClient") as constructor,
+                    mock.patch.object(interop, "prepare_tools", side_effect=AssertionError("unexpected tools")),
+                    mock.patch.object(interop, "prepare", wraps=interop.prepare) as prepare,
+                ):
+                    code, stdout, stderr = self.invoke("run", "--require-prepared", root=root)
+                    prepare.assert_called_once_with(root, require_prepared=True)
+                self.assertEqual((code, stdout), (1, ""))
+                self.assertEqual(json.loads(stderr)["code"], "gate-refused")
+                self.assertEqual(len(workers), 1)
+                self.assertEqual(workers[0][:2], (1, ""))
+                self.assertEqual(json.loads(workers[0][2])["status"], "refused")
+                acquire.assert_not_called()
+                constructor.assert_not_called()
+                self.assertEqual(interop.read_json(root / interop.AREA / "current.json")["status"], "refused")
+                self.assertFalse((root / interop.AREA / "run.lock").exists())
 
 
 class ArchiveAcquisitionTest(InteropTest):
@@ -1030,6 +1368,32 @@ class RunnerBoundaryTest(InteropTest):
         self.assertEqual(interpreter.read_bytes(), b"untrusted-cache-control")
         self.assertEqual(compiler.read_bytes(), b"untrusted-cache-control")
 
+    def test_timing_projection_reuses_the_recorded_runner_clock_and_exit(self):
+        gradle_home = interop.owned(self.root, Path("gradle-support"))
+        gradle_home.mkdir()
+        result = subprocess.CompletedProcess(["synthetic-command"], 0, b"", b"")
+        with mock.patch.dict(os.environ, {"GRADLE_USER_HOME": str(gradle_home)}), \
+                mock.patch.object(interop.Path, "home", side_effect=AssertionError("unexpected ambient home")) as home, \
+                mock.patch.object(interop.time, "monotonic", side_effect=(10.0, 10.125, 12.875)), \
+                mock.patch.object(interop.process_budget, "run", return_value=result) as command:
+            runner = interop.Runner(self.root, Path("recorded-timing"))
+            runner.call("generator-golden", ["synthetic-command"])
+        command.assert_called_once()
+        home.assert_not_called()
+        self.assertEqual(command.call_args.kwargs["env"]["GRADLE_USER_HOME"], str(gradle_home))
+        recorded = interop.read_json(self.root / "recorded-timing/commands/00-generator-golden.json")
+        self.assertEqual(recorded, runner.records[0])
+        self.assertEqual(recorded["elapsed_seconds"], 2.75)
+        records = ExecutionEvidenceTest.records(self)
+        records[0] = recorded
+        with mock.patch.object(interop.time, "monotonic", side_effect=AssertionError("unexpected clock")), \
+                mock.patch.object(interop.process_budget, "run", side_effect=AssertionError("repeated command")):
+            event = interop.timing_event(self.run_id, records, 3.25, 4.875)
+        self.assertEqual(event["commands"][0], {
+            "label": "generator-golden", "elapsed_seconds": 2.75,
+            "executed": True, "exit_code": 0, "readiness_probe": False,
+        })
+
 
 class ExecutionEvidenceTest(InteropTest):
     def test_readiness_records_require_exact_exit_integer_types(self):
@@ -1140,6 +1504,225 @@ class ExecutionEvidenceTest(InteropTest):
             }
             for label in interop.required_commands()
         ]
+
+    def test_timing_event_has_exact_fields_order_and_unmodified_recorded_values(self):
+        records = self.records()
+        for index, record in enumerate(records):
+            record["elapsed_seconds"] = index / 100 + 0.000000123
+        original = copy.deepcopy(records)
+        event = interop.timing_event(self.run_id, records, 3.250001, 4.875002)
+        self.assertEqual(event, {
+            "event": "money_client_interop_timings", "run_id": self.run_id,
+            "commands": [
+                {"label": record["label"], "elapsed_seconds": record["elapsed_seconds"],
+                 "executed": True, "exit_code": record["exit_code"], "readiness_probe": False}
+                for record in records
+            ],
+            "report_elapsed_seconds": 3.250001, "full_elapsed_seconds": 4.875002,
+        })
+        self.assertEqual(len(event["commands"]), 32)
+        self.assertEqual([record["label"] for record in event["commands"]], interop.required_commands())
+        self.assertEqual(records, original)
+
+    def test_timing_event_preserves_zero_through_three_optional_probe_outcomes(self):
+        probes = (
+            ("toolchain-probe", True, 0),
+            ("python-probe", True, 3),
+            ("typescript-probe", False, None),
+        )
+        for count in range(4):
+            records = self.records()
+            for index, (label, executed, exit_code) in enumerate(probes[:count]):
+                records.insert(index, {
+                    **records[-1], "label": label, "readiness_probe": True,
+                    "executed": executed, "exit_code": exit_code, "expected_exit": 0,
+                    "elapsed_seconds": 0.012345 + index,
+                })
+            with self.subTest(probes=count):
+                event = interop.timing_event(self.run_id, records, 8.5, 9.75)
+                self.assertEqual(len(event["commands"]), 32 + count)
+                self.assertEqual(
+                    [(record["label"], record["executed"], record["exit_code"], record["readiness_probe"])
+                     for record in event["commands"][:count]],
+                    [(label, executed, code, True) for label, executed, code in probes[:count]],
+                )
+                self.assertEqual([record["label"] for record in event["commands"][count:]], interop.required_commands())
+
+    def test_timing_event_refuses_missing_duplicate_foreign_reordered_or_excess_records(self):
+        records = self.records()
+        foreign = {**records[0], "label": "synthetic-private-foreign-command"}
+        controls = (
+            ("not-list", tuple(records), "timings-command-count"),
+            ("missing-list", None, "timings-command-count"),
+            ("empty", [], "commands-missing"),
+            ("missing-command", records[:-1], "commands-unexecuted"),
+            ("duplicate", [*records, records[0]], "commands-duplicate"),
+            ("foreign", [*records, foreign], "commands-unknown"),
+            ("reordered", [records[1], records[0], *records[2:]], "commands-unexecuted"),
+            ("too-many", [*records, *records[:4]], "timings-command-count"),
+        )
+        for label, value, cause in controls:
+            output = io.StringIO()
+            with self.subTest(control=label), contextlib.redirect_stdout(output), \
+                    self.assertRaisesRegex(interop.InteropError, "^" + cause + "$") as error:
+                interop.timing_event(self.run_id, value, 3.25, 4.875)
+            self.assertEqual(output.getvalue(), "")
+            self.assertNotIn("synthetic-private", str(error.exception))
+        for name in records[0]:
+            value = self.records()
+            del value[0][name]
+            with self.subTest(missing_field=name), self.assertRaises(interop.InteropError):
+                interop.timing_event(self.run_id, value, 3.25, 4.875)
+
+    def test_timing_event_refuses_malformed_execution_timing_and_private_extra_fields(self):
+        for field, value in (
+            ("executed", 1), ("executed", False), ("readiness_probe", 0), ("readiness_probe", True),
+            ("exit_code", False), ("exit_code", 0.0), ("exit_code", None),
+            ("elapsed_seconds", -0.1), ("elapsed_seconds", 600), ("elapsed_seconds", True),
+            ("elapsed_seconds", "0.1"), ("elapsed_seconds", None),
+            ("elapsed_seconds", float("nan")), ("elapsed_seconds", float("inf")),
+            ("elapsed_seconds", 10 ** 10000), ("private_extra", "synthetic-private"),
+        ):
+            records = self.records()
+            records[0][field] = value
+            with self.subTest(field=field, value_type=type(value).__name__), \
+                    self.assertRaises(interop.InteropError):
+                interop.timing_event(self.run_id, records, 3.25, 4.875)
+        for code in (-(2 ** 31) - 1, 2 ** 32, 10 ** 10000):
+            records = self.records()
+            records.append({**records[0], "label": "toolchain-probe", "readiness_probe": True, "exit_code": code})
+            with self.assertRaisesRegex(interop.InteropError, "^timings-exit$"):
+                interop.timing_event(self.run_id, records, 3.25, 4.875)
+
+    def test_timing_event_requires_actual_bounded_identity_and_coherent_enclosing_durations(self):
+        for identity in (None, True, "a" * 31, "A" * 32, "synthetic-private-path"):
+            with self.subTest(identity_type=type(identity).__name__), \
+                    self.assertRaisesRegex(interop.InteropError, "^timings-identity$"):
+                interop.timing_event(identity, self.records(), 3.25, 4.875)
+        for report, full in (
+            (0, 1), (-1, 1), (600, 601), (True, 1), ("1", 2), (None, 2),
+            (float("nan"), 2), (float("inf"), 2), (10 ** 10000, 2),
+            (2, 1), (1, True), (1, None), (1, "2"), (1, float("nan")),
+            (1, float("inf")), (1, 10 ** 10000),
+        ):
+            with self.subTest(report_type=type(report).__name__, full_type=type(full).__name__), \
+                    self.assertRaisesRegex(interop.InteropError, "^timings-duration$"):
+                interop.timing_event(self.run_id, self.records(), report, full)
+
+    def test_timing_event_is_bounded_and_never_projects_private_command_data(self):
+        records = self.records()
+        private = "synthetic-private-protocol-financial-environment-path"
+        for record in records:
+            record["argv"].append(private)
+            record["cwd"] = str(self.root / private)
+            record["environment"] = {"HOME": str(self.root / private)}
+            for name in ("stdout", "stderr"):
+                record[name]["path"] = private + name
+            record["elapsed_seconds"] = 599.9999999999999
+        for label, code in (("toolchain-probe", -(2 ** 31)), ("python-probe", 2 ** 32 - 1),
+                            ("typescript-probe", 3)):
+            records.append({**records[0], "label": label, "readiness_probe": True, "exit_code": code})
+        event = interop.timing_event(self.run_id, records, 599.999999, sys.float_info.max)
+        emitted = json.dumps(event, sort_keys=True, allow_nan=False)
+        self.assertEqual(len(event["commands"]), 35)
+        self.assertLess(len(emitted.encode("utf-8")), 16384)
+        self.assertNotIn(private, emitted)
+        self.assertNotIn(str(self.root), emitted)
+        for field in ("argv", "cwd", "environment", "stdout", "stderr", "expected_exit", "sha256", "path"):
+            self.assertNotIn('"' + field + '"', emitted)
+        self.assertTrue(all(set(record) == {
+            "label", "elapsed_seconds", "executed", "exit_code", "readiness_probe",
+        } for record in event["commands"]))
+
+    def invoke_timing_gate(self, verification_error=None, command_error=None):
+        specification = self.root / "synthetic-spec.yaml"
+        specification.write_bytes(b"synthetic specification, never generated\n")
+        classpath_file = self.root / "synthetic.jar"
+        classpath_file.write_bytes(b"synthetic classpath data, never executed\n")
+        runner = mock.Mock(started=10.0, records=self.records())
+        runner.call.side_effect = command_error
+        stdout, stderr = io.StringIO(), io.StringIO()
+
+        def document(path):
+            if path.name == "current.json":
+                return {"schema": interop.REPORT_SCHEMA, "status": "running", "run_id": self.run_id}
+            if path.name == "run.lock":
+                return {"run_id": self.run_id}
+            if path.name == "money-wire-fixtures.v1.json":
+                return {"invalid": [{"wire": {}} for _ in range(interop.INVALID_COUNT)]}
+            if path.name == "kotlin-launch.json":
+                return {"classpath": [str(classpath_file)]}
+            return {}
+
+        def verified(root):
+            self.assertEqual(root, self.root)
+            self.assertEqual(stdout.getvalue(), "", "timing output preceded full verification")
+            if verification_error is not None:
+                raise verification_error
+
+        with contextlib.ExitStack() as stack:
+            replacements = {
+                "ROOT": self.root, "Runner": mock.Mock(return_value=runner),
+                "read_json": mock.Mock(side_effect=document),
+                "producer": mock.Mock(return_value=self.root), "module_at": mock.Mock(),
+                "backend_launch": mock.Mock(return_value={"java": "synthetic-java", "classpath": [str(classpath_file)]}),
+                "api_inputs": mock.Mock(return_value={}), "classpath_bindings": mock.Mock(return_value={}),
+                "runtime_inputs": mock.Mock(return_value={}), "inventory": mock.Mock(return_value={}),
+                "runtime_dependencies": mock.Mock(return_value=("synthetic-python", "synthetic-node")),
+                "compile_kotlin": mock.Mock(return_value=["synthetic-kotlin"]),
+                "scratch_spec": mock.Mock(return_value=specification),
+                "generated": mock.Mock(side_effect=lambda _root, _dir, _spec, language, _pl: {"target": language}),
+                "corpus": mock.Mock(return_value={"values": [{"wire": {}}, {"wire": {}}]}),
+                "verify": mock.Mock(side_effect=verified),
+            }
+            for name in ("prepare", "prepare_tools", "verify_default_outputs", "validate_transport", "validate_disagreement"):
+                replacements[name] = mock.Mock()
+            for name, value in replacements.items():
+                stack.enter_context(mock.patch.object(interop, name, value))
+            stack.enter_context(mock.patch.object(interop.sources, "verify_provider"))
+            stack.enter_context(mock.patch.object(interop.time, "monotonic", side_effect=(13.25, 14.875)))
+            native = stack.enter_context(mock.patch.object(
+                interop.process_budget, "run", side_effect=AssertionError("native runtime is outside this control"),
+            ))
+            stack.enter_context(mock.patch.object(
+                sys, "argv", ["money_client_interop.py", "_run", "--run-id", self.run_id],
+            ))
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            stack.enter_context(contextlib.redirect_stderr(stderr))
+            code = interop.main()
+        native.assert_not_called()
+        return code, stdout.getvalue(), stderr.getvalue(), replacements["verify"]
+
+    def test_native_gate_adds_one_timing_event_after_verification_without_changing_success(self):
+        code, stdout, stderr, verify = self.invoke_timing_gate()
+        self.assertEqual((code, stderr), (0, ""))
+        verify.assert_called_once_with(self.root)
+        events = [json.loads(line) for line in stdout.splitlines()]
+        self.assertEqual(events, [
+            interop.timing_event(self.run_id, self.records(), 3.25, 4.875),
+            {"event": "money_client_interop", "status": "passed", "run_id": self.run_id,
+             "case_count": interop.COUNT, "languages": list(interop.LANGUAGES),
+             "invalid_cases_per_language": interop.INVALID_COUNT, "disagreement_refusals": 3, "recoveries": 3,
+             "elapsed_seconds": 4.875, "report": (interop.AREA / "runs" / self.run_id / "report.json").as_posix()},
+        ])
+
+    def test_native_gate_verification_failure_keeps_the_existing_refusal_without_timings(self):
+        code, stdout, stderr, verify = self.invoke_timing_gate(interop.InteropError("evidence-outputs"))
+        self.assertEqual((code, stdout), (1, ""))
+        verify.assert_called_once_with(self.root)
+        self.assertEqual(json.loads(stderr), {
+            "event": "money_client_interop", "status": "refused", "code": "evidence-outputs",
+        })
+
+    def test_native_gate_command_failure_is_not_replaced_by_timing_output(self):
+        code, stdout, stderr, verify = self.invoke_timing_gate(
+            command_error=interop.InteropError("command-failed-generator-golden"),
+        )
+        self.assertEqual((code, stdout), (1, ""))
+        verify.assert_not_called()
+        self.assertEqual(json.loads(stderr), {
+            "event": "money_client_interop", "status": "refused", "code": "command-failed-generator-golden",
+        })
 
     def test_bounded_reads_allocate_for_the_file_not_the_maximum_jar_allowance(self):
         path = self.root / "fixture.txt"
@@ -1321,6 +1904,443 @@ class ExecutionEvidenceTest(InteropTest):
         for entries in ([], ["relative.jar"], [str(self.root / "absent.jar")], [str(self.root), str(self.root)]):
             with self.assertRaises(interop.InteropError):
                 interop.classpath(entries)
+
+
+class PreparedInputsTest(InteropTest):
+    """Copied, reverified source data for I/O controls, never acquisition or execution evidence."""
+
+    def setUp(self):
+        super().setUp()
+        data = interop.verify_sources(ROOT)
+        interop.verify_acquisition(ROOT)
+        interop.sources.verify_provider(ROOT)
+        self.fixture_names = {
+            (interop.FIXTURES / name).as_posix() for name in interop.inventory(ROOT / interop.FIXTURES)
+        }
+        self.input_names = {
+            "build.gradle.kts", "gradle.lockfile", "gradle/verification-metadata.xml", interop.BACKEND.as_posix(),
+            "scripts/money_client_interop.py", "scripts/materialize_money_sources.py", "scripts/process_budget.py",
+            (interop.AREA / "acquisition.json").as_posix(),
+        } | self.fixture_names
+        self.input_names.update((interop.AREA / "inputs" / name).as_posix() for name in interop.source_bindings(data))
+        self.input_names.update(
+            (interop.sources.PROVIDER / name).as_posix()
+            for name in interop.sources.provider_bindings(interop.sources.CATALOG)
+        )
+        for name in sorted(self.input_names):
+            interop.write_file(self.root, Path(name), interop.read_file(ROOT / name))
+        for name in ("java", "node", "npm", "backend.jar", "client.jar"):
+            interop.write_file(self.root, Path("source-only") / name, b"synthetic, never executed\n")
+        self.launch = {
+            "java": str(self.root / "source-only/java"), "python": str(Path(sys.executable).absolute()),
+            "node": str(self.root / "source-only/node"), "npm": str(self.root / "source-only/npm"),
+            "classpath": [str(self.root / "source-only/backend.jar")],
+        }
+        interop.write_json(self.root, interop.AREA / "backend-launch.json", self.launch)
+        self.input_names.add((interop.AREA / "backend-launch.json").as_posix())
+        self.reference_inputs = self.input_bindings()
+        interop.verify_sources(self.root)
+        interop.verify_acquisition(self.root)
+        interop.sources.verify_provider(self.root)
+
+    def input_bindings(self):
+        return {name: interop.binding(self.root / name) for name in sorted(self.input_names)}
+
+
+class ApiInputBindingTest(PreparedInputsTest):
+    def test_complete_fixture_bindings_are_read_once_per_call_and_refreshed_on_later_calls(self):
+        observations = []
+
+        def check(expected):
+            with mock.patch.object(interop, "binding", wraps=interop.binding) as bindings, \
+                    mock.patch.object(interop, "read_file", wraps=interop.read_file) as reads:
+                result = interop.api_inputs(self.root)
+            self.assertEqual(result, expected)
+            self.assertEqual(list(result), sorted(expected))
+            counts = {
+                name: sum(call.args[0] == self.root / name for call in bindings.call_args_list)
+                for name in self.fixture_names
+            }
+            self.assertEqual(counts, dict.fromkeys(self.fixture_names, 1))
+            catalog_reads = sum(
+                call.args[0] == self.root / interop.FIXTURES / "source-inputs.json"
+                for call in reads.call_args_list
+            )
+            self.assertEqual(catalog_reads, 2, "The independent catalog validation must not reuse fixture bindings")
+            observations.append({"fixture_binding_reads": counts, "catalog_reads": catalog_reads})
+            return result
+
+        first = check(self.reference_inputs)
+        check(self.reference_inputs)
+        name = (interop.FIXTURES / "envelope.yaml").as_posix()
+        path = self.root / name
+        path.write_bytes(path.read_bytes() + b"\n")
+        first[name]["bytes"] = False
+        fresh = self.input_bindings()
+        self.assertNotEqual(fresh[name], self.reference_inputs[name])
+        check(fresh)
+        self.io_observations = observations
+
+    def test_later_fixture_additions_and_hardlinks_are_not_hidden_by_prior_bindings(self):
+        self.assertEqual(interop.api_inputs(self.root), self.reference_inputs)
+        relative = interop.FIXTURES / "extra-data.txt"
+        path = interop.write_file(self.root, relative, b"new fixture\n")
+        expected = {**self.reference_inputs, relative.as_posix(): interop.binding(path)}
+        self.assertEqual(interop.api_inputs(self.root), expected)
+        linked = self.root / interop.FIXTURES / "linked-data.txt"
+        os.link(path, linked)
+        with self.assertRaisesRegex(interop.InteropError, "^input-kind$"):
+            interop.api_inputs(self.root)
+
+
+class OutputVerificationTest(PreparedInputsTest):
+    """Real retained-file validators with synthetic commands/models and two corpus rows; no runtimes execute."""
+
+    def setUp(self):
+        super().setUp()
+        self.directory = interop.AREA / "runs" / self.run_id
+        self.values = interop.corpus(self.root)["values"][:2]
+        self.expected = interop.transport(self.run_id, self.values)
+        invalid = interop.transport(
+            self.run_id, interop.read_json(
+                self.root / interop.AREA / "inputs/spec/fixtures/money-wire-fixtures.v1.json",
+            )["invalid"], interop.INVALID_SHA256,
+        )
+        plant = copy.deepcopy(self.expected)
+        plant["cases"][0]["envelope"]["total"] = copy.deepcopy(self.expected["cases"][1]["envelope"]["total"])
+        rejected = {
+            **invalid, "schema": interop.REJECTIONS_SCHEMA,
+            "cases": [{"id": row["id"], "status": "rejected"} for row in invalid["cases"]],
+        }
+        documents = {"backend.json": self.expected, "invalid.json": invalid}
+        for language in interop.LANGUAGES:
+            documents.update({
+                language + ".json": self.expected, language + "-recovered.json": self.expected,
+                language + "-rejected.json": rejected, language + "-disagreement.json": plant,
+            })
+        for name, value in documents.items():
+            interop.write_json(self.root, self.directory / name, value)
+        self.semantic_names = set(documents) | {"spec/openapi.yaml"}
+        self.specification = interop.scratch_spec(self.root, self.directory)
+        source = interop.producer(self.root)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            pl = interop.module_at("retained_fixture_pl", source / "scripts/pl_contracts.py")
+        pins = interop.read_json(source / "toolchain/versions.json")
+        clients = []
+        for language in interop.LANGUAGES:
+            relative = self.directory / "generated" / language
+            model = interop.MODELS[language]
+            model_bytes = b"synthetic generated-model data, never compiled\n"
+            interop.write_file(self.root, relative / model, model_bytes)
+            files = {model: interop.digest(model_bytes)}
+            config = source / "generator" / (language + ".json")
+            manifest = {
+                "schema_version": 1, "target": language, "spec_version": "0.1.0",
+                "spec_sha256": interop.digest(interop.read_file(self.specification)),
+                "currency_registry_sha256": interop.digest(interop.read_file(source / "spec/currency-registry.v1.json")),
+                "generator": {
+                    "name": "openapi-generator-cli", "version": pins["openapi_generator"]["version"],
+                    "jar_sha256": pins["openapi_generator"]["sha256"],
+                    "generator_name": interop.read_json(config)["generatorName"],
+                    "config": f"generator/{language}.json", "config_sha256": interop.digest(interop.read_file(config)),
+                    "ignore_override_sha256": interop.digest(interop.read_file(source / "generator/openapi-generator-ignore")),
+                    "template_override_sha256": (
+                        pl.tree_hash(source / "generator/templates" / language)[0] if language != "typescript" else None
+                    ),
+                },
+                "runtime_sha256": pl.tree_hash(source / "runtime" / language)[0],
+                "file_count": 1, "tree_sha256": pl.combined_digest(files),
+                "files": [{"path": name, "sha256": sha} for name, sha in files.items()],
+            }
+            manifest_file = interop.write_json(self.root, relative / "contracts-manifest.json", manifest)
+            self.semantic_names.add(f"generated/{language}/contracts-manifest.json")
+            clients.append({
+                "target": language, "model": model, "model_sha256": files[model],
+                "manifest_sha256": interop.binding(manifest_file)["sha256"], "tree_sha256": manifest["tree_sha256"],
+                "round_trip": interop.COUNT, "invalid_rejected": interop.INVALID_COUNT,
+                "disagreement_refused": True, "recovery": interop.COUNT, "skipped": 0,
+            })
+        runtime = interop.AREA / "runtimes" / self.run_id
+        scripts = "Scripts" if os.name == "nt" else "bin"
+        library = "Lib" if os.name == "nt" else f"lib/python{sys.version_info.major}.{sys.version_info.minor}"
+        for name in ("venv/pyvenv.cfg", f"venv/{scripts}/fixture", f"venv/{library}/site-packages/fixture.py", "node/fixture"):
+            interop.write_file(self.root, runtime / name, b"synthetic runtime-inventory data\n")
+        interop.write_json(self.root, self.directory / "runtime-inputs.json",
+                           interop.runtime_inputs(self.root, self.directory, self.launch))
+        client_classpath = [str(self.root / "source-only/client.jar")]
+        interop.write_json(self.root, self.directory / "kotlin-launch.json", {"classpath": client_classpath})
+        self.report = {
+            "schema": interop.REPORT_SCHEMA, "status": "passed", "run_id": self.run_id,
+            "scope": "api-test-only-generated-model-round-trip", "release_consumed": False,
+            "source_ref": interop.SOURCE, "source_tree": interop.SOURCE_TREE, "catalog_sha256": interop.CATALOG_SHA256,
+            "spec_version": "0.1.0", "scratch_spec_sha256": interop.digest(interop.read_file(self.specification)),
+            "corpus_sha256": interop.CORPUS_SHA256, "canonical_sha256": interop.CANONICAL_SHA256,
+            "case_count": interop.COUNT, "generated_count": 10000, "boundary_count": 30,
+            "invalid_count": interop.INVALID_COUNT, "currencies": ["INR", "JPY", "KWD"],
+            "default_money_model_emitted": False, "languages": clients, "inputs": self.reference_inputs,
+            "backend_classpath": interop.classpath_bindings(self.launch["classpath"]),
+            "client_classpath": interop.classpath_bindings(client_classpath),
+            "commands": self.command_records(pins["typescript"]["version"]), "elapsed_seconds": 1.0,
+        }
+        self.refresh_report()
+
+    def command_records(self, typescript_version):
+        protocols = {
+            "python-ready": ({"missing": 0, "wrong": 0}, None),
+            "backend-emit": (interop.receipt("backend", "emit", interop.COUNT, self.run_id), None),
+            "backend-reject": (interop.receipt("backend", "reject", interop.INVALID_COUNT, self.run_id), None),
+        }
+        for language in interop.LANGUAGES:
+            for label, operation in (("convert", "convert"), ("recover", "convert"), ("disagree", "disagree"), ("reject", "reject")):
+                count = interop.INVALID_COUNT if operation == "reject" else interop.COUNT
+                protocols[language + "-" + label] = (interop.receipt(language, operation, count, self.run_id), None)
+            for label in ("consume", "consume-recovery"):
+                protocols[language + "-" + label] = (interop.receipt("backend", "consume", interop.COUNT, self.run_id), None)
+            protocols[language + "-refuse-disagreement"] = (None, interop.DISAGREEMENT)
+        records = ExecutionEvidenceTest.records(self)
+        for index, record in enumerate(records):
+            prefix = self.directory / "commands" / f"{index:02d}-{record['label']}"
+            contents = [b"" if value is None else interop.json_bytes(value)
+                        for value in protocols.get(record["label"], (None, None))]
+            if record["label"] == "typescript-ready":
+                contents[0] = ("Version " + typescript_version + "\n").encode("ascii")
+            if record["label"] == "compile-kotlin":
+                contents[0] = b"> Task :compileKotlin\n"
+            for name, content in zip(("stdout", "stderr"), contents):
+                path = Path(str(prefix) + "." + name + ".txt")
+                interop.write_file(self.root, path, content)
+                self.semantic_names.add(path.relative_to(self.directory).as_posix())
+                record[name] = {"path": path.as_posix(), "bytes": len(content), "sha256": interop.digest(content)}
+            path = Path(str(prefix) + ".json")
+            interop.write_json(self.root, path, record)
+            self.semantic_names.add(path.relative_to(self.directory).as_posix())
+        return records
+
+    def refresh_report(self):
+        files = interop.inventory(self.root / self.directory)
+        files.pop("report.json", None)
+        self.report["outputs"] = files
+        path = interop.write_json(self.root, self.directory / "report.json", self.report, replace=True)
+        interop.write_json(self.root, interop.AREA / "current.json", {
+            "schema": interop.REPORT_SCHEMA, "status": "passed", "run_id": self.run_id,
+            "report_sha256": interop.binding(path)["sha256"],
+        }, replace=True)
+
+    def verify_report(self):
+        with mock.patch.object(interop, "corpus", return_value={"values": self.values}), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return interop.verify(self.root)
+
+    def test_verification_binds_and_validates_each_semantic_artifact_from_one_read(self):
+        with mock.patch.object(interop, "read_file", wraps=interop.read_file) as reads:
+            result = self.verify_report()
+        self.assertEqual(result, {
+            "event": "money_client_interop", "status": "verified", "run_id": self.run_id, "case_count": interop.COUNT,
+        })
+        counts = {
+            name: sum(call.args[0] == self.root / self.directory / name for call in reads.call_args_list)
+            for name in sorted(self.semantic_names)
+        }
+        self.assertEqual(counts, dict.fromkeys(sorted(self.semantic_names), 1))
+        self.io_observations = {"semantic_artifact_reads": counts}
+
+    def test_hashed_bytes_supply_semantics_but_a_later_verification_reads_again(self):
+        path = self.root / self.directory / "kotlin.json"
+        changed = copy.deepcopy(self.expected)
+        changed["cases"][0]["envelope"]["total"]["amount"] = "changed after the bound read"
+        original_read = interop.read_file
+        reads = []
+
+        def mutate_after_read(candidate, limit=interop.MAX_DOCUMENT):
+            content = original_read(candidate, limit)
+            if candidate == path:
+                reads.append(interop.digest(content))
+                path.write_bytes(interop.json_bytes(changed))
+            return content
+
+        with mock.patch.object(interop, "read_file", side_effect=mutate_after_read):
+            self.verify_report()
+        self.assertEqual(reads, [self.report["outputs"]["kotlin.json"]["sha256"]])
+        with self.assertRaisesRegex(interop.InteropError, "^evidence-outputs$"):
+            self.verify_report()
+        self.io_observations = {"first_pass_transport_reads": len(reads), "next_pass_refusal": "evidence-outputs"}
+
+    def test_matching_new_hashes_do_not_hide_malformed_or_incorrect_semantics(self):
+        controls = (
+            ("kotlin.json", lambda value: value.update(run_id="b" * 32), "transport-run-id"),
+            ("kotlin-disagreement.json", lambda value: value["cases"][0]["envelope"].update(booked_on="2026-10-01"), "fault-not-planted"),
+            ("python-recovered.json", lambda value: value["cases"][0]["envelope"]["total"].update(amount="wrong"), "wire-disagreement"),
+            ("typescript-rejected.json", lambda value: value["cases"][0].update(status="skipped"), "case-unexecuted"),
+            ("generated/kotlin/contracts-manifest.json", lambda value: value.update(schema_version=True), "generated-version"),
+            ("generated/typescript/contracts-manifest.json", lambda value: value.update(files=[]), "generated-inventory"),
+            ("generated/python/contracts-manifest.json", lambda value: value.pop("target"), "generated-manifest-shape"),
+            ("commands/00-generator-golden.json", lambda value: value.update(executed=1), "command-record-binding"),
+        )
+        for name, mutate, cause in controls:
+            path = self.root / self.directory / name
+            original = path.read_bytes()
+            value = interop.sources.json_document(original)
+            mutate(value)
+            try:
+                path.write_bytes(interop.json_bytes(value))
+                self.refresh_report()
+                with self.subTest(artifact=name), self.assertRaisesRegex(interop.InteropError, "^" + cause + "$"):
+                    self.verify_report()
+            finally:
+                path.write_bytes(original)
+        self.refresh_report()
+        self.verify_report()
+
+    def test_rebound_negative_and_recovery_command_streams_still_require_exact_receipts(self):
+        for label, stream in (("kotlin-refuse-disagreement", "stderr"), ("python-consume-recovery", "stdout")):
+            index = next(index for index, record in enumerate(self.report["commands"]) if record["label"] == label)
+            record = self.report["commands"][index]
+            record_path = self.root / self.directory / "commands" / f"{index:02d}-{label}.json"
+            path = self.root / record[stream]["path"]
+            original_record, original_content = copy.deepcopy(record), path.read_bytes()
+            try:
+                path.write_bytes(b"{}\n")
+                record[stream].update(interop.binding(path))
+                record_path.write_bytes(interop.json_bytes(record))
+                self.refresh_report()
+                with self.subTest(label=label), self.assertRaisesRegex(interop.InteropError, "^command-receipt$"):
+                    self.verify_report()
+            finally:
+                path.write_bytes(original_content)
+                record_path.write_bytes(interop.json_bytes(original_record))
+                self.report["commands"][index] = original_record
+        self.refresh_report()
+        self.verify_report()
+
+    def test_missing_extra_and_tampered_artifacts_cannot_match_the_full_inventory(self):
+        path = self.root / self.directory / "kotlin.json"
+        original = path.read_bytes()
+        extra = self.root / self.directory / "undeclared.bin"
+        for kind in ("missing", "extra", "tampered"):
+            try:
+                if kind == "missing":
+                    path.unlink()
+                elif kind == "extra":
+                    extra.write_bytes(b"undeclared")
+                else:
+                    path.write_bytes(b"{}\n")
+                with self.subTest(kind=kind), self.assertRaisesRegex(interop.InteropError, "^evidence-outputs$"):
+                    self.verify_report()
+            finally:
+                path.write_bytes(original)
+                extra.unlink(missing_ok=True)
+        self.verify_report()
+
+    def test_cached_artifacts_still_refuse_missing_nonregular_hardlinked_and_linked_paths(self):
+        _, reader = interop.output_snapshot(self.root, self.directory, self.report["commands"])
+        path = self.root / self.directory / "kotlin.json"
+        original = path.read_bytes()
+        link = self.root / "after-snapshot-hardlink"
+        path.unlink()
+        with self.assertRaises(FileNotFoundError):
+            reader(path)
+        path.mkdir()
+        with self.assertRaisesRegex(interop.InteropError, "^input-kind$"):
+            reader(path)
+        path.rmdir()
+        path.write_bytes(original)
+        os.link(path, link)
+        try:
+            with self.assertRaisesRegex(interop.InteropError, "^input-kind$"):
+                reader(path)
+            with self.assertRaisesRegex(interop.InteropError, "^input-kind$"):
+                self.verify_report()
+        finally:
+            link.unlink()
+        for method in ("is_symlink", "is_junction"):
+            real_check = getattr(Path, method)
+            with self.subTest(kind=method), mock.patch.object(
+                Path, method, autospec=True, side_effect=lambda candidate: candidate == path or real_check(candidate),
+            ):
+                with self.assertRaisesRegex(interop.InteropError, "^linked-input$"):
+                    reader(path)
+                with self.assertRaisesRegex(interop.sources.MaterializationError, "^output-path-linked$"):
+                    self.verify_report()
+        self.assertEqual(reader(path), original)
+
+    def test_oversized_semantic_bytes_cannot_be_replaced_by_a_later_smaller_read(self):
+        path = self.root / self.directory / "kotlin.json"
+        original = path.read_bytes()
+        path.write_bytes(b" " * (interop.MAX_DOCUMENT + 1))
+        self.refresh_report()
+        original_read = interop.read_file
+        reads = []
+
+        def shrink_after_read(candidate, limit=interop.MAX_DOCUMENT):
+            content = original_read(candidate, limit)
+            if candidate == path:
+                reads.append(len(content))
+                path.write_bytes(original)
+            return content
+
+        with mock.patch.object(interop, "read_file", side_effect=shrink_after_read), \
+                self.assertRaisesRegex(interop.InteropError, "^document-size$"):
+            self.verify_report()
+        self.assertEqual(reads, [interop.MAX_DOCUMENT + 1])
+        self.io_observations = {"oversized_artifact_reads": reads}
+
+    def test_a_missing_artifact_added_after_inventory_is_not_an_unbound_semantic_input(self):
+        path = self.root / self.directory / "backend.json"
+        original = path.read_bytes()
+        path.unlink()
+        self.refresh_report()
+        commands = interop.verify_commands
+
+        def add_after_inventory(*args, **kwargs):
+            path.write_bytes(original)
+            return commands(*args, **kwargs)
+
+        with mock.patch.object(interop, "verify_commands", side_effect=add_after_inventory), \
+                self.assertRaisesRegex(interop.InteropError, "^evidence-outputs$"):
+            self.verify_report()
+
+    def test_independent_verification_refreshes_source_provider_input_classpath_runtime_and_producer(self):
+        self.verify_report()
+        mutations = (
+            (interop.AREA / "inputs/toolchain/versions.json", interop.sources.MaterializationError, "source-bytes"),
+            (interop.sources.PROVIDER / next(iter(interop.sources.provider_bindings(interop.sources.CATALOG))),
+             interop.sources.MaterializationError, "source-bytes"),
+            (interop.FIXTURES / "envelope.yaml", interop.InteropError, "evidence-stale-inputs"),
+            (Path("source-only/backend.jar"), interop.InteropError, "evidence-backend"),
+            (Path("source-only/client.jar"), interop.InteropError, "evidence-client"),
+            (interop.AREA / "runtimes" / self.run_id / "node/fixture", interop.InteropError, "evidence-runtime-inputs"),
+            (interop.AREA / "producer/scripts/pl_contracts.py", interop.InteropError, "producer-source-inventory"),
+        )
+        for relative, error_type, cause in mutations:
+            path = self.root / relative
+            original = path.read_bytes()
+            try:
+                path.write_bytes(original + b"\n")
+                with self.subTest(path=relative.as_posix()), self.assertRaisesRegex(error_type, "^" + cause + "$"):
+                    self.verify_report()
+            finally:
+                path.write_bytes(original)
+        self.verify_report()
+
+    def test_stale_run_identity_is_refused_before_the_output_snapshot(self):
+        self.report["run_id"] = "b" * 32
+        self.refresh_report()
+        with mock.patch.object(interop, "output_snapshot", wraps=interop.output_snapshot) as snapshot, \
+                self.assertRaisesRegex(interop.InteropError, "^evidence-stale$"):
+            self.verify_report()
+        snapshot.assert_not_called()
+
+    def test_invalid_recorded_report_durations_remain_static_verification_refusals(self):
+        original = self.report["elapsed_seconds"]
+        for duration in (0, -1, True, 600, 10 ** 400):
+            self.report["elapsed_seconds"] = duration
+            self.refresh_report()
+            with self.subTest(duration_type=type(duration).__name__), \
+                    self.assertRaisesRegex(interop.InteropError, "^evidence-budget$"):
+                self.verify_report()
+        self.report["elapsed_seconds"] = original
+        self.refresh_report()
+        self.verify_report()
 
 
 if __name__ == "__main__":

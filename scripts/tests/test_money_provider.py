@@ -18,12 +18,15 @@ class MoneyProviderBindingTest(unittest.TestCase):
                 provider.prepare(root=Path(temporary))
 
     def test_relative_source_selector_is_normalized_before_renderer_use(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        # A relative selector must share the working directory's Windows drive.
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
             root = Path(temporary)
             relative = Path(os.path.relpath(root, Path.cwd()))
+            self.assertFalse(relative.is_absolute())
             with patch.object(provider, "read_source", side_effect=provider.ProviderError("bounded stop")) as reader:
                 with self.assertRaisesRegex(provider.ProviderError, "bounded stop"):
                     provider.prepare(source=relative, root=root)
+                reader.assert_called_once_with(root)
                 self.assertTrue(reader.call_args.args[0].is_absolute())
 
     def test_unreadable_inventory_reports_no_success_or_error_content(self):

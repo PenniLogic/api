@@ -1,12 +1,23 @@
 import org.gradle.api.artifacts.dsl.LockMode
+import org.gradle.api.logging.Logging
+import org.gradle.api.services.BuildService
+import org.gradle.api.services.BuildServiceParameters
 import org.gradle.api.tasks.testing.TestDescriptor
 import org.gradle.api.tasks.testing.TestListener
 import org.gradle.api.tasks.testing.TestResult
+import org.gradle.build.event.BuildEventsListenerRegistry
+import org.gradle.tooling.events.FinishEvent
+import org.gradle.tooling.events.OperationCompletionListener
+import org.gradle.tooling.events.task.TaskFailureResult
+import org.gradle.tooling.events.task.TaskFinishEvent
+import org.gradle.tooling.events.task.TaskSkippedResult
+import org.gradle.tooling.events.task.TaskSuccessResult
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+import javax.inject.Inject
 
 plugins {
     kotlin("jvm") version "2.4.10"
@@ -14,6 +25,79 @@ plugins {
     jacoco
     id("com.diffplug.spotless") version "8.10.2"
 }
+
+object GradleTaskTiming {
+    fun record(event: TaskFinishEvent): String {
+        val task = event.descriptor.taskPath
+        require(task.length <= 256 && Regex(":[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*").matches(task)) {
+            "Unsupported public task identifier"
+        }
+        val result = event.result
+        val status =
+            when (result) {
+                is TaskFailureResult -> {
+                    "failed"
+                }
+
+                is TaskSkippedResult -> {
+                    "skipped"
+                }
+
+                is TaskSuccessResult -> {
+                    when {
+                        result.isFromCache -> "from_cache"
+                        result.isUpToDate -> "up_to_date"
+                        else -> "executed_success"
+                    }
+                }
+
+                else -> {
+                    "unknown"
+                }
+            }
+        val start = result.startTime
+        val end = result.endTime
+        val measured = start >= 0 && end >= start
+        return groovy.json.JsonOutput.toJson(
+            mapOf(
+                "event" to "gradle_task_completed",
+                "task" to task,
+                "status" to status,
+                "timing" to if (measured) "measured" else "unavailable",
+                "start_ms" to start.takeIf { measured },
+                "end_ms" to end.takeIf { measured },
+                "wall_ms" to if (measured) end - start else null,
+            ),
+        )
+    }
+}
+
+abstract class GradleTaskTimingService :
+    BuildService<BuildServiceParameters.None>,
+    OperationCompletionListener {
+    override fun onFinish(event: FinishEvent) {
+        if (event !is TaskFinishEvent) return
+        try {
+            Logging.getLogger(GradleTaskTimingService::class.java).lifecycle(GradleTaskTiming.record(event))
+        } catch (_: Exception) {
+            // Telemetry must not replace an owning task failure or print its private exception.
+            System.err.println("""{"event":"gradle_task_timing_unavailable","reason":"observation-failed"}""")
+        }
+    }
+}
+
+abstract class GradleTaskTimingPlugin
+    @Inject
+    constructor(
+        private val events: BuildEventsListenerRegistry,
+    ) : Plugin<Project> {
+        override fun apply(project: Project) {
+            val timings = project.gradle.sharedServices.registerIfAbsent("gradleTaskTimings", GradleTaskTimingService::class.java) {}
+            events.onTaskCompletion(timings)
+        }
+    }
+
+apply<GradleTaskTimingPlugin>()
 
 group = "com.pennilogic"
 version = "0.1.0"
@@ -29,12 +113,21 @@ application {
     mainClass.set("com.pennilogic.bootstrap.ApplicationKt")
 }
 
+val requirePreparedSources =
+    providers
+        .gradleProperty("moneyClientInteropRequirePrepared")
+        .map(String::toBooleanStrict)
+        .orElse(false)
+
 val prepareDatabaseAdmission =
     tasks.register<Exec>("prepareDatabaseAdmission") {
         description = "Explicitly fetches or verifies the exact accepted database-admission source bundle."
         group = "verification"
         workingDir(rootDir)
-        commandLine("python", "-I", "-S", "-B", "scripts/prepare_database_admission.py", "prepare", "--fetch")
+        commandLine("python", "-I", "-S", "-B", "scripts/prepare_database_admission.py", "prepare")
+        if (!requirePreparedSources.get()) {
+            args("--fetch")
+        }
         mustRunAfter(tasks.clean)
     }
 
@@ -185,6 +278,9 @@ tasks.withType<Test>().configureEach {
 }
 
 tasks.test {
+    // Money coverage and mutation evidence must not reuse a cached test execution.
+    outputs.upToDateWhen { false }
+    outputs.cacheIf { false }
     useJUnitPlatform {
         excludeTags("postgres")
     }
@@ -211,29 +307,10 @@ tasks.test {
 }
 
 val targetedMoneyTest =
-    tasks.register<Test>("moneyTest") {
-        description = "Runs the actual immutable Money dependency's source-seam and arithmetic tests."
+    tasks.register("moneyTest") {
+        description = "Runs the authoritative ordinary test suite, including the Money tests."
         group = "verification"
-        testClassesDirs =
-            sourceSets.test
-                .get()
-                .output.classesDirs
-        classpath = sourceSets.test.get().runtimeClasspath
-        outputs.upToDateWhen { false }
-        outputs.cacheIf { false }
-        useJUnitPlatform()
-        include("com/pennilogic/money/**")
-        systemProperty(
-            "pennilogic.money.source",
-            layout.buildDirectory
-                .dir("contracts-money/source")
-                .get()
-                .asFile.path,
-        )
-        inputs.dir(layout.buildDirectory.dir("contracts-money/source/spec"))
-        testLogging {
-            events("failed", "skipped")
-        }
+        dependsOn(tasks.test)
     }
 
 val acceptedCoverageReport =
@@ -241,7 +318,7 @@ val acceptedCoverageReport =
         description = "Measures every compiled class of the immutable Contracts Money source dependency."
         group = "verification"
         dependsOn(targetedMoneyTest)
-        executionData.setFrom(layout.buildDirectory.file("jacoco/moneyTest.exec"))
+        executionData.setFrom(layout.buildDirectory.file("jacoco/test.exec"))
         classDirectories.setFrom(acceptedSourceSet.output.classesDirs)
         sourceDirectories.setFrom(acceptedSourceSet.allSource.sourceDirectories)
         reports {
@@ -299,6 +376,7 @@ val generatedClientInterop =
         val backendClasspath = sourceSets.test.get().runtimeClasspath
         val configuredPython = providers.gradleProperty("moneyClientInteropPython")
         val configuredNode = providers.gradleProperty("moneyClientInteropNode")
+        val requirePrepared = requirePreparedSources.get()
         doFirst {
             val windows = System.getProperty("os.name").startsWith("Windows")
             val pythonLocation = System.getenv("pythonLocation")
@@ -358,6 +436,9 @@ val generatedClientInterop =
                 backendClasspath.filter { it.exists() }.asPath,
             )
             configuredNode.orNull?.let { args("--node", it) }
+            if (requirePrepared) {
+                args("--require-prepared")
+            }
         }
     }
 
@@ -589,13 +670,19 @@ registerMigrationTask("migrateDryRun", "Prints the migrate plan and writes nothi
 registerMigrationTask("migrateDownDryRun", "Prints the migrate-down plan and writes nothing.", "migrate-down", "--dry-run")
 registerMigrationTask("migrateStatus", "Prints the registry state: current version, last applied migration and lock holder.", "status")
 
+val aggregateCoverageData =
+    files(
+        layout.buildDirectory.file("jacoco/test.exec"),
+        layout.buildDirectory.file("jacoco/integrationTest.exec"),
+        layout.buildDirectory.file("jacoco/migrationConventionCheck.exec"),
+    )
+
 tasks.jacocoTestReport {
     dependsOn(tasks.test)
     mustRunAfter(integrationTest)
-    mustRunAfter(targetedMoneyTest)
     mustRunAfter(migrationConventionCheck)
     // Include the real convention-check CLI alongside test JVMs; a skipped integrationTest leaves no new data.
-    executionData.setFrom(fileTree(layout.buildDirectory.dir("jacoco")) { include("*.exec") })
+    executionData.setFrom(aggregateCoverageData)
     reports {
         xml.required.set(true)
         html.required.set(true)
@@ -604,8 +691,7 @@ tasks.jacocoTestReport {
 
 tasks.jacocoTestCoverageVerification {
     dependsOn(tasks.jacocoTestReport)
-    mustRunAfter(targetedMoneyTest)
-    executionData.setFrom(fileTree(layout.buildDirectory.dir("jacoco")) { include("*.exec") })
+    executionData.setFrom(aggregateCoverageData)
     val docker = dockerAvailable
     val ci = providers.environmentVariable("CI")
     onlyIf("the coverage gate needs the Postgres tests, which need Docker") { task ->

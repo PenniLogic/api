@@ -99,6 +99,7 @@ approved Node executable without relying on ambient Gradle properties:
 
 ```text
 python scripts/quality.py build --money-client-interop-node "<approved absolute Node executable>"
+python scripts/quality.py build --base "<full trusted base SHA>" --money-client-interop-node "<approved absolute Node executable>"
 python scripts/quality.py coverage --base "<full trusted base SHA>" --money-client-interop-node "<approved absolute Node executable>"
 python scripts/quality.py gate-self-test --artifact-dir "<owned parent>" --money-client-interop-node "<approved absolute Node executable>"
 ```
@@ -138,9 +139,16 @@ Each owned baseline/candidate copy must run its own quality script with its own
 working directory and self-test artifact parent. Only the explicit SDK path is
 shared, not launch files, generated output or runtime evidence. `coverage --base`
 reads the named Git baseline; it does not build another checkout, and forwarding
-this option does not add interoperability to the coverage task graph. Canonical
-Infra setup must provision the supported SDK and explicitly supply its path only
-after this manual bridge is accepted; this change does not activate generated CI.
+this option does not add interoperability to the coverage task graph.
+The canonical CI adoption from accepted Infra `6b1e4baf403f25e6c4c695a5676e995f1ecb259e`
+keeps the isolated SDK preparation and passes its path to a single `build --base`
+invocation. That command runs the existing build/install graph and test metrics,
+then both general and Money reviewed-base comparisons before terminal mutation
+verification, without starting another Gradle/PIT graph. Omitting `--base`
+preserves the manual build behavior. After the normal CLI and optional Node
+guards, explicitly empty, malformed, missing or non-commit bases fail before
+provider/budget reads, Gradle or test metrics, rather than disabling comparisons.
+Standalone `coverage` and explicit baseline regeneration remain available.
 
 The budgeted quality caller also admits the standard Windows Docker Desktop CLI
 directory on the approved system drive (`Program Files\Docker\Docker\resources\bin`).
@@ -153,6 +161,26 @@ Retained command exit metadata uses exact integers, including readiness probes.
 Only a genuinely unexecuted optional probe may have a null actual exit; its
 expected exit must still be an integer. A fresh missing-path probe's actual
 exit 3 with expected exit 0 remains valid and triggers preparation, not success.
+
+After full evidence verification, the native worker also emits one
+`money_client_interop_timings` JSON event. It preserves the recorded order of all
+32 required commands and zero to three optional readiness probes. Each command
+contains only `label`, `elapsed_seconds`, `executed`, `exit_code` and
+`readiness_probe`; an unexecuted probe retains its null exit rather than an
+invented zero. The event includes the run ID, the private report's recorded
+`report_elapsed_seconds`, and `full_elapsed_seconds`, copied from the existing
+success event's terminal duration sample after verification. These enclosing
+durations include the command work; they are not additional task durations or
+evidence of non-overlap. Buffered Gradle log timestamps are not command starts.
+
+The timing projection contains no argv, environment, filesystem paths, stream
+bodies, protocol data or financial values. Unknown, duplicate, missing,
+malformed or excessive records refuse the gate through its existing static
+error handling; nothing is silently omitted or reported as a partial success.
+The existing success/refusal events and private report schema remain unchanged.
+This is measurement visibility only: no commands, cases, preparation, caches,
+scheduling, process boundaries or deadlines change, and it does not establish
+native timing, cleanup or product acceptance.
 
 The accepted package requires Node `>=24.14.0 <25` and npm `>=11`.
 Configuring only Python/JDK, or prepending an arbitrary Node executable to PATH,
@@ -192,6 +220,45 @@ pipeline therefore uses **48 REST requests plus one archive request**, not 80
 REST requests. This does not reserve quota against unrelated users or excuse
 actual exhaustion: there is no retry, backoff, proxy, token fallback or endpoint
 lottery.
+
+`prepare --native-fetch` is a separate, explicit preparation-only selector for
+the reviewed canonical `ReadOnlyClient(data, native_fetch=True)` interface.
+The caller does not read credentials or infer the mode from its environment.
+The canonical client validates the native context and consumes
+`PENNILOGIC_NATIVE_SOURCE_TOKEN` before any existing-input short-circuit; that
+same client is reused for cold acquisition. The selector requires the matching
+accepted canonical client and workflow policy; the API caller alone neither
+implements nor authorizes native authentication. It is refused for `run`,
+`verify`, `_run`, or in combination with `--offline-source` or
+`--require-prepared`. Default preparation remains anonymous, with no token
+fallback. Archive requests retain their separate credential-free headers.
+Official generation from accepted Infra
+`687d4d9acbd8a0f801c9ac4267230c8c67735eb0` supplies the matching client and
+workflow steps. Offline tests use that client with synthetic credentials and
+responses; they do not establish hosted authentication or quota availability.
+
+The canonical native workflow must keep its two token-scoped acquisition steps
+on either side of the existing credential-free Money provider preparation and
+verification. Interop still verifies those provider inputs before its three
+metadata GETs; provider execution must not be moved into a token-scoped step.
+After acquisition, `prepare --require-prepared` verifies the complete 39-input
+inventory and acquisition receipt with zero requests and without executing
+Node, JVM or the full interop gate. Missing, partial or changed inputs/receipt
+refuse rather than reacquire.
+
+The same non-secret `--require-prepared` flag on `quality.py build` or
+`quality.py test` forwards `-PmoneyClientInteropRequirePrepared=true` to Gradle.
+The interop task forwards it through `run` into the isolated `_run` worker,
+which repeats strict preparation before using the inputs. Disappearance after
+the preceding verification therefore cannot enable anonymous reacquisition.
+That same explicit Gradle condition removes `--fetch` from the existing
+database preparation task, using its offline prepared-input verification at
+the later build use point as well. Money provider source/strategy validation
+already refuses missing inputs without any remote acquisition fallback.
+No environment variable or marker selects this condition. Omitted flags keep
+the existing manual/Conformance behavior; other quality commands and full
+interop `verify` do not accept this selector. This input condition does not
+replace SDK, execution, coverage, mutation or native acceptance checks.
 
 The API-owned binary reader reuses the native no-proxy/no-redirect opener,
 framing checks and budget primitives; the native reader itself decodes JSON and
@@ -283,6 +350,459 @@ Python/JVM/Node startup options, package-manager configuration and unrelated
 credentials are not forwarded. The Windows process-budget bootstrap itself
 uses `-I -S -B` and cannot spawn its child before its owned Job is attached.
 
+The temporary **DIAGNOSTIC COUNTERFACTUAL** in the approved-shell regression
+leaves the default `PSModulePath` untouched and keeps the original uncaptured
+`Write-Output`, 10-second call, return/output assertions and legacy E/S-or-U/X prefixes.
+It exclusively creates `build/diagnostics/api106-approved-shell-module-lookup.jsonl`
+outside JUnit selection. The child appends only bounded, flushed ASCII NDJSON:
+at most 8192 bytes, five records and 6144 bytes per LF-terminated record, with
+integer `v=2` throughout. No raw paths, module names, commands, messages,
+credentials or ANSI are exported. Historical V1 capsules retain their exact
+four-record contract and contain no negative-hook availability or observation.
+Versions must not be mixed or reinterpreted. This V2 producer requires the
+corresponding reviewed canonical collector; its generated adoption is separate.
+
+The existing boundary file gains one optional literal `C` after `ES[01]{3}` and
+before optional `X`. Only the first matching `Write-Output` pre-lookup callback
+can append it, immediately after its existing pre-record writer invocation
+returns. The callback snapshots an eligible boundary path before that invocation;
+the path is armed only after the redirect flags are appended, around the original
+bare command statement, and disarmed before `X`. The existing first-target latch
+prevents a second or nested lookup from emitting another `C`. No `C` is emitted
+under `EU`, before the redirect flags, or during finalization.
+
+`C` attests only that this writer invocation returned, including a return through
+its existing handled failure path. It does not certify a successful JSON write,
+native delegate return, lookup success, entry into the cmdlet, output or pipeline
+completion, cleanup, or cause. Failure to observe `C` is not proof of non-return.
+The marker is untimestamped and collected after the owning command: it does not
+prove the writer returned before the ten-second deadline. The earlier `pre.ms`
+sample precedes the writer invocation and cannot supply that missing ordering.
+Marker append errors use the existing callback-refusal handling; no raw error or
+path is exported. The V2 JSON records and five-record limit are unchanged.
+The paired canonical boundary reader retains every old valid prefix and adds
+only `ES[01]{3}CX?`, with a seven-byte valid maximum and eight-byte overflow probe.
+It reports `pre_record_writer_return` as `observed` for valid `C`, otherwise
+`not-observed`; repeated or out-of-order `C` remains invalid. The earlier
+producer-only increment left the generated reader unchanged. This composed source
+adoption includes the canonical workflow/checker and 2254-byte inline boundary
+reader from protected-merged [PenniLogic/infra#87](https://github.com/PenniLogic/infra/pull/87),
+commit `0f5f7b7ce4baa8206add295ce0adee03292a5b20`. Old records are not
+reinterpreted; native success and acceptance remain unestablished.
+
+The V2 record order is `roots`, `observer`, optional `pre`, optional `not-found`,
+optional `post`, each at most once. `roots/observed` has `value` (`present` or
+`absent`) and `roots`:
+up to 32 entries with consecutive `i`, `kind` (`pshome`, `unknown`, `empty`),
+`sha256` and nullable `duplicate_of`. Hashes are lowercase SHA256 of each exact
+strict-UTF-8 component, without normalization; duplicates refer to the earliest
+identical ordinal string. Empty/trailing components remain in order. An empty
+value has one empty entry; absence has no entries. The environment string is
+capped at 32768 UTF-16 units and each component at 2048. `pshome` means a lexical
+case/slash/trailing-separator match to this child's `PSHOME\Modules`, not physical
+path identity. Refusal replaces those fields with `code`: `input-limit`,
+`encoding` or `snapshot`.
+
+`observer/armed` registers only the public WinPS5.1
+`PreCommandLookupAction`/`PostCommandLookupAction` APIs, without replacing
+existing hooks or initiating lookup. Their availability is documented in
+`Microsoft.PowerShell.5.1.ReferenceAssemblies`; the returned `CommandName`,
+`Command`, `CommandType`, `Module` and `Path` getters are read through their
+public reflection metadata, not alias resolution or command enumeration.
+Unavailable codes are `roots-refused`, `existing-hooks`, `unsupported-api`;
+installation failure is `observer/refused` with `code=install`.
+
+Every V2 `observer` also has an exact `not_found` object. The optional public
+WinPS5.1 `CommandNotFoundAction` hook is admitted independently: only a supported,
+currently null slot is assigned, and identity readback is required before its
+separate armed flag is set. Its object is `{"status":"armed"}`, or has
+`status=unavailable` with `code=existing-hook|unsupported-api`, or
+`status=refused` with `code=install`. The base Pre/Post observer can remain armed
+in all those cases. If and only if the base observer is not armed, the object is
+`{"status":"unavailable","code":"observer-unavailable"}`. A partially installed
+negative handler remains inert; an existing handler is never overwritten.
+
+Only the first matching actual lookup is sampled. `pre/observed` adds nullable
+`ms`. With both observers armed and an earlier unambiguous `pre`, the first
+matching negative callback adds only `v`, `phase=not-found`, `status=observed`
+and nullable `ms`. This record is nonterminal: it establishes callback entry
+and recording, not callback return, lookup completion, a particular subsequent
+command result, test success or cleanup. An absent negative record remains
+unknown, not evidence of successful resolution or a cache hit.
+`post/observed` adds nullable `ms`, `lookup_ms`, actual `command_type`
+(1,2,4,8,16,32,64,128,256, or null for no returned command), `module_kind` and
+`module_sha256`. Module kinds are `no-command`, `none`, `unknown`, `pshome`,
+`other`; only the latter two have a hash of the observed module path, capped at
+2048 UTF-16 units. `pshome` is lexical absolute containment below `PSHOME\Modules`,
+not module-byte or symlink attestation. Alias metadata describes its defining
+module, never its resolved target. Times are monotonic diagnostic-relative
+milliseconds in 0..600000 or null, not a changed deadline or method duration.
+The lookup interval includes callback/recording overhead. Nested target lookup
+or a repeated matching negative callback invalidates pairing, emits one
+`post/unavailable` with `code=nested-target`, and emits no inner provenance or
+second negative record. A negative callback without a recorded pre emits only
+the existing `post/unavailable` with `code=post-without-pre`.
+All three boundary samples use the existing `Stopwatch.ElapsedMilliseconds`
+without further rounding or clamping. An out-of-range sample is null; a negative
+sample below a valid pre sample is null, and a post sample below either retained
+valid predecessor is null. All nonnull pre/negative/post samples are therefore
+nondecreasing, even across a null sample. When pre and post are both nonnull,
+`lookup_ms` is exactly `post.ms - pre.ms`; otherwise it is null. A null negative
+sample does not change that rule, and there is no negative elapsed field.
+Throwing property, clock or formatting access uses the existing callback
+refusal, not a fabricated sample or negative edge.
+
+Other `post` records have only `code`: unavailable codes are
+`observer-unavailable`, `no-pre`, `no-post`, `nested-target`, `post-without-pre`;
+refusal codes are `command-type`, `module-path-limit`, `callback`. All records
+also have `v`, `phase`, `status`; unknown fields are invalid. Writer/open failures
+emit only the fixed `api106_module_lookup_capture`/`refused` stderr event, never
+exception text or a success fallback. After a terminal post or capture failure,
+callbacks emit no further records. Normal finalization after pre/negative
+without post emits `post/unavailable` with `code=no-post`. Successful finalization
+removes all three delegates only when each slot still refers to the fixture's
+own delegate; later replacements are never removed. Existing stream/hash cleanup
+is unchanged, and process termination can leave a strict prefix.
+
+The canonical collector must read at most 8193 bytes and validate the entire
+capsule before emitting its safe projection. Reparse/nonregular files, I/O errors,
+oversize, incomplete lines, non-ASCII/BOM/ANSI, duplicate JSON keys, wrong types,
+unknown fields/enums, invalid hashes/duplicate indices and impossible phase
+relationships are explicit refusals, without echoing offending data. A valid
+prefix is partial/unknown: only a final post completes a capsule, not a negative
+edge alone. Absent callbacks do not prove a cached lookup. The earlier producer-only
+increment retained the 2105-byte boundary reader; this composed adoption uses the
+2254-byte inline reader described above. Neither roots, callbacks, `C`, X nor a
+green instrumented test establishes cause, delivery, no-error behavior,
+cleanup, a default-launch repair or merge acceptance.
+
+### Dormant, one-use observer comparison
+
+The original owning test contains an inactive `APPROVED_SHELL_PAIR_ENCLOSURE`
+seam, initialized to `None`. No environment variable, ordinary command or
+generated workflow activates it. With that value unchanged, the original composed
+PowerShell payload, provider call and return/output assertions are unchanged.
+The pair protocol and its synthetic tests do not authorize a real execution.
+
+The API-owned `scripts/api106_observer_pair.py` source prepares an explicit
+Windows/test-only `python scripts/quality.py test --api106-observer-pair` route.
+This is default-off diagnostic source, not execution authorization or an accepted
+native enclosure. Ordinary `quality.py test` still runs its original unittest
+command. The generated qualifier does not forward the option.
+
+The prepared supervisor creates the actual discovery interpreter suspended,
+retains its creation process/thread handles, attaches the existing Windows Job,
+rechecks the API source/interpreter bindings and only then resumes its thread.
+There is no extra live bootstrap interpreter, breakaway or attachment fallback.
+The child keeps the ordinary interpreter startup flags, cwd, environment and
+standard streams. A fixed byte-bound `-c` bootstrap replaces only the `-m` entry
+and restores its absolute cwd import entry. It discovers the full ordinary
+suite, locates exactly one original test object and its existing module, requires
+the `None` seam, and installs there without reloading, filtering or reordering
+the suite. The private fixed-size control pipe, unnamed eight-byte deadline
+mapping and its unnamed mutex are separate from test logs and stdin. Only those three private handles
+and duplicates of the original three standard handles enter the suspended
+child's explicit handle whitelist. Source/tool bindings are API-specific per-use continuity checks of the
+selected CPython 3.14 executable and fixed API sources, not Infra Git/Gitleaks
+admission, a signed runtime attestation or native qualification.
+
+At that test's `startTest`, the child samples one monotonic epoch and atomically
+publishes its exact bits into the initially zero shared word, before target
+admission or its first control wait. The successful zero-to-epoch exchange is
+the publication point; a delayed exchange retains the earlier sampled time,
+never fresh credit. The parent already owns and monitors the mapping. It does
+not need the `ARM` pipe frame to discover or enforce that epoch; any later `ARM`
+must match it exactly. Scheduling before publication is not a demonstrated
+native bound, and no target admission/control wait precedes publication.
+The same epoch is yielded by the enclosure and used for all 28/48-second protocol
+checks; acknowledgment latency never restarts it. Normal `stopTest` accounting
+follows the original per-test fixture cleanup and result callbacks. Initial
+discovery and class/module fixtures can precede this per-test window; they are not prewarmed,
+reordered or claimed inside it. Each arm still reserves a complete ten-second
+work plus existing shared ten-second cleanup allowance. Neither inner limit is
+increased or shortened.
+
+All shared-word reads and conditional writes hold the same inherited mutex.
+`CreateMutexW`, zero-time `WaitForSingleObject` and `ReleaseMutex` replace the
+unavailable current-host `InterlockedCompareExchange64` export; no intrinsic,
+undocumented entrypoint or raw unsynchronized access is substituted. The
+documented interlocked API-set contract also resolves to KernelBase on that
+observed host, whose export table lacks the symbol; it is not a usable alias.
+The [documented wait/release barriers](https://learn.microsoft.com/en-us/windows/win32/sync/synchronization-and-multiprocessor-issues)
+protect the complete word operation. The
+[zero-time acquisition](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject)
+never enters a blocking wait: contention, abandonment
+or another acquisition failure refuses the control path rather than hiding
+the epoch behind a lock wait, retrying or granting another allowance. Thus even
+brief benign contention can abort this diagnostic; it is not evidence about
+the required shell or the original stall. A granted abandoned mutex is released
+once without consuming its word. A failed or interrupted release remains
+uncertain, with no further word access or release retry. The sampled epoch is
+retained locally even when publication or release fails, so cleanup cannot
+resample it. Successful publication is visible after the protected write and
+release, still before admission or any blocking control wait.
+
+The independent parent observes the protected atomic word before, during and after
+overlapped control/report I/O, with pending waits sliced at at most 25 milliseconds.
+That observation interval is not another allowance or a native timing guarantee.
+A live child publishing an epoch but never delivering `ARM` still has the same
+independent parent deadline owner. While the word is zero, preceding suite work
+does not acquire a global 60-second limit. The case must finalize by 48 seconds; otherwise its
+outer Job is terminated and termination, member drain, reaping, control/report
+I/O cancellation and release use the remainder of the same 60-second deadline,
+including the 12-second reserve. Unconfirmed cleanup remains a failure, never
+success-shaped evidence; unconfirmed overlapped I/O does not attest its later
+interpreter-finalization time or a bounded parent exit. API-owned mock controls
+cover this state machine but do not prove real Windows timing, cancellation,
+nested-Job or filesystem behavior.
+
+The child publishes a permanent closed word only after receiving the final
+`DONE` acknowledgment within the original work deadline. The parent independently
+observes that closure before disarming case enforcement; waiting for closure
+also uses that deadline. The word is never reset: premature close, epoch change,
+erasure or rearm is refused. Subsequent ordinary suite work keeps its existing
+accounting without an expired case deadline. This mapping, mutex, atomic
+publication and polling are additional observer perturbations, not an established causal fix.
+
+One parent ownership guard spans acquisition, attachment, protocol construction,
+supervision and finalization; there is no pre-entry cleanup handoff. Every
+acquired temporary inheritable handle receives one release attempt even when an
+earlier release raises a declared cleanup error, `KeyboardInterrupt` or
+`SystemExit`. Ambiguous closes are not retried. The original acquisition/creation
+failure stays primary, secondary release failures remain explicit, and release
+uncertainty prevents a true cleanup claim. The shared Windows ownership helper
+is unchanged. The mapping view and both mapping/mutex handles are independently
+released, even after a declared cleanup failure or cancellation; partial
+acquisition remains owned. These source corrections do not supersede the frozen
+v1/v2 reviews or constitute independent acceptance of v3. A resource-free DLL
+binding check verifies export resolution only, not mutex behavior, physical
+deadline enforcement or any hosted activation.
+
+The fixed order is required, then `auxiliary-no-lookup-delegates`, each at most
+once. The required arm receives the original command object and calls the same
+provider with the same cwd, capture and assertions. The auxiliary is a copy:
+only its diagnostic file bindings and lookup-observer registration/reporting
+change. Root sampling and its writer remain; Pre/Post delegate construction
+remains but neither is installed, so `Armed` stays false and the existing
+negative-handler guard prevents its installation. The auxiliary omits the
+corresponding observer/terminal records rather than fabricating `armed`,
+unavailable-reason or callback evidence. Its lookup file is intentionally a
+roots-only V2 prefix, not a completed required capsule. The original bare
+`Write-Output`, shell flags, module environment, stdin/capture contract, E/S/X
+operations and stream/hash disposal are unchanged. No new marker is added.
+
+The pair exclusively creates `api106-approved-shell-observer-pair.jsonl` in the
+existing diagnostic directory. This retained claim prevents another pair at
+that location even after failure or interpreter restart; nothing is deleted or
+retried. The auxiliary uses separate, exclusively created
+`api106-approved-shell-auxiliary-boundary.bin` and
+`api106-approved-shell-auxiliary-module-lookup.jsonl`, never the required files.
+The ASCII report has event `api106_approved_shell_observer_pair`, integer `v=1`,
+`diagnostic_only=true`, at most six records, 1024 bytes per record and 4096 total:
+`begin`, then each admitted arm's `started`/`arm`, then `complete` if both
+outcomes can be recorded. An unexecuted arm has an explicit reason instead of a
+process outcome. Partial reports remain partial; `complete` describes arm
+accounting, **not** the external enclosure's later cleanup receipt.
+
+Arm records contain role, outcome, elapsed milliseconds, nullable return code
+and nullable UTF-8 text byte count/hash of returned stdout, not raw output,
+exception text, paths or credentials. Both arms apply the original assertions.
+A required error/failure is re-raised unchanged after the auxiliary, including
+its traceback; an auxiliary success never replaces it. A required process/setup
+or cleanup error prevents the auxiliary when safe ownership completion is
+unknown. Secondary reporting/enclosure failure is chained without erasing the
+required failure. An auxiliary failure is recorded separately and cannot turn
+the required arm's own pass into a claimed required failure, or into pair
+acceptance. An enclosure cannot suppress an incomplete protocol into success.
+Unexpected interruption leaves an incomplete report and propagates.
+
+The discovery process and its descendants acquire an additional outer Job;
+the unchanged per-arm Jobs are nested. That is an additional observer confounder.
+Normal case completion requires the known live discovery process, identified
+by its creation handle, to be the sole outer member: it is not active-zero.
+The outer Job remains owned until suite exit without an expired case cleanup
+deadline. If the parent must terminate discovery, the rest of the inventory is
+incomplete; it cannot preserve a killed interpreter's live exception or fabricate
+replacement test results. On the normal path, the original required exception
+and unittest objects/order/result accounting are preserved.
+
+The parent exclusively creates the private
+`api106-approved-shell-enclosure.jsonl` receipt, bounded to eight ASCII records,
+1024 bytes each and 8192 total, using deadline-bound overlapped writes.
+Its case-closed record is a pre-acknowledgment phase observation that one known
+discovery member remains, not proof of the later shared-word closure; its
+cleanup record cannot attest its own subsequent file-handle close. A partial
+receipt is partial, not proof of cleanup or full inventory.
+
+The generated workflow and qualifier now contain the canonical default-off
+route. This local candidate uses corrected canonical source
+`e94792d8605c42c8b9d8dd5ee398b757b27486eb` through its immutable actual-history
+binding `f719c9d0242a0c80ea401cc18cc2e96da61cabce`. Both are published on the
+producer topic, not accepted on protected main. The adoption changes only the
+generated CI workflow, repository checker and Windows qualifier from the
+original API source; the other 22 generated outputs remain unchanged. This
+correction from the prior local candidate changes only the qualifier, preserving
+all 24 other generated outputs, the legacy inline reader and API
+owner/controller/observer/provider/preparation source.
+
+The typed `workflow_dispatch` input `api106_observer_pair` defaults to `false`.
+Only an explicitly selected manual run uses the full owning command
+`quality.py test --require-prepared --api106-observer-pair`: complete supervised
+Python discovery, then Gradle test and JUnit metrics only if discovery succeeds.
+Same-job checkout, Python, Git, JDK and preparation bindings admit finite runtime
+inputs before owner creation; ambient PATH and environment are not admitted as
+a substitute. The fresh Gradle cache does not imply offline or prewarmed
+dependencies. The command has 270 seconds of work and the existing single
+10-second cleanup allowance, with a strict diagnostic closed interval below
+300 seconds. The nested case remains 48 work / 60 total / 12 reserve, and
+neither original 10+10 arm is extended.
+
+An independently scheduled conditional `always()` collector can safely project
+the pair report, auxiliary boundary/roots-only capsule and enclosure receipt,
+including incomplete evidence after discovery failure or termination. The
+complementary default path retains the legacy reader. Primary ownership errors
+and returned nonzero results stay failures even when reporting or finalization
+also fails. The explicit route consumes the retained owner captures directly,
+removing the redundant outer temporary-file staging identified in
+`CORE-72A-001`. Active owning failures retain their identity and cause; ordinary
+returned nonzero results project safe Python evidence before any eligible fresh
+Gradle/JUnit evidence. The prior negative consumer opinion remains on its exact
+source subject; neither producer opinions nor the older scoped QA pass clear
+this corrected consumer.
+
+Source/synthetic controls never run either real arm or prove native ownership,
+inventory, cleanup, parity or timing. Fresh independent consumer review,
+publication and a separate one-use execution decision remain required; no hosted
+diagnostic is activated by this local source adoption, and the original
+10,001-ms timeout cause is not established.
+
+Required-fail/auxiliary-pass would support observer participation only in that
+paired occurrence, not identify a callback or explain the pre-observer failure.
+Two instances of the same stall would show these diagnostic delegates are not
+necessary for that reproduced failure. Pass/pass, inverse results, different
+failures or unmatched preceding state are inconclusive. Fixed order, filesystem
+and module caches, scheduling and separate shell startups remain confounders;
+there is no retry, prewarm or successful-sidecase acceptance. Current and
+historical native failures, complete Windows inventory, API-suite 300-second
+timing, per-test parity and full cleanup obligations remain open.
+
+An elapsed-budget failure samples bounded process state immediately before the
+existing owned termination, then attaches one ASCII `process_budget_state=` JSON
+note to the original `BudgetExceeded`. Successful commands, nonzero exits and
+other refusal branches do not collect or emit it. The note is diagnostic only;
+it changes no deadline, command, environment, capture, cleanup or acceptance rule.
+The Windows process is the bootstrap; on POSIX it is the direct owned command.
+
+Version `pennilogic.process-budget-state/1` has exactly `schema`, `status`,
+`process_running`, `returncode`, `capture_readers`, `capture_readers_alive`,
+`setup_ms`, `wait_ms` and `elapsed_ms` when `status` is `observed`.
+`process_running` is boolean; `returncode` is null iff running, otherwise an
+integer from -2147483648 through 4294967295. Reader counts are integers from 0
+through 2, with alive no greater than total. Monotonic elapsed values are
+integers from 0 through 86400000 milliseconds, with setup plus wait equal to
+elapsed. Setup includes launch, Job attachment, capture setup and bootstrap
+release; wait starts afterwards. This observation bound does not extend any
+execution budget. Booleans are not accepted as integer values.
+
+Unavailable, malformed or out-of-range samples instead emit only
+`{"schema":"pennilogic.process-budget-state/1","status":"unavailable"}` after the
+same prefix. Notes use compact sorted JSON and are at most 384 ASCII bytes.
+They contain no PID, command, path, environment, raw output, exception text or
+stack content. Sampling failure preserves the original timeout and cleanup.
+The canonical Infra qualifier owns transport within the matching unittest
+`ERROR` block; a note is neither an exception-allowlist extension nor evidence
+of a complete inventory or a passing test.
+
+After the existing termination and capture snapshot, the elapsed-failure path
+also projects only the original `BudgetExceeded.streams` metadata into an
+additive `process_budget_capture_state=` note. It precedes the existing optional
+Job note and final v1 note, preserving Job-v1 adjacency. There are no new process,
+member or clock queries, output reads, rehashes, waits or changes to the exception.
+The adopted canonical qualifier transports this bounded capture note within the
+matching unittest `ERROR` block, preserving refusal and incomplete outcomes.
+
+Version `pennilogic.process-budget-capture-state/1` uses recursively sorted compact
+ASCII JSON, at most 512 bytes including the prefix. An observed envelope has
+exactly `schema`, `status: "observed"`, `scope: "snapshot"`, `complete: false`,
+`mode: "merged"` or `"separate"`, and `stdout`/`stderr` objects each containing
+exactly `bytes` and `sha256`. Counts are non-boolean integers from 0 through
+18446744073709551615; hashes are exactly 64 lowercase hexadecimal characters.
+A zero count requires the SHA256 of empty bytes. In merged mode, stdout describes
+the merged raw capture and the retained stderr slot must be zero with that empty
+hash; this unused slot does **not** prove that the shell emitted no stderr.
+Separate mode describes each retained stream independently. These are existing
+raw-byte counts/hashes, not hashes of replacement-decoded text or outer unittest
+captures. No arbitrary output, command, private path, raw note or environment is
+projected.
+
+Missing or malformed metadata, an invalid mode, inconsistent merged stderr,
+or a projection/encoding refusal instead emits only
+`{"schema":"pennilogic.process-budget-capture-state/1","status":"unavailable"}`
+after the same prefix, with no invented counts or hashes. The original failure
+and existing notes remain intact. `complete: false` means completeness is not
+established, not that truncation was positively observed: this is only the
+already-retained snapshot after the existing cleanup attempt. It does not prove
+EOF, all child output, process exit, a wait cause or a timeout repair. The
+original v1 schema/384-byte bound and Job schema/512-byte bound are unchanged.
+
+On Windows, the same elapsed-failure boundary also queries only the already-owned
+Job. It attaches `process_budget_job_state=` immediately before the unchanged
+final v1 note. Version `pennilogic.process-budget-job-state/1` has exactly
+`schema`, `accounting` and `members`, encoded as recursively sorted compact ASCII
+JSON, at most 512 bytes including the prefix. The adopted canonical Infra
+qualifier transports the optional Job fields from the matching unittest `ERROR`
+block, requiring the Job note immediately before the unchanged final v1 note.
+Malformed or misplaced Job notes remain unavailable, not observed zeroes.
+The existing v1 schema and 384-byte bound, original `BudgetExceeded`,
+refusal and incomplete-outcome treatment remain unchanged. This source adoption
+adds no runtime evidence and does not diagnose or repair the original timeout.
+
+Accounting uses one query: an `observed` block contains `status`,
+`total_assigned` (the Job's cumulative process count) and `active`, with unsigned
+32-bit integers and active no greater than total. Membership uses one fixed
+16-entry query without sizing, retry or further enumeration. An `observed` or
+`partial` block contains `status`, `listed`, `bootstrap`,
+`system_approved_shell`, `other` and `unclassified`. Counts are integers from 0
+through 16, bootstrap is at most one, and the four roles sum to listed.
+Booleans are not integers. Unclassified entries, an incomplete list or a
+disagreement with actually observed active accounting make membership partial;
+cumulative total is never compared with listed. An unavailable accounting
+component supplies no invented active count.
+
+Unavailable or unsupported components contain only their corresponding
+`status`; an oversized membership component contains only
+`{"status":"oversized"}`. Missing evidence is not observed zeroes. Expected
+query or encoding refusals preserve the original failure and cleanup, with no
+raw exception text. No identities, handles, creation times, paths or their
+hashes, argv, environment or command output are emitted.
+
+Each returned PID is opened at most once with limited-query access. Membership
+in this exact Job is checked before metadata and again afterwards; observer-owned
+handles are closed even on refusal, never the borrowed Job/bootstrap handles.
+Bootstrap identity uses the retained process object, not its PID or image name.
+Its [`CompareObjectHandles` function](https://learn.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-compareobjecthandles)
+is resolved lazily from the fixed system `KernelBase.dll` provider with
+`LOAD_LIBRARY_SEARCH_SYSTEM32`. Job ownership, accounting, membership and the
+other handle/image APIs remain on `kernel32`; no provider is loaded for this
+comparison until a usable nonempty member list needs classification. A missing
+comparison library leaves membership unavailable; a missing export leaves it
+unsupported. Neither replaces the original timeout or changes cleanup. Regression
+fakes use separate strict DLL namespaces rather than assuming one DLL exports
+every function.
+An approved-shell role requires a positive image-path match to the already
+resolved requested shell and its already-established system location. Unknown
+or ambiguous identities remain unclassified, without filesystem discovery,
+image-buffer resizing or runtime substitution.
+
+The two queries and per-handle checks are not an atomic census. PID reuse within
+the Job or exit after opening can prevent a handle classification from describing
+the earlier accounting instant. Counts do not establish per-role liveness,
+absence throughout execution, binary authenticity, lifecycle history or a wait
+cause. Fixed query counts and buffers bound work, not operating-system latency;
+no extra wait, prewarm, retry or execution-budget extension is added. Portable
+fake-Win32 and mocked-run regressions exercise this contract, not live kernel
+behavior, a timeout repair, native acceptance or the five-minute requirement.
+
 The separate `quality.py gate-self-test` command copies
 `scripts/money_client_interop.py`, `scripts/tests/fixtures/money_client_interop`,
 and `build/source-materialization` into its isolated working directory. Its final
@@ -309,6 +829,16 @@ unexecuted and skipped evidence fails closed. Old success cannot rescue a
 failed new attempt.
 The current report schema is `pennilogic.api-money-client-interop/2`; older
 reports cannot stand in for the strengthened execution boundary.
+
+Within one final `verify` call, the complete output inventory retains bounded
+command records/streams, transports, scratch specification and generated manifests.
+Their hashes and semantic checks use those same freshly read bytes; reuse still
+checks path links, file kind and size. Other files remain fully inventoried.
+Each `api_inputs` call likewise retains its own fixture binding map rather than
+hashing those fixtures twice. Neither reuse crosses a call boundary: standalone
+verification and pre/post-execution, report-publication and final-verification
+checks remain fresh. Read-count regressions are source-only evidence, not measured
+latency savings or acceptance of any outstanding runtime, timing or skipped gate.
 
 Live and retained/offline transports compare nested values through the existing
 canonical JSON helper, not Python container equality: Boolean, integer and
