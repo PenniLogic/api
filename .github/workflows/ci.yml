@@ -1,7 +1,22 @@
 {
   "name": "CI",
   "on": {
-    "workflow_dispatch": {},
+    "workflow_dispatch": {
+      "inputs": {
+        "api106_observer_pair": {
+          "description": "Opt in to the diagnostic observer pair; owning failures still fail CI",
+          "type": "boolean",
+          "required": false,
+          "default": false
+        },
+        "api106_shell_focus": {
+          "description": "Run only the original approved-shell diagnostic in a separate job; never qualification",
+          "type": "boolean",
+          "required": false,
+          "default": false
+        }
+      }
+    },
     "push": {
       "branches": [
         "main"
@@ -22,7 +37,7 @@
   },
   "jobs": {
     "ci": {
-      "name": "CI",
+      "name": "Linux qualification",
       "runs-on": "ubuntu-24.04",
       "timeout-minutes": 30,
       "steps": [
@@ -61,17 +76,244 @@
           "run": "set -o pipefail\nif ! /usr/bin/env -0 2>/dev/null | while IFS= read -r -d '' setting; do\n  name=\"${setting%%=*}\"\n  case \"${name^^}\" in\n    NODE_OPTIONS|NODE_PATH|NPM_CONFIG_NODE_OPTIONS|NPM_CONFIG_NODE-OPTIONS) exit 1 ;;\n  esac\ndone; then\n  echo \"::error::API Node SDK startup environment check failed.\" >&2\n  exit 1\nfi\ncase \"${RUNNER_TOOL_CACHE-}\" in\n  /*) ;;\n  *) echo \"::error::API runner tool cache must be absolute.\" >&2; exit 1 ;;\nesac\ncase \"$RUNNER_TOOL_CACHE\" in\n  *$'\\n'*|*$'\\r'*) echo \"::error::API runner tool cache must be one line.\" >&2; exit 1 ;;\nesac\nsdk=\"$RUNNER_TOOL_CACHE/node/24.14.0/x64\"\nnode=\"$sdk/bin/node\"\nnpm=\"$sdk/lib/node_modules/npm/bin/npm-cli.js\"\nif [ ! -f \"$node\" ] || [ ! -x \"$node\" ] || [ ! -f \"$npm\" ]; then\n  echo \"::error::API Node SDK or bundled npm is missing.\" >&2\n  exit 1\nfi\nif ! version=\"$(\"$node\" --version)\" || [ \"$version\" != \"v24.14.0\" ]; then\n  echo \"::error::API Node SDK version check failed.\" >&2\n  exit 1\nfi\nif ! version=\"$(\"$node\" \"$npm\" --version)\" || [ \"$version\" != \"11.9.0\" ]; then\n  echo \"::error::API bundled npm version check failed.\" >&2\n  exit 1\nfi\nprintf 'MONEY_CLIENT_INTEROP_NODE=%s\\n' \"$node\" >> \"${GITHUB_ENV:?GitHub step environment is missing}\"\n"
         },
         {
-          "name": "Run checks",
-          "run": "python scripts/check_repository.py\npython scripts/materialize_money_sources.py\npython scripts/money_provider.py --source-root \"build/source-materialization/contracts-aa8d90cb98cec9b6dd08c91b3a4d869e47362662\" --strategy-file \"build/source-materialization/docs-a700e639585c61a4610e7b99dbd02b2dab28bdcc/governance/test-strategy.json\"\npython scripts/money_provider.py --verify\npython scripts/materialize_money_sources.py --verify\npython -I -S -B scripts/prepare_database_admission.py prepare --fetch\npython -I -S -B scripts/prepare_database_admission.py verify\npython scripts/quality.py build --money-client-interop-node \"${MONEY_CLIENT_INTEROP_NODE:?API Node SDK was not prepared}\"\npython -m unittest discover -s scripts/tests"
+          "name": "Check repository",
+          "run": "python scripts/check_repository.py"
         },
         {
-          "name": "Coverage against explicit base",
+          "name": "Prepare pinned Money sources",
+          "env": {
+            "PENNILOGIC_NATIVE_SOURCE_TOKEN": "${{ github.token }}"
+          },
+          "run": "python -I -S -B scripts/materialize_money_sources.py --native-fetch"
+        },
+        {
+          "name": "Prepare verified Money provider",
+          "run": "python scripts/materialize_money_sources.py --verify-inputs\npython scripts/money_provider.py --source-root \"build/source-materialization/contracts-aa8d90cb98cec9b6dd08c91b3a4d869e47362662\" --strategy-file \"build/source-materialization/docs-a700e639585c61a4610e7b99dbd02b2dab28bdcc/governance/test-strategy.json\"\npython scripts/money_provider.py --verify\npython scripts/materialize_money_sources.py --verify"
+        },
+        {
+          "name": "Prepare pinned database and interop sources",
+          "env": {
+            "PENNILOGIC_NATIVE_SOURCE_TOKEN": "${{ github.token }}"
+          },
+          "run": "python -I -S -B scripts/prepare_database_admission.py prepare --fetch --native-fetch\npython -I -S -B scripts/money_client_interop.py prepare --native-fetch"
+        },
+        {
+          "name": "Run checks",
+          "run": "python -I -S -B scripts/prepare_database_admission.py prepare\npython -I -S -B scripts/prepare_database_admission.py verify\npython scripts/quality.py build --base \"$BASE_SHA\" --require-prepared --money-client-interop-node \"${MONEY_CLIENT_INTEROP_NODE:?API Node SDK was not prepared}\"\npython -m unittest discover -s scripts/tests",
           "env": {
             "BASE_SHA": "${{ github.event.pull_request.base.sha || github.sha }}"
-          },
-          "run": "python scripts/quality.py coverage --base \"$BASE_SHA\" --money-client-interop-node \"${MONEY_CLIENT_INTEROP_NODE:?API Node SDK was not prepared}\""
+          }
         }
       ]
+    },
+    "windows": {
+      "name": "Windows qualification",
+      "runs-on": "windows-2025",
+      "timeout-minutes": 30,
+      "steps": [
+        {
+          "name": "Bind API106 checkout Git",
+          "id": "api106_git",
+          "if": "${{ github.event_name == 'workflow_dispatch' && inputs.api106_observer_pair == true }}",
+          "shell": "pwsh",
+          "run": "$ErrorActionPreference = 'Stop'\ntry {\n    $git = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source\n    if (![IO.Path]::IsPathFullyQualified($git) -or [IO.Path]::GetFileName($git) -cne 'git.exe' -or\n        $git -match '[\\x00-\\x1f\\x7f]') { throw 'selection' }\n    $hash = (Get-FileHash -LiteralPath $git -Algorithm SHA256).Hash.ToLowerInvariant()\n    [IO.File]::AppendAllText($env:GITHUB_OUTPUT, \"path=$git`nsha256=$hash`n\")\n    [IO.File]::AppendAllText($env:GITHUB_PATH, [IO.Path]::GetDirectoryName($git) + \"`n\")\n} catch {\n    [Console]::Error.WriteLine('API106 checkout Git selection refused.')\n    exit 1\n}\n"
+        },
+        {
+          "name": "Checkout",
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "persist-credentials": false,
+            "fetch-depth": 0
+          },
+          "id": "api106_checkout"
+        },
+        {
+          "name": "Python",
+          "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+          "with": {
+            "python-version": "3.14"
+          },
+          "id": "api106_python"
+        },
+        {
+          "name": "Node",
+          "uses": "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+          "with": {
+            "node-version-file": ".nvmrc"
+          }
+        },
+        {
+          "name": "JDK",
+          "uses": "actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6",
+          "with": {
+            "distribution": "temurin",
+            "java-version": "21"
+          },
+          "id": "api106_java"
+        },
+        {
+          "name": "Check repository",
+          "run": "python scripts\\check_repository.py\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+        },
+        {
+          "name": "Prepare pinned Money sources",
+          "env": {
+            "PENNILOGIC_NATIVE_SOURCE_TOKEN": "${{ github.token }}"
+          },
+          "run": "python -I -S -B scripts\\materialize_money_sources.py --native-fetch\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+        },
+        {
+          "name": "Prepare verified Money provider",
+          "run": "python scripts\\materialize_money_sources.py --verify-inputs\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\npython scripts\\money_provider.py --source-root \"build\\source-materialization\\contracts-aa8d90cb98cec9b6dd08c91b3a4d869e47362662\" --strategy-file \"build\\source-materialization\\docs-a700e639585c61a4610e7b99dbd02b2dab28bdcc\\governance\\test-strategy.json\"\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\npython scripts\\money_provider.py --verify\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\npython scripts\\materialize_money_sources.py --verify\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+          "id": "api106_money"
+        },
+        {
+          "name": "Prepare pinned database and interop sources",
+          "env": {
+            "PENNILOGIC_NATIVE_SOURCE_TOKEN": "${{ github.token }}"
+          },
+          "run": "python -I -S -B scripts\\prepare_database_admission.py prepare --fetch --native-fetch\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\npython -I -S -B scripts\\money_client_interop.py prepare --native-fetch\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+        },
+        {
+          "name": "Run Windows owning suites",
+          "env": {
+            "PENNILOGIC_API106_OBSERVER_PAIR": "${{ github.event_name == 'workflow_dispatch' && inputs.api106_observer_pair == true }}",
+            "PENNILOGIC_API106_GIT": "${{ steps.api106_git.outputs.path }}",
+            "PENNILOGIC_API106_GIT_SHA256": "${{ steps.api106_git.outputs.sha256 }}",
+            "PENNILOGIC_API106_CHECKOUT": "${{ steps.api106_checkout.outputs.commit }}",
+            "PENNILOGIC_API106_PYTHON": "${{ steps.api106_python.outputs.python-path }}",
+            "PENNILOGIC_API106_PYTHON_VERSION": "${{ steps.api106_python.outputs.python-version }}",
+            "PENNILOGIC_API106_JAVA": "${{ steps.api106_java.outputs.path }}",
+            "PENNILOGIC_API106_JAVA_VERSION": "${{ steps.api106_java.outputs.version }}",
+            "PENNILOGIC_API106_MONEY": "${{ steps.api106_money.outcome }}",
+            "PENNILOGIC_API106_TEMP": "${{ runner.temp }}"
+          },
+          "run": "python -I -S -B scripts\\prepare_database_admission.py prepare\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\npython -I -S -B scripts\\prepare_database_admission.py verify\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\npython -I -S -B scripts\\money_client_interop.py prepare --require-prepared\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\nif ($env:PENNILOGIC_API106_OBSERVER_PAIR -ceq 'true') {\n    $ErrorActionPreference = 'Stop'\n    try {\n        if (@(Get-ChildItem Env: | Where-Object { $_.Name -imatch '^GIT_' -and $_.Name -ine 'GIT_INSTALL_ROOT' }).Count -ne 0) { throw 'git selectors' }\n        $git = $env:PENNILOGIC_API106_GIT\n        if ((Get-FileHash -LiteralPath $git -Algorithm SHA256).Hash.ToLowerInvariant() -cne\n            $env:PENNILOGIC_API106_GIT_SHA256) { throw 'git selection changed' }\n        $prefix = @('--no-pager', '--no-optional-locks', '-c', 'core.fsmonitor=false')\n        $binding = @(& $git @prefix rev-parse --path-format=absolute --show-toplevel --absolute-git-dir --git-common-dir HEAD 'HEAD^{tree}' 2>$null)\n        if ($LASTEXITCODE -ne 0 -or $binding.Count -ne 5) { throw 'checkout binding' }\n        $root = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)\n        $metadata = Join-Path $root '.git'\n        if ([IO.Path]::GetFullPath($binding[0]) -cne $root -or\n            [IO.Path]::GetFullPath($binding[1]) -cne $metadata -or\n            [IO.Path]::GetFullPath($binding[2]) -cne $metadata -or\n            $binding[3] -cne $env:GITHUB_SHA -or $binding[3] -cne $env:PENNILOGIC_API106_CHECKOUT -or\n            $binding[4] -cnotmatch '\\A[0-9a-f]{40}\\z') { throw 'checkout mismatch' }\n        $status = @(& $git @prefix status --porcelain=v1 --untracked-files=normal 2>$null)\n        if ($LASTEXITCODE -ne 0 -or $status.Count -ne 0) { throw 'checkout not clean' }\n        & $git @prefix diff --no-ext-diff --no-textconv --quiet HEAD -- 2>$null\n        if ($LASTEXITCODE -ne 0) { throw 'checkout differs' }\n        $env:PENNILOGIC_API106_TREE = $binding[4]\n        $env:PENNILOGIC_API106_HEAD_SHA256 = (Get-FileHash -LiteralPath (Join-Path $metadata 'HEAD') -Algorithm SHA256).Hash.ToLowerInvariant()\n        $env:PENNILOGIC_API106_INDEX_SHA256 = (Get-FileHash -LiteralPath (Join-Path $metadata 'index') -Algorithm SHA256).Hash.ToLowerInvariant()\n        $env:PENNILOGIC_API106_CONFIG_SHA256 = (Get-FileHash -LiteralPath (Join-Path $metadata 'config') -Algorithm SHA256).Hash.ToLowerInvariant()\n        $env:PENNILOGIC_API106_PREPARED = 'verified'\n    } catch {\n        [Console]::Error.WriteLine('API106 same-job source and preparation binding refused.')\n        exit 1\n    }\n    & $env:PENNILOGIC_API106_PYTHON -I -S -B scripts\\qualify_windows.py --require-prepared --api106-observer-pair\n} elseif ($env:PENNILOGIC_API106_OBSERVER_PAIR -ceq 'false') {\n    python scripts\\qualify_windows.py --require-prepared\n} else { throw 'API106 observer selection must be a Boolean' }\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+        },
+        {
+          "name": "Read API106 observer-pair diagnostics",
+          "if": "${{ always() && github.event_name == 'workflow_dispatch' && inputs.api106_observer_pair == true }}",
+          "shell": "pwsh",
+          "working-directory": "${{ github.workspace }}",
+          "timeout-minutes": 1,
+          "run": "python scripts\\qualify_windows.py --collect-api106-observer-pair\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+        },
+        {
+          "name": "Read approved-shell command boundary",
+          "if": "${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.api106_observer_pair == true) }}",
+          "shell": "pwsh",
+          "working-directory": "${{ github.workspace }}",
+          "timeout-minutes": 1,
+          "run": "$ErrorActionPreference = 'Stop'\n$path = Join-Path (Get-Location).Path 'build\\diagnostics\\api106-approved-shell-boundary.bin'\n$record = [ordered]@{\n    event = 'api106_approved_shell_command_boundary'\n    diagnostic_only = $true\n    status = 'unavailable'\n    checkpoint = $null\n    console_redirected = $null\n    pre_record_writer_return = 'not-observed'\n}\n$exitCode = 2\n$stream = $null\ntry {\n    $stream = [IO.File]::OpenRead($path)\n    $bytes = [byte[]]::new(8)\n    $count = 0\n    while ($count -lt $bytes.Length) {\n        $read = $stream.Read($bytes, $count, $bytes.Length - $count)\n        if ($read -eq 0) { break }\n        $count += $read\n    }\n    if ($count -le 7) {\n        $value = [Text.Encoding]::ASCII.GetString($bytes, 0, $count)\n        if ($value -cmatch '\\A(?:|E|EU|EUX|ES[01]{3}|ES[01]{3}X|ES[01]{3}CX?)\\z') {\n            $record.status = 'observed-record'\n            $record.checkpoint = if ($value -eq '') { 'none-observed' }\n                elseif ($value.EndsWith('X', [StringComparison]::Ordinal)) { 'after-write-output' }\n                elseif ($value -eq 'E') { 'command-entry' }\n                else { 'before-write-output' }\n            if ($value.Contains('C')) { $record.pre_record_writer_return = 'observed' }\n            if ($value -cmatch '\\AES([01])([01])([01])C?X?\\z') {\n                $record.console_redirected = [ordered]@{\n                    stdin = $Matches[1] -ceq '1'\n                    stdout = $Matches[2] -ceq '1'\n                    stderr = $Matches[3] -ceq '1'\n                }\n            }\n            $exitCode = 0\n        } else {\n            $record.status = 'partial-or-invalid-record'\n        }\n    } else {\n        $record.status = 'oversized-record'\n    }\n} catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] {\n    $record.status = 'not-observed'\n    $exitCode = 0\n} catch [IO.IOException], [UnauthorizedAccessException], [Security.SecurityException] {\n    $record.status = 'unavailable-read'\n} finally {\n    if ($null -ne $stream) { $stream.Dispose() }\n}\n$json = $record | ConvertTo-Json -Compress -Depth 3\nif ([Text.Encoding]::ASCII.GetByteCount($json) -gt 1024) { throw 'Boundary diagnostic exceeded its fixed output bound' }\n[Console]::Out.WriteLine($json)\nexit $exitCode\n"
+        }
+      ]
+    },
+    "ci-result": {
+      "name": "CI",
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 1,
+      "needs": [
+        "ci",
+        "windows"
+      ],
+      "if": "always()",
+      "steps": [
+        {
+          "name": "Require both qualification results",
+          "env": {
+            "LINUX_RESULT": "${{ needs.ci.result }}",
+            "WINDOWS_RESULT": "${{ needs.windows.result }}"
+          },
+          "run": "if [ \"${LINUX_RESULT-}\" != success ] || [ \"${WINDOWS_RESULT-}\" != success ]; then\n  echo \"::error::API CI requires successful Linux and Windows qualification.\" >&2\n  exit 1\nfi"
+        }
+      ]
+    },
+    "api106-shell-focus": {
+      "name": "API106 isolated shell diagnostic",
+      "runs-on": "windows-2025",
+      "timeout-minutes": 30,
+      "steps": [
+        {
+          "name": "Bind API106 checkout Git",
+          "id": "api106_git",
+          "if": "${{ github.event_name == 'workflow_dispatch' && inputs.api106_shell_focus == true }}",
+          "shell": "pwsh",
+          "run": "$ErrorActionPreference = 'Stop'\ntry {\n    $git = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source\n    if (![IO.Path]::IsPathFullyQualified($git) -or [IO.Path]::GetFileName($git) -cne 'git.exe' -or\n        $git -match '[\\x00-\\x1f\\x7f]') { throw 'selection' }\n    $hash = (Get-FileHash -LiteralPath $git -Algorithm SHA256).Hash.ToLowerInvariant()\n    [IO.File]::AppendAllText($env:GITHUB_OUTPUT, \"path=$git`nsha256=$hash`n\")\n    [IO.File]::AppendAllText($env:GITHUB_PATH, [IO.Path]::GetDirectoryName($git) + \"`n\")\n} catch {\n    [Console]::Error.WriteLine('API106 checkout Git selection refused.')\n    exit 1\n}\n"
+        },
+        {
+          "name": "Checkout",
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "persist-credentials": false,
+            "fetch-depth": 0
+          },
+          "id": "api106_checkout"
+        },
+        {
+          "name": "Python",
+          "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+          "with": {
+            "python-version": "3.14.8"
+          },
+          "id": "api106_python"
+        },
+        {
+          "name": "Node",
+          "uses": "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+          "with": {
+            "node-version-file": ".nvmrc"
+          }
+        },
+        {
+          "name": "JDK",
+          "uses": "actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6",
+          "with": {
+            "distribution": "temurin",
+            "java-version": "21"
+          },
+          "id": "api106_java"
+        },
+        {
+          "name": "Check repository",
+          "run": "python scripts\\check_repository.py\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+        },
+        {
+          "name": "Prepare pinned Money sources",
+          "env": {
+            "PENNILOGIC_NATIVE_SOURCE_TOKEN": "${{ github.token }}"
+          },
+          "run": "python -I -S -B scripts\\materialize_money_sources.py --native-fetch\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+        },
+        {
+          "name": "Prepare verified Money provider",
+          "run": "python scripts\\materialize_money_sources.py --verify-inputs\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\npython scripts\\money_provider.py --source-root \"build\\source-materialization\\contracts-aa8d90cb98cec9b6dd08c91b3a4d869e47362662\" --strategy-file \"build\\source-materialization\\docs-a700e639585c61a4610e7b99dbd02b2dab28bdcc\\governance\\test-strategy.json\"\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\npython scripts\\money_provider.py --verify\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\npython scripts\\materialize_money_sources.py --verify\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+          "id": "api106_money"
+        },
+        {
+          "name": "Prepare pinned database and interop sources",
+          "env": {
+            "PENNILOGIC_NATIVE_SOURCE_TOKEN": "${{ github.token }}"
+          },
+          "run": "python -I -S -B scripts\\prepare_database_admission.py prepare --fetch --native-fetch\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\npython -I -S -B scripts\\money_client_interop.py prepare --native-fetch\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+        },
+        {
+          "name": "Run isolated approved-shell diagnostic",
+          "env": {
+            "PENNILOGIC_API106_GIT": "${{ steps.api106_git.outputs.path }}",
+            "PENNILOGIC_API106_GIT_SHA256": "${{ steps.api106_git.outputs.sha256 }}",
+            "PENNILOGIC_API106_CHECKOUT": "${{ steps.api106_checkout.outputs.commit }}",
+            "PENNILOGIC_API106_PYTHON": "${{ steps.api106_python.outputs.python-path }}",
+            "PENNILOGIC_API106_PYTHON_VERSION": "${{ steps.api106_python.outputs.python-version }}",
+            "PENNILOGIC_API106_JAVA": "${{ steps.api106_java.outputs.path }}",
+            "PENNILOGIC_API106_JAVA_VERSION": "${{ steps.api106_java.outputs.version }}",
+            "PENNILOGIC_API106_MONEY": "${{ steps.api106_money.outcome }}",
+            "PENNILOGIC_API106_TEMP": "${{ runner.temp }}",
+            "PENNILOGIC_API106_SHELL_FOCUS": "${{ github.event_name == 'workflow_dispatch' && inputs.api106_shell_focus == true }}"
+          },
+          "run": "python -I -S -B scripts\\prepare_database_admission.py prepare\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\npython -I -S -B scripts\\prepare_database_admission.py verify\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\npython -I -S -B scripts\\money_client_interop.py prepare --require-prepared\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\nif ($env:PENNILOGIC_API106_SHELL_FOCUS -ceq 'true') {\n    $ErrorActionPreference = 'Stop'\n    try {\n        if (@(Get-ChildItem Env: | Where-Object { $_.Name -imatch '^GIT_' -and $_.Name -ine 'GIT_INSTALL_ROOT' }).Count -ne 0) { throw 'git selectors' }\n        $git = $env:PENNILOGIC_API106_GIT\n        if ((Get-FileHash -LiteralPath $git -Algorithm SHA256).Hash.ToLowerInvariant() -cne\n            $env:PENNILOGIC_API106_GIT_SHA256) { throw 'git selection changed' }\n        $prefix = @('--no-pager', '--no-optional-locks', '-c', 'core.fsmonitor=false')\n        $binding = @(& $git @prefix rev-parse --path-format=absolute --show-toplevel --absolute-git-dir --git-common-dir HEAD 'HEAD^{tree}' 2>$null)\n        if ($LASTEXITCODE -ne 0 -or $binding.Count -ne 5) { throw 'checkout binding' }\n        $root = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)\n        $metadata = Join-Path $root '.git'\n        if ([IO.Path]::GetFullPath($binding[0]) -cne $root -or\n            [IO.Path]::GetFullPath($binding[1]) -cne $metadata -or\n            [IO.Path]::GetFullPath($binding[2]) -cne $metadata -or\n            $binding[3] -cne $env:GITHUB_SHA -or $binding[3] -cne $env:PENNILOGIC_API106_CHECKOUT -or\n            $binding[4] -cnotmatch '\\A[0-9a-f]{40}\\z') { throw 'checkout mismatch' }\n        $status = @(& $git @prefix status --porcelain=v1 --untracked-files=normal 2>$null)\n        if ($LASTEXITCODE -ne 0 -or $status.Count -ne 0) { throw 'checkout not clean' }\n        & $git @prefix diff --no-ext-diff --no-textconv --quiet HEAD -- 2>$null\n        if ($LASTEXITCODE -ne 0) { throw 'checkout differs' }\n        $env:PENNILOGIC_API106_TREE = $binding[4]\n        $env:PENNILOGIC_API106_HEAD_SHA256 = (Get-FileHash -LiteralPath (Join-Path $metadata 'HEAD') -Algorithm SHA256).Hash.ToLowerInvariant()\n        $env:PENNILOGIC_API106_INDEX_SHA256 = (Get-FileHash -LiteralPath (Join-Path $metadata 'index') -Algorithm SHA256).Hash.ToLowerInvariant()\n        $env:PENNILOGIC_API106_CONFIG_SHA256 = (Get-FileHash -LiteralPath (Join-Path $metadata 'config') -Algorithm SHA256).Hash.ToLowerInvariant()\n        $env:PENNILOGIC_API106_PREPARED = 'verified'\n    } catch {\n        [Console]::Error.WriteLine('API106 same-job source and preparation binding refused.')\n        exit 1\n    }\n    & $env:PENNILOGIC_API106_PYTHON -I -S -B scripts\\qualify_windows.py --require-prepared --api106-shell-focus\n} else { throw 'API106 shell focus requires an explicit Boolean true' }\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+        }
+      ],
+      "if": "${{ github.event_name == 'workflow_dispatch' && inputs.api106_shell_focus == true }}"
     }
   }
 }

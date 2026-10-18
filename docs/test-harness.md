@@ -145,7 +145,8 @@ refused command characters. POSIX fixtures remain `0644`; tracked wrapper
 bytes/modes and the parent environment are unchanged.
 
 Existing `test` and `integrationTest` selections execute all the new tests;
-`build` still invokes both. The existing `moneyTest`/PIT qualification inventory
+`build` still invokes both. Money tests are owned once by `test`; `moneyTest` is a
+compatibility lifecycle alias, not another runner. The PIT qualification inventory
 is unchanged: the new non-ledger consumer is in `com.pennilogic.testing`, not a
 replacement for the 39 existing Money tests, 10,030 round trips, 10,000
 associativity cases, 384 keys or 66,851 finite model comparisons.
@@ -161,6 +162,54 @@ parameterized containers are included once in their parent class, not counted
 again. These are per-suite measurements, not end-to-end workflow timing;
 property-backed PostgreSQL classes retain their `integrationTest` task
 attribution.
+
+## Gradle task-completion timing
+
+The existing build also emits one `gradle_task_completed` JSON record per
+observed Gradle task completion through `BuildEventsListenerRegistry` and a
+shared `OperationCompletionListener` build service. No task actions, dependencies,
+ordering, cache policy, test selection or deadlines are changed.
+
+`task` is the public colon-separated task identifier, not a filesystem path.
+`start_ms` and `end_ms` are Gradle's task-result epoch-millisecond timestamps;
+`wall_ms` is their actual difference, including task execution overhead. They
+are not console-output arrival intervals. `timing: "measured"` admits a
+nonnegative, ordered interval, including an actual zero-length interval.
+Invalid intervals have `timing: "unavailable"` and all three times are `null`,
+not invented zeros.
+
+| `status` | Meaning |
+| --- | --- |
+| `executed_success` | Successful task result without the cache or up-to-date flags; not proof of individual test passes |
+| `failed` | Failed task result; failure can occur before task actions start |
+| `skipped` | Skipped result, including no-source/conditional skips; not an executed pass |
+| `from_cache` | Outputs restored from cache, distinguished before the up-to-date flag |
+| `up_to_date` | Reused current outputs; not a fresh execution |
+| `unknown` | Unrecognized result type; never success credit |
+
+JSON contains only those seven fields. Identifiers are bounded to 256 ASCII
+letters, digits, underscores, dots, hyphens and colon separators; invalid
+identifiers or observer exceptions emit the fixed
+`gradle_task_timing_unavailable` diagnostic instead. Failure/skip messages,
+exception text, arguments, environment and filesystem paths are not projected.
+Telemetry failure does not replace the owning task's result.
+
+These spans include existing nested interop commands, PIT execution and JUnit
+class suites. Do not add those nested measurements to their enclosing task.
+Concurrent task intervals can overlap: sums are not build wall time. Task
+timestamps permit interval comparison, but missing events remain unavailable;
+configuration, startup, scheduling gaps and finalization are not measured by
+this task listener. Compare the union of observed task intervals, not their sum,
+with the enclosing `quality_duration`. The remainder is **unattributed time**
+(possibly including missing task evidence), not a measured configuration duration.
+
+The focused Python `GradleTaskTimingTest` guards the source contract without
+starting another Gradle build during Python discovery. Its `observer_source()`
+extracts the unchanged observer for a small, separate offline Gradle fixture
+that can check real completion events and controlled result projections.
+Neither those source checks nor a synthetic fixture qualifies the complete
+API workload. This instrumentation does not demonstrate a speedup or satisfy
+the original complete-suite under-300-second requirement.
 
 ## Remaining original requirements
 

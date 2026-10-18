@@ -160,12 +160,18 @@ The coverage-only commands do not qualify mutation and can stale an earlier resu
 ## Actual Money-package qualification
 
 The existing JaCoCo 0.8.15 tool now measures the authoritative dependency, not unchanged API
-own-main code. `moneyTest` executes the source-seam tests; `moneyCoverageReport` includes all
+own-main code. The ordinary `test` task owns the Money tests and their XML; `moneyTest` is a
+compatibility lifecycle alias for that same fresh, uncached execution, not a second runner.
+`moneyCoverageReport` reads `jacoco/test.exec` and includes all
 eight compiled classes from both `Money.kt` and `CurrencyRegistry.kt`, without class, method or
 branch exclusions. `moneyCoverageCheck` fails a normal build below the accepted `api.money`
 97% line or 93% branch floor. It reads the numbers directly from the byte-bound Docs strategy;
 there are no local fallback thresholds. Missing target tests, skips/failures, omitted classes,
 omitted source files, unrelated package totals or inconsistent counters are refusals.
+Money metrics and PIT input binding select the Money suites from `build/test-results/test`;
+they never fall back to old `moneyTest` XML or execution data. The
+[single-owner contract](money-mutation.md#single-testreport-owner) preserves standalone
+`test` and documents the broader Money-command prerequisite and supported focused selector.
 
 The initial twelve tests measured 74/75 lines and 76/86 branches, and the branch gate failed.
 Additional equality, descriptor, rendering and non-JSON encoder/decoder tests improved the

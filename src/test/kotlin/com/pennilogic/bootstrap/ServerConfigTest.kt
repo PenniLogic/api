@@ -15,7 +15,7 @@ class ServerConfigTest {
         assertEquals("Invalid or missing configuration key: APP_ENV", error.message)
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(name = "{displayName} [{index}]")
     @ValueSource(strings = ["local", "test", "staging", "production"])
     fun `accepted environments use safe local defaults`(environment: String) {
         val config = ServerConfig.load(mapOf("APP_ENV" to environment))
@@ -24,7 +24,7 @@ class ServerConfigTest {
         assertEquals(8080, config.port)
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(name = "{displayName} [{index}]")
     @ValueSource(strings = ["", " ", "LOCAL", "local ", "invalid-config-value"])
     fun `invalid environment is rejected without echoing its value`(value: String) {
         val error =
@@ -35,7 +35,7 @@ class ServerConfigTest {
         assertFalse(error.message.orEmpty().contains("invalid-config-value"))
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(name = "{displayName} [{index}]")
     @ValueSource(strings = ["1", "8080", "65535"])
     fun `valid port boundaries and container host are accepted`(port: String) {
         val config = ServerConfig.load(mapOf("APP_ENV" to "test", "HOST" to "0.0.0.0", "PORT" to port))
@@ -43,7 +43,7 @@ class ServerConfigTest {
         assertEquals(port.toInt(), config.port)
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(name = "{displayName} [{index}]")
     @ValueSource(strings = ["", " ", "0", "-1", "65536", "2147483648", "eight", "80.0", " 80", "+80", "080"])
     fun `invalid ports fail closed`(port: String) {
         val error =
@@ -53,7 +53,7 @@ class ServerConfigTest {
         assertEquals("PORT", error.key)
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(name = "{displayName} [{index}]")
     @ValueSource(strings = ["", "localhost", "example.invalid", "::", "0.0.0.0 "])
     fun `unsupported bind hosts are rejected`(host: String) {
         val error =

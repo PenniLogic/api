@@ -72,7 +72,7 @@ def input_snapshot(config):
     files.append(runtime_executable(config["java"]))
     files.append(runtime_executable(sys.executable))
     files.extend(path for path in (ROOT / "src").rglob("*") if path.suffix in (".kt", ".java"))
-    files.extend((ROOT / "build/test-results/moneyTest").glob("TEST-*.xml"))
+    files.extend(quality.money_test_reports(ROOT))
     files.extend(quality.money_class_inventory(provider).values())
     for name in ("tool_classpath", "test_classpath"):
         paths = config.get(name)
@@ -322,7 +322,8 @@ def execute(input_file=ROOT / INPUT_FILE):
                 )
             except TimeoutError as error:
                 entry["budget_exceeded"] = True
-                (directory / f"{name}.log").write_text(error.output or "", encoding="utf-8", newline="\n")
+                if isinstance(error, process_budget.BudgetExceeded):
+                    (directory / f"{name}.log").write_text(error.output or "", encoding="utf-8", newline="\n")
                 raise
             finally:
                 entry["elapsed_seconds"] = round(time.monotonic() - step_start, 6)
